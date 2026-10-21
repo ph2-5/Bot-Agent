@@ -24,7 +24,9 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
-    // 签名信息从 local.properties 读取，避免把密码写进版本库
+    // 签名信息从 local.properties 读取，避免把密码写进版本库。
+    // 密钥文件不存在时（典型如 CI 无 Secrets 场景）不配置签名：
+    // release 产出未签名包、debug 回退默认调试密钥，保证构建不失败。
     signingConfigs {
         create("release") {
             val props = Properties()
@@ -32,10 +34,13 @@ android {
             if (propsFile.exists()) {
                 propsFile.inputStream().use { props.load(it) }
             }
-            storeFile = file(props.getProperty("STORE_FILE") ?: "qbot-release.jks")
-            storePassword = props.getProperty("STORE_PASSWORD").orEmpty()
-            keyAlias = props.getProperty("KEY_ALIAS").orEmpty()
-            keyPassword = props.getProperty("KEY_PASSWORD").orEmpty()
+            val keystoreFile = file(props.getProperty("STORE_FILE") ?: "qbot-release.jks")
+            if (keystoreFile.exists()) {
+                storeFile = keystoreFile
+                storePassword = props.getProperty("STORE_PASSWORD").orEmpty()
+                keyAlias = props.getProperty("KEY_ALIAS").orEmpty()
+                keyPassword = props.getProperty("KEY_PASSWORD").orEmpty()
+            }
         }
     }
 
@@ -46,7 +51,10 @@ android {
             // 需要瘦身时可自行开启。
             isMinifyEnabled = false
             isShrinkResources = false
-            signingConfig = signingConfigs.getByName("release")
+            // 密钥存在才应用正式签名；否则产出未签名 release 包
+            signingConfigs.findByName("release")?.takeIf { it.storeFile != null }?.let {
+                signingConfig = it
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -56,7 +64,10 @@ android {
         debug {
             // debug 包也用同一把正式密钥签名：
             // 这样手机上 debug 与 release 之间可以直接覆盖安装，不会因签名冲突失败。
-            signingConfig = signingConfigs.getByName("release")
+            // 密钥缺失时回退到 AGP 默认调试密钥。
+            signingConfigs.findByName("release")?.takeIf { it.storeFile != null }?.let {
+                signingConfig = it
+            }
         }
     }
 
