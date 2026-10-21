@@ -28,10 +28,13 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
 
       - name: 还原签名密钥（可选）
-        # 未配置 Secret 时会自动跳过，构建出未签名的 release 包
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        # 未配置 Secret 时会自动跳过，构建出未签名的 release 包。
+        # 注意：secrets 上下文不能出现在 step 级 if 中，需经 env 中转。
+        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > qbot-release.jks
+          echo "$KEYSTORE_BASE64" | base64 -d > qbot-release.jks
           cat > local.properties <<EOF
           STORE_FILE=../qbot-release.jks
           STORE_PASSWORD=${{ secrets.STORE_PASSWORD }}
