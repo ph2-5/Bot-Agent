@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">QQ机器人</string>
+
+    <!-- 前台服务通知 -->
+    <string name="notification_channel_name">机器人运行状态</string>
+    <string name="notification_channel_desc">显示 QQ 机器人的在线状态与连接信息</string>
+    <string name="notification_title">QQ 机器人运行中</string>
+    <string name="notification_text_online">已在线 · 保持连接中</string>
+    <string name="notification_text_connecting">正在连接…</string>
+    <string name="notification_text_reconnecting">连接中断，正在重连（第 %1$d 次）</string>
+    <string name="notification_text_idle">已停止</string>
+    <string name="notification_action_stop">停止</string>
+
+    <!-- 前台服务用途说明（Android 14+ specialUse 需要） -->
+    <string name="fgs_subtype">维持与 QQ 机器人网关的 WebSocket 长连接，用于实时收发消息</string>
+</resources>

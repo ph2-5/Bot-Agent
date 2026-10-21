@@ -1,0 +1,386 @@
+package com.qbot.core.ai
+
+import com.qbot.core.model.IncomingMessage
+import com.qbot.core.model.MessageKind
+import com.qbot.core.model.cleanText
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+/** AI 触发策略。 */
+enum class AiMode {
+    /** 先匹配本地规则，未命中才交给 AI（默认） */
+    RULE_FIRST,
+
+    /** 所有消息都走 AI，忽略本地规则 */
+    AI_ALWAYS,
+
+    /** 只有以 /ai 开头的消息才走 AI */
+    COMMAND_ONLY,
+}
+
+/**
+ * 思考模式开关。
+ *
+ * DeepSeek 官方文档：思考模式**默认开启**（effort=high），会先输出一段思维链
+ * 再给最终答案——这就是"感觉思考时间过长"的直接原因。关闭方式是在请求体
+ * 顶层传 `{"thinking": {"type": "disabled"}}`。
+ *
+ * 注意该字段是 DeepSeek 扩展，OpenAI 等严格的服务商遇到未知字段会直接 400，
+ * 因此仅当端点域名包含 deepseek 时才会真正发送（见 [AiResponder.thinkingParam]）。
+ */
+enum class ThinkingMode {
+    /** 关闭思考（默认）：响应最快，适合即时对话 */
+    DISABLED,
+
+    /** 强制开启思考：回答更严谨但明显更慢 */
+    ENABLED,
+
+    /** 不发送该参数，由服务端默认行为决定 */
+    AUTO,
+}
+
+/**
+ * AI 配置。
+ *
+ * 只保留最常用的字段，全部可由用户在维护端里直接填写，无需改代码。
+ */
+data class AiConfig(
+    val enabled: Boolean = false,
+    val baseUrl: String = "https://api.deepseek.com",
+    val apiKey: String = "",
+    val model: String = "deepseek-chat",
+    val systemPrompt: String =
+        "你是一个运行在 QQ 里的助手。回答简洁友好，不要使用 Markdown 标题和代码块，因为 QQ 不支持渲染。",
+    val temperature: Double = 0.7,
+    val maxTokens: Int = 800,
+    val mode: AiMode = AiMode.RULE_FIRST,
+    /** 每个会话保留的历史轮数（1 轮 = 一问一答 2 条消息） */
+    val contextTurns: Int = 6,
+    /** AI 失败时回复给用户的话，留空则不回复 */
+    val replyOnError: String = "AI 暂时无法回答，请稍后再试。",
+    /** 思考模式开关，默认关闭（DeepSeek 默认开启思考，慢） */
+    val thinkingMode: ThinkingMode = ThinkingMode.DISABLED,
+    /**
+     * 上下文 token 预算：system 提示词 + 历史 + 本轮问题的总量上限。
+     *
+     * 超预算时从最早的历史开始成对丢弃，保证长对话不会把请求撑爆。
+     * 同时这也是缓存友好的关键：system 提示词越短越稳定，前缀缓存越容易命中。
+     */
+    val contextTokenBudget: Int = 3000,
+) {
+    /** 配置是否可用。缺任何一项都会让每次请求都白跑一趟，故提前拦住。 */
+    val isReady: Boolean
+        get() = enabled && apiKey.isNotBlank() && model.isNotBlank() && baseUrl.isNotBlank()
+}
+
+/**
+ * 会话历史存储。
+ *
+ * 抽成接口是为了让 botcore 不依赖 Room：Android 侧用数据库实现，
+ * 单元测试则可用内存实现。
+ */
+interface AiHistoryStore {
+    suspend fun load(
+        conversationKey: String,
+        limit: Int,
+    ): List<ChatMessage>
+
+    suspend fun append(
+        conversationKey: String,
+        message: ChatMessage,
+    )
+
+    suspend fun clear(conversationKey: String)
+
+    /** 清理单个会话中超出保留数量的旧消息 */
+    suspend fun trim(
+        conversationKey: String,
+        keep: Int,
+    )
+
+    /** 清理所有会话的旧消息（按全局保留量），供启动时调用一次 */
+    suspend fun trimAll(keep: Int) {}
+}
+
+/** 内存实现，供测试与「不落库」模式使用。 */
+class InMemoryAiHistoryStore : AiHistoryStore {
+    private val mutex = Mutex()
+    private val store = mutableMapOf<String, MutableList<ChatMessage>>()
+
+    override suspend fun load(
+        conversationKey: String,
+        limit: Int,
+    ): List<ChatMessage> =
+        mutex.withLock {
+            store[conversationKey]?.takeLast(limit) ?: emptyList()
+        }
+
+    override suspend fun append(
+        conversationKey: String,
+        message: ChatMessage,
+    ) {
+        // 用大括号体：表达式体会把 add() 的 Boolean 返回值推断成函数返回类型
+        mutex.withLock {
+            store.getOrPut(conversationKey) { mutableListOf() }.add(message)
+        }
+    }
+
+    override suspend fun clear(conversationKey: String) = mutex.withLock {
+        store.remove(conversationKey)
+        Unit
+    }
+
+    override suspend fun trim(
+        conversationKey: String,
+        keep: Int,
+    ) = mutex.withLock {
+        val list = store[conversationKey] ?: return@withLock
+        while (list.size > keep) list.removeAt(0)
+    }
+
+    override suspend fun trimAll(keep: Int) = mutex.withLock {
+        store.values.forEach { list ->
+            while (list.size > keep) list.removeAt(0)
+        }
+        Unit
+    }
+}
+
+/**
+ * AI 应答器。
+ *
+ * 职责：
+ * 1. 按 [AiConfig.mode] 决定一条消息是否该由 AI 回答；
+ * 2. 组装 system prompt + 历史上下文 + 当前问题，调用 LLM；
+ * 3. 把本轮问答写回历史，实现多轮对话。
+ */
+class AiResponder(
+    private val client: LlmClient,
+    private val history: AiHistoryStore = InMemoryAiHistoryStore(),
+) {
+    companion object {
+        /** 触发 AI 的命令前缀 */
+        const val COMMAND_PREFIX = "/ai"
+
+        /** 清空会话上下文的指令（跟在 /ai 后或直接发送） */
+        val CLEAR_COMMANDS = setOf("clear", "重置", "清空", "清除上下文", "新对话")
+
+        /**
+         * QQ 单条消息长度有限制（群约 4000 字符），
+         * 超出会被服务端拒绝，这里统一截断保证发送成功。
+         */
+        const val MAX_REPLY_LENGTH = 1800
+    }
+
+    // 同一会话串行处理：群聊里多人连问时，避免并发请求把历史顺序打乱。
+    // map 会在超过上限时整体清空重建，长期运行也不会无限增长。
+    private val locks = ConcurrentHashMap<String, Mutex>()
+
+    private fun lockFor(key: String): Mutex {
+        if (locks.size > 128) locks.clear()
+        return locks.getOrPut(key) { Mutex() }
+    }
+
+    /**
+     * 判断该消息是否应由 AI 处理。
+     *
+     * @param ruleMatched 本地规则引擎是否已经命中——RULE_FIRST 模式下已命中就不再问 AI。
+     */
+    fun shouldHandle(
+        message: IncomingMessage,
+        config: AiConfig,
+        ruleMatched: Boolean,
+    ): Boolean {
+        if (!config.isReady) return false
+        if (message.content.isBlank()) return false
+
+        return when (config.mode) {
+            AiMode.AI_ALWAYS -> true
+            AiMode.RULE_FIRST -> !ruleMatched
+            AiMode.COMMAND_ONLY ->
+                message.cleanText().startsWith(COMMAND_PREFIX, ignoreCase = true)
+        }
+    }
+
+    /** 剥掉 /ai 前缀，得到真正要问的问题。 */
+    fun extractQuestion(message: IncomingMessage): String {
+        val text = message.cleanText()
+        return if (text.startsWith(COMMAND_PREFIX, ignoreCase = true)) {
+            text.substring(COMMAND_PREFIX.length).trim()
+        } else {
+            text
+        }
+    }
+
+    /**
+     * 生成回复。
+     *
+     * @return 助手回复文本；失败时抛出 [LlmException]，由调用方决定兜底话术。
+     */
+    suspend fun reply(
+        message: IncomingMessage,
+        config: AiConfig,
+    ): String {
+        val key = conversationKey(message)
+        val question = extractQuestion(message)
+
+        lockFor(key).withLock {
+            // 清空指令不调用模型，直接重置上下文
+            if (question.lowercase() in CLEAR_COMMANDS) {
+                history.clear(key)
+                return "已清空与本会话的上下文，可以开始新对话了。"
+            }
+
+            if (question.isBlank()) return "请问你想问什么？"
+
+            val historyLimit = (config.contextTurns * 2).coerceIn(2, 40)
+            val stored = history.load(key, historyLimit)
+
+            val result =
+                try {
+                    callLlm(stored, question, config)
+                } catch (e: ContextTooLongException) {
+                    // 估算偏差或历史里混进超长消息：砍掉一半历史重试一次，
+                    // 仍失败就把异常抛给调用方走兜底话术。
+                    val halved = stored.drop(stored.size / 2)
+                    callLlm(halved, question, config)
+                }
+
+            // 成功后才写入历史：失败的请求不应污染上下文
+            history.append(key, ChatMessage(role = "user", content = question))
+            history.append(key, ChatMessage(role = "assistant", content = result.content))
+            history.trim(key, historyLimit)
+
+            return truncate(result.content)
+        }
+    }
+
+    /** 最近一次成功调用的用量（供维护端展示缓存命中率），无调用时为 null。 */
+    private val _lastUsage = MutableStateFlow<LlmUsage?>(null)
+    val lastUsage: StateFlow<LlmUsage?> = _lastUsage.asStateFlow()
+
+    private suspend fun callLlm(
+        storedHistory: List<ChatMessage>,
+        question: String,
+        config: AiConfig,
+    ): LlmReply {
+        val messages =
+            assembleMessages(
+                systemPrompt = config.systemPrompt,
+                history = storedHistory,
+                question = question,
+                tokenBudget = config.contextTokenBudget,
+            )
+        val reply =
+            client.chat(
+                baseUrl = config.baseUrl,
+                apiKey = config.apiKey,
+                model = config.model,
+                messages = messages,
+                temperature = config.temperature,
+                maxTokens = config.maxTokens,
+                thinkingType = thinkingParam(config),
+            )
+        _lastUsage.value = reply.usage
+        return reply
+    }
+
+    /**
+     * 组装消息列表——**顺序本身就是缓存策略**。
+     *
+     * 1. system（人设/记忆）必须最先且内容逐字节稳定：DeepSeek 的前缀缓存要求
+     *    「从第 0 个 token 起完全相同」，在 system 里插时间戳之类变化内容
+     *    会让后面全部缓存失效，既费钱又慢；
+     * 2. 历史按时间正序 append-only，超预算时从最早开始**成对**丢弃
+     *    （一问一答算一对），保证问答配对完整；
+     * 3. 本轮问题固定放最后。
+     */
+    internal fun assembleMessages(
+        systemPrompt: String,
+        history: List<ChatMessage>,
+        question: String,
+        tokenBudget: Int,
+    ): List<ChatMessage> {
+        val system =
+            if (systemPrompt.isNotBlank()) {
+                listOf(ChatMessage(role = "system", content = systemPrompt))
+            } else {
+                emptyList()
+            }
+        val tail = listOf(ChatMessage(role = "user", content = question))
+        var remaining = (tokenBudget - TokenEstimator.estimate(system) - TokenEstimator.estimate(tail))
+            .coerceAtLeast(0)
+
+        val kept = ArrayDeque<ChatMessage>()
+        var i = history.size - 1
+        while (i >= 1) {
+            val cost = TokenEstimator.estimate(history[i - 1].content) +
+                TokenEstimator.estimate(history[i].content)
+            if (cost > remaining) break
+            kept.addFirst(history[i])
+            kept.addFirst(history[i - 1])
+            remaining -= cost
+            i -= 2
+        }
+        // 历史条数为奇数时最早那条落单，预算还够就带上
+        if (i == 0 && TokenEstimator.estimate(history[0].content) <= remaining) {
+            kept.addFirst(history[0])
+        }
+        return system + kept + tail
+    }
+
+    /**
+     * 是否发送 thinking 参数、发送什么值。
+     *
+     * thinking 是 DeepSeek 扩展字段：OpenAI 等实现严格的的服务商遇到未知字段
+     * 会直接 400，因此仅在「端点域名或模型名含 deepseek」时才发送——
+     * 模型名也参与判断是为了覆盖通过第三方代理转发 DeepSeek 的场景；
+     * 其余情况等同 AUTO（不发送，由服务端默认行为决定）。
+     */
+    internal fun thinkingParam(config: AiConfig): String? {
+        if (config.thinkingMode == ThinkingMode.AUTO) return null
+        val looksLikeDeepSeek =
+            config.baseUrl.contains("deepseek", ignoreCase = true) ||
+                config.model.contains("deepseek", ignoreCase = true)
+        if (!looksLikeDeepSeek) return null
+        return when (config.thinkingMode) {
+            ThinkingMode.DISABLED -> "disabled"
+            ThinkingMode.ENABLED -> "enabled"
+            ThinkingMode.AUTO -> null
+        }
+    }
+
+    /** 清空某个会话的上下文。 */
+    suspend fun clearHistory(message: IncomingMessage) {
+        history.clear(conversationKey(message))
+    }
+
+    /** 启动时清理一次全局过期历史。 */
+    suspend fun trimAllHistory(keep: Int) {
+        history.trimAll(keep)
+    }
+
+    /**
+     * 会话标识。
+     *
+     * 群聊与单聊分开，避免把 A 群的问题答案喂给 B 群。
+     */
+    private fun conversationKey(message: IncomingMessage): String =
+        when (message.kind) {
+            MessageKind.GROUP_AT -> "g:${message.targetId}"
+            MessageKind.GUILD -> "c:${message.targetId}"
+            MessageKind.C2C -> "u:${message.targetId}"
+            MessageKind.DIRECT -> "d:${message.targetId}"
+        }
+
+    private fun truncate(text: String): String =
+        if (text.length <= MAX_REPLY_LENGTH) {
+            text
+        } else {
+            text.take(MAX_REPLY_LENGTH) + "\n……（回复过长已截断）"
+        }
+}

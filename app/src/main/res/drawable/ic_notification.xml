@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  通知图标：Android 会对通知栏图标做单色化处理，
+  因此这里只画白色剪影，不使用彩色。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#FFFFFF">
+
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M12,2
+            C17.52,2 22,6.48 22,12
+            C22,17.52 17.52,22 12,22
+            C6.48,22 2,17.52 2,12
+            C2,6.48 6.48,2 12,2 Z
+            M9.5,10
+            A1.5,1.5 0 1 0 9.5,13
+            A1.5,1.5 0 1 0 9.5,10
+            M14.5,10
+            A1.5,1.5 0 1 0 14.5,13
+            A1.5,1.5 0 1 0 14.5,10
+            M12,17.5
+            C13.93,17.5 15.71,16.36 16.62,14.5
+            H7.38
+            C8.29,16.36 10.07,17.5 12,17.5 Z" />
+</vector>

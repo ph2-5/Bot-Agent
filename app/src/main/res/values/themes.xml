@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Compose 负责绘制内容，这里只需要一个不带 ActionBar 的壳，
+      因此直接继承系统主题，无需引入额外的 Material Components 依赖。
+    -->
+    <style name="Theme.QBotMobile" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>
