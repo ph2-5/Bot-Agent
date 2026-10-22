@@ -204,11 +204,28 @@ class InMemoryRoomContextStore : RoomContextStore {
  * @param senderLabel 已解析的展示名（回退值保证非空）
  * @param facts 关于这个人的持久事实（注入提示词）
  * @param roomDigest 所在范围的近期对话（注入提示词，群聊才非空）
+ * @param group 所在群的画像（机器人群名片、见过多少成员；群聊才非空）
  */
 data class MemoryContext(
     val senderLabel: String,
     val facts: List<UserFact> = emptyList(),
     val roomDigest: List<RoomMessage> = emptyList(),
+    val group: GroupDigest? = null,
+)
+
+/**
+ * 群画像摘要：注入提示词，让机器人回答「你叫什么」「群里有多少人」时有据可依。
+ *
+ * @param groupId 群 openid
+ * @param botName 机器人在本群的名字（手动设置/聊天指令「叫你X」），null 时用全局名
+ * @param seenCount 本群跟机器人打过招呼/进过群的成员数（openid 级别）
+ * @param proactiveAllowed 群是否允许机器人主动发言（GROUP_MSG_REJECT 后为 false）
+ */
+data class GroupDigest(
+    val groupId: String,
+    val botName: String?,
+    val seenCount: Int,
+    val proactiveAllowed: Boolean = true,
 )
 
 /**

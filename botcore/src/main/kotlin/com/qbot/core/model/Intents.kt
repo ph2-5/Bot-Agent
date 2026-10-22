@@ -40,6 +40,17 @@ object Intents {
     /** (1 << 25) 公域群/C2C 消息事件（群 @机器人 + QQ 消息列表单聊 + 加好友/退群等） */
     const val PUBLIC_MESSAGES = 1 shl 25
 
+    /**
+     * (1 << 24) 群成员事件（新成员加入群聊）。
+     *
+     * ⚠️ 这一位**官方 wiki 已上线但 botpy 尚未收录**（botpy flags.py 里没有），
+     * 依据官方文档：https://bot.qq.com/wiki/develop/api-v2/autogen/event/group_member_add.html
+     * 事件名 GROUP_MEMBER_ADD，载荷 {timestamp, group_openid, member_openid, user_openid}。
+     * 它是公域机器人「感知群里有谁」的唯一渠道，因此默认订阅；
+     * 若该机器人未获授权，服务端会拒绝 Identify，客户端按降级梯级先摘掉这一位重试。
+     */
+    const val GROUP_MEMBER_EVENT = 1 shl 24
+
     /** (1 << 26) 互动事件（按钮/机器人"设置"等） */
     const val INTERACTION = 1 shl 26
 
@@ -73,10 +84,19 @@ object Intents {
             OPEN_FORUMS_EVENT or
             AUDIO_OR_LIVE_CHANNEL_MEMBER or
             PUBLIC_MESSAGES or
+            GROUP_MEMBER_EVENT or
             INTERACTION or
             MESSAGE_AUDIT or
             AUDIO_ACTION or
             PUBLIC_GUILD_MESSAGES
+
+    /**
+     * 降级第一档：只摘掉群成员事件位。
+     *
+     * GROUP_MEMBER_EVENT 是最可能未获授权的新位（官方 wiki 有、botpy 未收录），
+     * 被拒时先单独摘掉它，保住其余全部订阅，而不是一步跌到只收消息。
+     */
+    const val DEFAULT_WITHOUT_GROUP_MEMBER = DEFAULT and GROUP_MEMBER_EVENT.inv()
 
     /** 只收消息：群 @、C2C 单聊、频道私信、公域 @消息，用于省电模式。 */
     const val MESSAGES_ONLY = PUBLIC_MESSAGES or DIRECT_MESSAGE or PUBLIC_GUILD_MESSAGES

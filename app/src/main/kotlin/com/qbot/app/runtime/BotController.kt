@@ -6,6 +6,7 @@ import com.qbot.app.data.db.LogEntity
 import com.qbot.app.data.repo.PersonaRepository
 import com.qbot.app.data.repo.RoomAiHistoryStore
 import com.qbot.app.data.repo.RoomFactStore
+import com.qbot.app.data.repo.RoomGroupStore
 import com.qbot.app.data.repo.RoomIdentityStore
 import com.qbot.app.data.repo.RoomSharedContextStore
 import com.qbot.app.data.repo.SettingsRepository
@@ -110,10 +111,25 @@ class BotController(
     private val roomContextStore = RoomSharedContextStore(database.roomMessageDao())
 
     /**
-     * 记忆管线：身份 → 事实 → 共享群聊背景。
+     * 群档案存储（机器人进过哪些群、群里见过谁、群名片、主动消息权限）。
+     *
+     * 平台不提供群成员名单接口，档案完全靠网关事件拼出来，
+     * 落库后跨重启保留，维护端也能直接查看与管理。
+     */
+    private val groupStore =
+        RoomGroupStore(
+            groupDao = database.groupDao(),
+            memberDao = database.groupMemberDao(),
+        )
+
+    /**
+     * 记忆管线：身份 → 事实 → 共享群聊背景 → 群画像。
      *
      * 存储全部走 Room，跨重启保留；配置由 [SettingsRepository.memoryConfig]
      * 在每条消息处理时现取，改设置无需重启。
+     *
+     * 群名片的全局兜底名（READY 下发的 username）在连接建立后才有，
+     * 因此用 lambda 延迟读取运行时，而不是在构造时固定。
      */
     private val memoryPipeline =
         MemoryPipeline(
@@ -121,6 +137,8 @@ class BotController(
             facts = factStore,
             roomContext = roomContextStore,
             configProvider = { settings.memoryConfig.value },
+            groupStore = groupStore,
+            botNameProvider = { runtime?.botName?.takeIf { it.isNotBlank() } },
         )
 
     /** 身份存储（公开给维护端 UI 做备注名 / 忘掉某人）。 */
@@ -129,11 +147,17 @@ class BotController(
     /** 事实存储（公开给维护端 UI 做删除某条记忆）。 */
     fun factStore(): RoomFactStore = factStore
 
+    /** 群档案存储（公开给维护端 UI 做群管理与群名片编辑）。 */
+    fun groupStore(): RoomGroupStore = groupStore
+
     /** AI 配置快照，供 UI 展示机器人是否具备 AI 能力。 */
     val aiConfig = settings.aiConfig
 
     /** 记忆系统配置快照，供 UI 展示与编辑。 */
     val memoryConfig = settings.memoryConfig
+
+    /** 加群问候语配置快照，供 UI 展示与编辑。 */
+    val greetingConfig = settings.greetingConfig
 
     /**
      * 最近一次 AI 调用的 token 用量（含缓存命中拆分）。
@@ -346,6 +370,13 @@ class BotController(
                 aiResponder = aiResponder,
                 aiConfigProvider = { settings.aiConfig.value },
                 memoryPipeline = memoryPipeline,
+                // 被拉进群时按设置发一句自我介绍（主动消息，默认关闭）。
+                // 空白文本等同于关闭，与「未开启」走同一条安静路径。
+                greetingTextProvider = {
+                    settings.greetingConfig.value.let { greeting ->
+                        if (greeting.enabled) greeting.text.trim().takeIf { it.isNotEmpty() } else null
+                    }
+                },
             )
 
         // 把网关状态转发到控制器自己的流上，

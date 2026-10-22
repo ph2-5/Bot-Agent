@@ -62,9 +62,10 @@ class BotApplication : Application() {
 
         database =
             Room.databaseBuilder(applicationContext, AppDatabase::class.java, "qbot.db")
-                // 记忆系统表（v3）走增量迁移，老用户的日志/规则/AI 历史全部保留；
+                // 记忆系统表（v3）与群感知表（v4）都走增量迁移，
+                // 老用户的日志/规则/AI 历史/身份/事实全部保留；
                 // 破坏性迁移只作为未知版本的兜底。
-                .addMigrations(AppDatabase.MIGRATION_2_3)
+                .addMigrations(AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4)
                 .fallbackToDestructiveMigration()
                 .build()
 

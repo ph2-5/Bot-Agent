@@ -695,8 +695,8 @@ class GatewayClient(
      *    （intents 含未定义位、或订阅了未申请的权限都会走到这里）。
      *
      * 盲目重新 Identify 只会永远卡在「连接中 → 鉴权中」的循环里，
-     * 因此按三级阶梯逐级降级重连：
-     *   完整订阅 → 仅消息事件 → 基础事件（官方默认授予、免申请）
+     * 因此按四级阶梯逐级降级重连：
+     *   完整订阅 → 去掉群成员事件位 → 仅消息事件 → 基础事件（官方默认授予、免申请）
      * 每级只砍掉最可能未获授权的部分，尽量保住「群聊@/单聊」核心能力；
      * 全部被拒才停机，并给出平台侧的操作指引。
      *
@@ -717,8 +717,10 @@ class GatewayClient(
         val nextLevel = degradeLevel + 1
         val nextIntents =
             when (nextLevel) {
-                1 -> Intents.MESSAGES_ONLY
-                2 -> Intents.BASIC
+                // 第一档：只摘掉最可能未获授权的群成员事件位，保住其余订阅
+                1 -> Intents.DEFAULT_WITHOUT_GROUP_MEMBER
+                2 -> Intents.MESSAGES_ONLY
+                3 -> Intents.BASIC
                 else -> null
             }
         if (nextIntents != null && nextIntents != currentIntents) {

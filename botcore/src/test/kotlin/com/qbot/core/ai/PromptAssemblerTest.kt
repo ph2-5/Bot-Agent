@@ -21,7 +21,8 @@ class PromptAssemblerTest {
         label: String = "小明",
         facts: List<UserFact> = emptyList(),
         digest: List<RoomMessage> = emptyList(),
-    ) = MemoryContext(senderLabel = label, facts = facts, roomDigest = digest)
+        group: GroupDigest? = null,
+    ) = MemoryContext(senderLabel = label, facts = facts, roomDigest = digest, group = group)
 
     private fun fact(text: String) = UserFact(senderId = "s", text = text)
 
@@ -207,5 +208,105 @@ class PromptAssemblerTest {
                 tokenBudget = 10_000,
             )
         assertTrue(messages.any { it.content.contains("[某人]") })
+    }
+
+    @Test
+    fun `群画像注入在事实之后 群背景之前`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "人设",
+                memory =
+                    memory(
+                        facts = listOf(fact("喜欢吃辣")),
+                        digest = listOf(roomMsg("小红", "在吗")),
+                        group =
+                            GroupDigest(
+                                groupId = "g",
+                                botName = "小助手",
+                                seenCount = 12,
+                                proactiveAllowed = true,
+                            ),
+                    ),
+                history = emptyList(),
+                question = "问题",
+                tokenBudget = 10_000,
+            )
+
+        assertEquals(5, messages.size)
+        assertEquals("人设", messages[0].content)
+        assertTrue(messages[1].content.contains("喜欢吃辣"))
+        assertTrue("群画像应包含本群昵称", messages[2].content.contains("小助手"))
+        assertTrue("群画像应包含成员数", messages[2].content.contains("12"))
+        assertTrue(messages[3].content.contains("小红"))
+        assertEquals("user", messages[4].role)
+    }
+
+    @Test
+    fun `群画像没有昵称时用官方名字兜底`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "",
+                memory =
+                    memory(
+                        group =
+                            GroupDigest(
+                                groupId = "g",
+                                botName = null,
+                                seenCount = 3,
+                                proactiveAllowed = true,
+                            ),
+                    ),
+                history = emptyList(),
+                question = "问题",
+                tokenBudget = 10_000,
+            )
+        assertTrue(messages.any { it.content.contains("还没有昵称") })
+    }
+
+    @Test
+    fun `群关闭主动消息时注入禁令`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "",
+                memory =
+                    memory(
+                        group =
+                            GroupDigest(
+                                groupId = "g",
+                                botName = null,
+                                seenCount = 3,
+                                proactiveAllowed = false,
+                            ),
+                    ),
+                history = emptyList(),
+                question = "问题",
+                tokenBudget = 10_000,
+            )
+        assertTrue(messages.any { it.content.contains("关闭了主动消息") })
+    }
+
+    @Test
+    fun `预算紧张时群画像保留 群背景被砍`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "",
+                memory =
+                    memory(
+                        digest = List(20) { roomMsg("小红", "啊".repeat(80)) },
+                        group =
+                            GroupDigest(
+                                groupId = "g",
+                                botName = "小助手",
+                                seenCount = 5,
+                                proactiveAllowed = true,
+                            ),
+                    ),
+                history = emptyList(),
+                question = "问题",
+                tokenBudget = 60,
+            )
+        assertTrue("群画像必须保留", messages.any { it.content.contains("小助手") })
+        assertFalse("背景应被砍掉", messages.any { it.content.contains("小红") })
+        assertTrue(messages.last().content.contains("问题"))
     }
 }

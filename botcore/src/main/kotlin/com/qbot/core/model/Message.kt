@@ -67,7 +67,58 @@ object EventType {
     const val MESSAGE_CREATE = "MESSAGE_CREATE"
     const val DIRECT_MESSAGE_CREATE = "DIRECT_MESSAGE_CREATE"
     const val INTERACTION_CREATE = "INTERACTION_CREATE"
+
+    // ---- 群/好友生命周期通知（Intent GROUP_AND_C2C_EVENT 1<<25） ----
+    const val GROUP_ADD_ROBOT = "GROUP_ADD_ROBOT"
+    const val GROUP_DEL_ROBOT = "GROUP_DEL_ROBOT"
+    const val FRIEND_ADD = "FRIEND_ADD"
+    const val FRIEND_DEL = "FRIEND_DEL"
+    const val GROUP_MSG_RECEIVE = "GROUP_MSG_RECEIVE"
+    const val GROUP_MSG_REJECT = "GROUP_MSG_REJECT"
+
+    // ---- 群成员事件（Intent GROUP_MEMBER_EVENT 1<<24，官方 wiki 已上线） ----
+    const val GROUP_MEMBER_ADD = "GROUP_MEMBER_ADD"
 }
+
+/** 群/好友生命周期通知的类型。 */
+enum class GroupNoticeKind {
+    /** 机器人被拉进群 */
+    ROBOT_ADDED,
+
+    /** 机器人被移出群 */
+    ROBOT_REMOVED,
+
+    /** 新成员加入群 */
+    MEMBER_ADDED,
+
+    /** 用户添加机器人为好友 */
+    FRIEND_ADDED,
+
+    /** 用户删除机器人好友 */
+    FRIEND_REMOVED,
+
+    /** 群管理员开启了机器人的主动消息通知 */
+    PROACTIVE_ALLOWED,
+
+    /** 群管理员关闭了机器人的主动消息通知 */
+    PROACTIVE_REJECTED,
+}
+
+/**
+ * 群/好友生命周期通知。
+ *
+ * 这是机器人「感知群里有谁」的主要渠道：平台不提供群成员列表接口，
+ * 但每次有人进群都会推 [GroupNoticeKind.MEMBER_ADDED]，积少成多即可
+ * 拼出群成员画像（openid 级别，展示名仍靠自称/人工备注补齐）。
+ */
+data class GroupNotice(
+    val kind: GroupNoticeKind,
+    /** 群 openid；好友类事件为 null */
+    val groupId: String?,
+    /** 操作者/成员 openid（op_member_openid / member_openid / openid） */
+    val actorId: String?,
+    val timestampMillis: Long,
+)
 
 private fun JsonObject.stringOrNull(key: String): String? =
     get(key)?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotEmpty() }
@@ -144,6 +195,60 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
         senderName = senderName,
         timestampMillis = if (timestamp > 1_000_000_000_000L) timestamp else timestamp * 1000,
         raw = obj,
+    )
+}
+
+/**
+ * 把 Dispatch 帧解析为 [GroupNotice]。
+ *
+ * 覆盖官方 GROUP_AND_C2C_EVENT（1<<25）与 GROUP_MEMBER_EVENT（1<<24）
+ * 下的全部群/好友生命周期事件；其余事件返回 null。
+ *
+ * 载荷字段（官方 wiki）：
+ * - GROUP_ADD_ROBOT / GROUP_DEL_ROBOT：{timestamp, group_openid, op_member_openid}
+ * - GROUP_MEMBER_ADD：{timestamp, group_openid, member_openid, user_openid}
+ * - GROUP_MSG_RECEIVE / GROUP_MSG_REJECT：{timestamp, group_openid}
+ * - FRIEND_ADD / FRIEND_DEL：{timestamp, openid}
+ */
+fun parseGroupNotice(
+    eventType: String,
+    d: JsonElement?,
+): GroupNotice? {
+    val obj = d as? JsonObject ?: return null
+
+    val kind =
+        when (eventType) {
+            EventType.GROUP_ADD_ROBOT -> GroupNoticeKind.ROBOT_ADDED
+            EventType.GROUP_DEL_ROBOT -> GroupNoticeKind.ROBOT_REMOVED
+            EventType.GROUP_MEMBER_ADD -> GroupNoticeKind.MEMBER_ADDED
+            EventType.FRIEND_ADD -> GroupNoticeKind.FRIEND_ADDED
+            EventType.FRIEND_DEL -> GroupNoticeKind.FRIEND_REMOVED
+            EventType.GROUP_MSG_RECEIVE -> GroupNoticeKind.PROACTIVE_ALLOWED
+            EventType.GROUP_MSG_REJECT -> GroupNoticeKind.PROACTIVE_REJECTED
+            else -> return null
+        }
+
+    val seconds =
+        obj["timestamp"]?.jsonPrimitive?.longOrNull
+            ?: obj.stringOrNull("timestamp")?.toLongOrNull()
+
+    // 与消息解析同一套 heuristic：超过 1e12 视为毫秒，否则按秒换算
+    val millis =
+        when {
+            seconds == null || seconds <= 0L -> System.currentTimeMillis()
+            seconds > 1_000_000_000_000L -> seconds
+            else -> seconds * 1000
+        }
+
+    return GroupNotice(
+        kind = kind,
+        groupId = obj.stringOrNull("group_openid"),
+        actorId =
+            obj.stringOrNull("op_member_openid")
+                ?: obj.stringOrNull("member_openid")
+                ?: obj.stringOrNull("openid")
+                ?: obj.nestedStringOrNull("author", "user_openid"),
+        timestampMillis = millis,
     )
 }
 

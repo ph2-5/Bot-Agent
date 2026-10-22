@@ -9,6 +9,8 @@ package com.qbot.core.ai
  *    「从第 0 个 token 起完全相同」，人设里插时间戳之类变化内容会让后面全部失效。
  * 2. **关于对方的事实（system）**：按人隔离，且只追加不重写——
  *    同一个人后续对话的前缀保持稳定，缓存持续命中。
+ * 2.5. **群画像（system）**：机器人在本群的名字、本群有过交流的成员数。
+ *    内容短且极少变化，位置同样在动态内容之前。
  * 3. **群聊背景（system）**：动态内容，每条消息都变，注定无法缓存，
  *    因此放在事实之后、历史之前——它打断缓存的代价被控制在最小范围。
  * 4. **会话历史（user/assistant）**：按人隔离的对话线程。
@@ -84,6 +86,29 @@ class PromptAssembler {
                 result += ChatMessage(role = "system", content = block)
                 remaining -= TokenEstimator.estimate(block)
             }
+        }
+
+        // 2.5) 群画像：机器人在本群的名字 + 见过多少成员。
+        // 内容短且极少变化（仅新成员进群/改名时变），放在事实之后、
+        // 动态群背景之前，把前缀缓存的失效控制在最小范围。
+        val group = memory?.group
+        if (group != null) {
+            val lines = mutableListOf("你正在一个 QQ 群里聊天。")
+            lines +=
+                if (group.botName != null) {
+                    "你在这个群的名字叫「${group.botName}」，大家会用这个名字称呼你。"
+                } else {
+                    "你在这个群还没有昵称，被问到名字时用官方名字即可。"
+                }
+            lines +=
+                "这个群里跟你有过交流的成员约 ${group.seenCount} 人" +
+                    "（平台不提供完整成员名单，不要编造群成员姓名；有人问「群里都有谁」时如实说明数量）。"
+            if (!group.proactiveAllowed) {
+                lines += "本群管理员关闭了主动消息，不要发送与当前对话无关的内容。"
+            }
+            val block = lines.joinToString("\n")
+            result += ChatMessage(role = "system", content = block)
+            remaining -= TokenEstimator.estimate(block)
         }
 
         // 3) 群聊背景：动态内容，预算紧张时最先牺牲

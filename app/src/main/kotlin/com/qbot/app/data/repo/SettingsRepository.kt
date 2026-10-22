@@ -38,6 +38,14 @@ data class BotCredentials(
         get() = appId.isNotBlank() && clientSecret.isNotBlank()
 }
 
+/** 加群问候语设置。 */
+data class GreetingConfig(
+    /** 总开关：关闭后被拉进群保持安静 */
+    val enabled: Boolean = false,
+    /** 问候语正文；空白等同于关闭 */
+    val text: String = "大家好，我是本群机器人，@我就能聊天，说「叫你XXX」可以给我取个群昵称。",
+)
+
 /**
  * 设置仓库。
  *
@@ -77,6 +85,10 @@ class SettingsRepository(private val context: Context) {
         val MEMORY_ROOM_SIZE = intPreferencesKey("memory_room_size")
         val MEMORY_LEARN_NAMES = booleanPreferencesKey("memory_learn_names")
         val MEMORY_LEARN_FACTS = booleanPreferencesKey("memory_learn_facts")
+
+        // ---- 群感知 ----
+        val GREETING_ENABLED = booleanPreferencesKey("greeting_enabled")
+        val GREETING_TEXT = stringPreferencesKey("greeting_text")
     }
 
     private companion object {
@@ -144,6 +156,16 @@ class SettingsRepository(private val context: Context) {
     private val _memoryConfig = MutableStateFlow(MemoryConfig())
     val memoryConfig: StateFlow<MemoryConfig> = _memoryConfig.asStateFlow()
 
+    /**
+     * 加群问候语配置。
+     *
+     * 与 [memoryConfig] 同一套机制：DataStore 出字段，
+     * 机器人被拉进群时 `.value` 取最新值，改设置无需重启。
+     * 问候语属于主动消息（消耗配额），默认关闭。
+     */
+    private val _greetingConfig = MutableStateFlow(GreetingConfig())
+    val greetingConfig: StateFlow<GreetingConfig> = _greetingConfig.asStateFlow()
+
     init {
         // DataStore 的变更合并进 StateFlow；加密偏好里的 apiKey 每次重新读，
         // 保证用户在设置页改完 Key 后保存即可生效。
@@ -151,6 +173,7 @@ class SettingsRepository(private val context: Context) {
             context.dataStore.data.collect { prefs ->
                 _aiConfig.value = readAiConfig(prefs)
                 _memoryConfig.value = readMemoryConfig(prefs)
+                _greetingConfig.value = readGreetingConfig(prefs)
             }
         }
     }
@@ -180,6 +203,25 @@ class SettingsRepository(private val context: Context) {
                 prefs[Keys.MEMORY_ROOM_SIZE] = config.roomContextSize
                 prefs[Keys.MEMORY_LEARN_NAMES] = config.learnNames
                 prefs[Keys.MEMORY_LEARN_FACTS] = config.learnFacts
+            }
+        }
+    }
+
+    private fun readGreetingConfig(prefs: Preferences): GreetingConfig {
+        val defaults = GreetingConfig()
+        return GreetingConfig(
+            enabled = prefs[Keys.GREETING_ENABLED] ?: defaults.enabled,
+            text = prefs[Keys.GREETING_TEXT] ?: defaults.text,
+        )
+    }
+
+    /** 保存加群问候语配置。 */
+    fun saveGreetingConfig(config: GreetingConfig) {
+        _greetingConfig.value = config
+        scope.launch {
+            context.dataStore.edit { prefs ->
+                prefs[Keys.GREETING_ENABLED] = config.enabled
+                prefs[Keys.GREETING_TEXT] = config.text
             }
         }
     }

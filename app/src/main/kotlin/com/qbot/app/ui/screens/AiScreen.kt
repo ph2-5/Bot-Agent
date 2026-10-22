@@ -45,26 +45,34 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.qbot.app.BotApplication
+import com.qbot.app.data.repo.GreetingConfig
+import com.qbot.app.data.repo.GroupSummary
+import com.qbot.app.data.repo.observeSummaries
 import com.qbot.core.ai.KnownPerson
 import com.qbot.core.ai.MemoryConfig
 import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.Persona
 import com.qbot.core.ai.UserFact
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.launch
 
 /**
- * AI 管理页：记忆系统 + 人设系统。
+ * AI 管理页：记忆系统 + 人设系统 + 群感知。
  *
  * 设计原则：
  * - 记忆页回答「机器人现在认识谁、记得什么」，每条记忆都可删——
  *   用户对机器人的记忆必须有最终处置权；
  * - 人设页回答「机器人现在是谁」，人设可绑定到
- *   具体某个人 / 某个群 / 全局，优先级 人 > 群 > 全局。
+ *   具体某个人 / 某个群 / 全局，优先级 人 > 群 > 全局；
+ * - 群组页回答「机器人进了哪些群、在每个群叫什么、见过多少人」——
+ *   平台不提供成员名单，这些档案全靠事件拼出来，这里既能查看也能手动修正。
  */
 @Composable
 fun AiScreen() {
     var tab by remember { mutableIntStateOf(0) }
-    val tabs = listOf("记忆", "人设")
+    val tabs = listOf("记忆", "人设", "群组")
 
     Column(modifier = Modifier.fillMaxSize()) {
         TabRow(selectedTabIndex = tab) {
@@ -78,7 +86,8 @@ fun AiScreen() {
         }
         when (tab) {
             0 -> MemoryTab()
-            else -> PersonaTab()
+            1 -> PersonaTab()
+            else -> GroupTab()
         }
     }
 }
@@ -662,6 +671,283 @@ private fun PersonaEditorDialog(
                 },
                 enabled = name.isNotBlank() && prompt.isNotBlank(),
             ) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
+// ---------- 群感知 ----------
+
+/** 群成员样本（openid + 解析出的展示名，可能为 null）。 */
+private data class MemberSample(
+    val memberId: String,
+    val displayName: String?,
+)
+
+@Composable
+private fun GroupTab() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val app = context.applicationContext as BotApplication
+    val controller = app.controller
+    val groupStore = controller.groupStore()
+    val scope = rememberCoroutineScope()
+
+    val greeting by controller.greetingConfig.collectAsState()
+    val summaries by groupStore.observeSummaries().collectAsState(initial = emptyList())
+
+    var expandedGroup by remember { mutableStateOf<String?>(null) }
+    var members by remember { mutableStateOf<List<MemberSample>>(emptyList()) }
+    var renameTarget by remember { mutableStateOf<GroupSummary?>(null) }
+
+    Column(
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        GreetingCard(
+            config = greeting,
+            onChange = { app.settings.saveGreetingConfig(it) },
+        )
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        ) {
+            Column(Modifier.padding(16.dp)) {
+                Text("群档案从哪来", fontWeight = FontWeight.Medium)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "QQ 官方不提供群成员名单接口，机器人进过哪些群、群里见过谁，" +
+                        "全靠网关事件（加群/退群/新成员/@消息）一点点拼出来。" +
+                        "在群里说「叫你XXX」可以改机器人的群名片，" +
+                        "说「群里都有谁」它会凭这些档案回答。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
+        if (summaries.isEmpty()) {
+            EmptyHint(
+                "还没有群档案",
+                "把机器人拉进任何一个群，它就会在这里建档；" +
+                    "之后群里每@它一次、每进一个新成员，档案都会更新。",
+            )
+        }
+
+        summaries.forEach { group ->
+            GroupCard(
+                group = group,
+                expanded = expandedGroup == group.groupId,
+                members = if (expandedGroup == group.groupId) members else emptyList(),
+                onToggle = {
+                    if (expandedGroup == group.groupId) {
+                        expandedGroup = null
+                    } else {
+                        expandedGroup = group.groupId
+                        scope.launch {
+                            val ids = groupStore.members(group.groupId)
+                            members =
+                                ids.map { id ->
+                                    MemberSample(
+                                        memberId = id,
+                                        displayName =
+                                            runCatching {
+                                                controller.identityStore().find(id)?.displayName
+                                            }.getOrNull(),
+                                    )
+                                }
+                        }
+                    }
+                },
+                onRename = { renameTarget = group },
+                onDelete = {
+                    scope.launch { groupStore.delete(group.groupId) }
+                },
+            )
+        }
+
+        Spacer(Modifier.height(32.dp))
+    }
+
+    renameTarget?.let { target ->
+        GroupRenameDialog(
+            current = target.botName.orEmpty(),
+            groupId = target.groupId,
+            onDismiss = { renameTarget = null },
+            onConfirm = { name ->
+                scope.launch {
+                    groupStore.rename(target.groupId, name.ifBlank { null })
+                    renameTarget = null
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun GreetingCard(
+    config: GreetingConfig,
+    onChange: (GreetingConfig) -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("加群问候语", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+
+            SwitchRow(
+                title = "被拉进群时打招呼",
+                desc = "开启后进群会主动发一句自我介绍（属于主动消息，消耗每日配额）",
+                checked = config.enabled,
+                onCheckedChange = { onChange(config.copy(enabled = it)) },
+            )
+
+            OutlinedTextField(
+                value = config.text,
+                onValueChange = { onChange(config.copy(text = it)) },
+                label = { Text("问候语正文") },
+                minLines = 2,
+                enabled = config.enabled,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            Text(
+                "留空等同于关闭。问候语只在新群第一次进群时发；" +
+                    "群管理员关闭主动消息后（GROUP_MSG_REJECT）不再发送。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun GroupCard(
+    group: GroupSummary,
+    expanded: Boolean,
+    members: List<MemberSample>,
+    onToggle: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val timeFormat = remember { SimpleDateFormat("MM-dd HH:mm", Locale.CHINA) }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f).clickable { onToggle() }) {
+                    Text(
+                        text = group.botName ?: "群 ${group.groupId.take(10)}…",
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Text(
+                        text = "见过 ${group.seenCount} 人 · 最近活跃 ${timeFormat.format(Date(group.lastSeenAt))}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = buildString {
+                            append(if (group.active) "在群中" else "已被移出")
+                            append(" · 主动消息")
+                            append(if (group.proactiveAllowed) "允许" else "已关闭")
+                            append(" · ")
+                            append(group.groupId.take(16))
+                            append("…")
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color =
+                            if (group.active) {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.error
+                            },
+                    )
+                }
+                IconButton(onClick = onRename) {
+                    Icon(Icons.Default.Edit, contentDescription = "改群名片")
+                }
+                IconButton(onClick = onDelete) {
+                    Icon(Icons.Default.Delete, contentDescription = "删除此群档案")
+                }
+            }
+
+            if (expanded) {
+                Spacer(Modifier.height(8.dp))
+                if (members.isEmpty()) {
+                    Text(
+                        "这个群还没有互动记录。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                members.forEach { member ->
+                    Text(
+                        text =
+                            "· " +
+                                (member.displayName ?: "群友${member.memberId.takeLast(6)}") +
+                                "  ${member.memberId.take(10)}…",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "成员按最近出现排序，每群最多保留 500 个样本（超出淘汰最久的）。" +
+                        "没报过名字的人只显示 openid 尾段。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun GroupRenameDialog(
+    current: String,
+    groupId: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var name by remember { mutableStateOf(current) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("群名片") },
+        text = {
+            Column {
+                Text(
+                    "设置后，机器人在这个群里被问到名字时用这个名字回答，" +
+                        "AI 也会被告知大家怎么称呼它。留空则用官方名字。" +
+                        "在群里直接说「叫你XXX」也能改。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("群名片（最多 12 字）") },
+                    singleLine = true,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "群 openid：${groupId.take(20)}…",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(name.trim()) }) { Text("保存") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )

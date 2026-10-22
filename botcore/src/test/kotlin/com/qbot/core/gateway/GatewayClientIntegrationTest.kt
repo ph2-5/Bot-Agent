@@ -322,18 +322,18 @@ class GatewayClientIntegrationTest {
     }
 
     @Test
-    fun `intents 无权限时按三级阶梯自动降级并重连成功`() {
+    fun `intents 无权限时按四级阶梯自动降级并重连成功`() {
         enqueueToken()
         enqueueGateway()
-        // 前两次连接：Identify 后服务端以 4014（intent 无权限）关闭
-        repeat(2) {
+        // 前三次连接：Identify 后服务端以 4014（intent 无权限）关闭
+        repeat(3) {
             enqueueWebSocketUpgrade { ws, frame ->
                 if (Json.frameOp(frame) == OpCode.IDENTIFY) {
                     ws.close(GatewayCloseCode.UNAUTHORIZED_INTENT, "intent 无权限")
                 }
             }
         }
-        // 第三次连接：基础事件集合获准，正常 READY
+        // 第四次连接：基础事件集合获准，正常 READY
         enqueueWebSocketUpgrade { ws, frame ->
             if (Json.frameOp(frame) == OpCode.IDENTIFY) {
                 ws.send("""{"op":0,"s":1,"t":"READY","d":{"version":1,"session_id":"sid-3"}}""")
@@ -354,20 +354,26 @@ class GatewayClientIntegrationTest {
         val ready = waitFor(15_000L) { it.state == ConnectionState.READY }
         assertEquals("逐级降级后应能连上", ConnectionState.READY, ready.state)
 
-        // 校验三次 Identify 逐级降级：完整 → 仅消息 → 基础
+        // 校验四次 Identify 逐级降级：
+        // 完整 → 去掉群成员事件位 → 仅消息 → 基础
         val identifies =
             synchronized(receivedFrames) {
                 receivedFrames.filter { Json.frameOp(it) == OpCode.IDENTIFY }
             }
-        assertEquals("应有三次 Identify", 3, identifies.size)
+        assertEquals("应有四次 Identify", 4, identifies.size)
         val ladder =
             identifies.map {
                 Json.parseToJsonElement(it).jsonObject["d"]!!.jsonObject["intents"]!!
                     .jsonPrimitive.content.toInt()
             }
         assertEquals(
-            "降级阶梯应为 完整 → 仅消息 → 基础",
-            listOf(Intents.DEFAULT, Intents.MESSAGES_ONLY, Intents.BASIC),
+            "降级阶梯应为 完整 → 去群成员位 → 仅消息 → 基础",
+            listOf(
+                Intents.DEFAULT,
+                Intents.DEFAULT_WITHOUT_GROUP_MEMBER,
+                Intents.MESSAGES_ONLY,
+                Intents.BASIC,
+            ),
             ladder,
         )
     }
@@ -376,8 +382,8 @@ class GatewayClientIntegrationTest {
     fun `降级后仍无权限则停机并给出平台指引`() {
         enqueueToken()
         enqueueGateway()
-        // 三级阶梯全部被 4014 拒绝
-        repeat(3) {
+        // 四级阶梯全部被 4014 拒绝
+        repeat(4) {
             enqueueWebSocketUpgrade { ws, frame ->
                 if (Json.frameOp(frame) == OpCode.IDENTIFY) {
                     ws.close(GatewayCloseCode.UNAUTHORIZED_INTENT, "intent 无权限")
@@ -391,7 +397,7 @@ class GatewayClientIntegrationTest {
         val degraded = waitFor { it.lastError?.contains("降级") == true }
         assertTrue(degraded.lastError!!.contains("降级"))
 
-        // 三级降级全部被拒 → 应进入 FATAL 并提示去平台申请
+        // 四级降级全部被拒 → 应进入 FATAL 并提示去平台申请
         val fatal = waitFor(15_000L) { it.state == ConnectionState.FATAL }
         assertEquals(ConnectionState.FATAL, fatal.state)
         assertTrue(
@@ -440,7 +446,8 @@ class GatewayClientIntegrationTest {
         val secondIntents =
             Json.parseToJsonElement(identifies[1]).jsonObject["d"]!!.jsonObject["intents"]!!
                 .jsonPrimitive.content.toInt()
-        assertEquals(Intents.MESSAGES_ONLY, secondIntents)
+        // 第一级降级：只摘掉群成员事件位，其余订阅保留
+        assertEquals(Intents.DEFAULT_WITHOUT_GROUP_MEMBER, secondIntents)
     }
 
     @Test

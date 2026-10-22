@@ -137,8 +137,10 @@ interface AiHistoryDao {
         FactEntity::class,
         RoomMessageEntity::class,
         PersonaEntity::class,
+        GroupEntity::class,
+        GroupMemberEntity::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -155,6 +157,10 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun roomMessageDao(): RoomMessageDao
 
     abstract fun personaDao(): PersonaDao
+
+    abstract fun groupDao(): GroupDao
+
+    abstract fun groupMemberDao(): GroupMemberDao
 
     companion object {
         /**
@@ -218,6 +224,48 @@ abstract class AppDatabase : RoomDatabase() {
                             updatedAt INTEGER NOT NULL
                         )
                         """.trimIndent(),
+                    )
+                }
+            }
+
+        /**
+         * v3 → v4：群感知表（群档案 + 群成员样本）。
+         *
+         * 同样是纯增量迁移：老用户的身份、事实、背景、人设全部保留。
+         * 索引名必须与 Room 为实体生成的名字一致（index_group_members_groupId 等），
+         * 否则打开数据库时 schema 校验会失败。
+         */
+        val MIGRATION_3_4 =
+            object : androidx.room.migration.Migration(3, 4) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS groups (
+                            groupId TEXT NOT NULL PRIMARY KEY,
+                            botName TEXT,
+                            joinedAt INTEGER NOT NULL,
+                            lastSeenAt INTEGER NOT NULL,
+                            active INTEGER NOT NULL,
+                            proactiveAllowed INTEGER NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS group_members (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            groupId TEXT NOT NULL,
+                            memberId TEXT NOT NULL,
+                            lastSeenAt INTEGER NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS index_group_members_groupId ON group_members(groupId)",
+                    )
+                    db.execSQL(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS index_group_members_groupId_memberId" +
+                            " ON group_members(groupId, memberId)",
                     )
                 }
             }

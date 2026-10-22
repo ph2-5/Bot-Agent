@@ -11,10 +11,12 @@ import com.qbot.core.model.IncomingMessage
 import com.qbot.core.model.MessageKind
 import com.qbot.core.model.ReadyUser
 import com.qbot.core.model.cleanText
+import com.qbot.core.model.parseGroupNotice
 import com.qbot.core.util.Logger
 import com.qbot.core.util.NoopLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -66,6 +68,14 @@ class BotRuntime(
      * 行为与接入前完全一致（测试与「轻量模式」用）。
      */
     private val memoryPipeline: MemoryPipeline? = null,
+    /**
+     * 加群问候语提供者。
+     *
+     * 返回空白/null 表示关闭问候。机器人被拉进群时若开启，
+     * 会以主动消息形式发一句自我介绍（消耗主动消息配额，
+     * 因此默认关闭，由用户在维护端显式打开）。
+     */
+    private val greetingTextProvider: (() -> String?)? = null,
 ) : SimpleGatewayListener() {
     companion object {
         private const val TAG = "Runtime"
@@ -117,6 +127,44 @@ class BotRuntime(
         scope.launch { processMessage(message, text) }
     }
 
+    /**
+     * 群/好友生命周期通知（加群、退群、新成员入群、主动消息开关）。
+     *
+     * 这些事件不是消息，网关会走 onRawEvent 分发过来。
+     * 全部处理都放进协程：要查库、可能要发问候消息。
+     */
+    override fun onRawEvent(
+        eventType: String,
+        payload: JsonObject,
+    ) {
+        val notice =
+            parseGroupNotice(eventType, payload) ?: return
+        scope.launch { handleGroupNotice(notice) }
+    }
+
+    private suspend fun handleGroupNotice(notice: com.qbot.core.model.GroupNotice) {
+        val pipeline = memoryPipeline ?: return
+        pipeline.handleGroupNotice(notice) { groupId ->
+            // 被拉进群：按设置决定是否发一句自我介绍（主动消息，消耗配额）
+            val greeting = greetingTextProvider?.invoke()?.trim()
+            if (greeting.isNullOrEmpty()) {
+                log(LogLevel.INFO, TAG, "已加入群 $groupId（未开启问候语）")
+                return@handleGroupNotice
+            }
+            val profile = runCatching { pipeline.groupProfile(groupId) }.getOrNull()
+            if (profile?.proactiveAllowed == false) {
+                log(LogLevel.INFO, TAG, "已加入群 $groupId（群已关闭主动消息，跳过问候）")
+                return@handleGroupNotice
+            }
+            runCatching {
+                api.sendGroupMessage(groupId, greeting)
+                log(LogLevel.INFO, TAG, "已加入群 $groupId → 已发送问候语")
+            }.onFailure { t ->
+                log(LogLevel.WARN, TAG, "问候语发送失败：${t.message}")
+            }
+        }
+    }
+
     private suspend fun processMessage(
         message: IncomingMessage,
         text: String,
@@ -126,6 +174,10 @@ class BotRuntime(
         val label = memoryPipeline?.resolveLabel(message, text)
         val who = label ?: message.senderId?.takeLast(6) ?: "匿名"
         log(LogLevel.DEBUG, TAG, "收到[${message.kind}] $who: $text")
+
+        // 群内互动记账：把发送者记入「本群见过的人」。
+        // 不论这条消息最终走规则、记忆指令还是 AI，样本都不能漏。
+        memoryPipeline?.noteGroupActivity(message)
 
         // 记忆管理指令（我的记忆 / 忘掉X / 我是谁）优先于规则与 AI：
         // 它们是本地数据库操作，不依赖 AI 开关，且比任何规则都更具体。

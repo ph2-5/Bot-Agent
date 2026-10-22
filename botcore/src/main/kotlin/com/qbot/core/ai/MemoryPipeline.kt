@@ -84,6 +84,15 @@ class MemoryPipeline(
     private val extractor: MemoryExtractor = MemoryExtractor(),
     private val configProvider: () -> MemoryConfig = { MemoryConfig() },
     private val clock: () -> Long = { System.currentTimeMillis() },
+    /**
+     * 群档案存储（机器人进过哪些群、群里见过谁）。
+     *
+     * 为 null 时群感知整体关闭：不建群档、不注入群画像、
+     * 群相关指令（叫你X / 你叫什么 / 群里都有谁）不生效。
+     */
+    private val groupStore: GroupStore? = null,
+    /** 机器人全局名（READY 下发的 username），回答「你叫什么」时兜底 */
+    private val botNameProvider: (() -> String?)? = null,
 ) {
     companion object {
         /** 查看自己记忆的指令 */
@@ -96,6 +105,17 @@ class MemoryPipeline(
         /** 清空自己全部事实的指令 */
         val FORGET_ALL_COMMANDS =
             setOf("忘掉我", "忘记我", "清空我的记忆", "删除我的记忆", "忘掉关于我的所有记忆", "忘掉我的记忆")
+
+        /** 问机器人名字的指令 */
+        val BOT_NAME_COMMANDS = setOf("你叫什么", "你叫什么名字", "你叫啥", "你是谁")
+
+        /** 查本群都有谁的指令 */
+        val GROUP_MEMBERS_COMMANDS =
+            setOf("群里都有谁", "这群里都有谁", "群里有多少人", "这群有多少人", "群记忆", "群里的人")
+
+        /** 给机器人改群名片：「叫你小白 / 以后叫你小白 / 我以后就叫你小白」 */
+        val RENAME_BOT_REGEX =
+            Regex("^我?(?:以后|今后|从那以后)?(?:就)?叫你([\\u4e00-\\u9fa5A-Za-z0-9_-]{1,12})$")
 
         private const val TAG = "MemoryPipeline"
     }
@@ -148,12 +168,104 @@ class MemoryPipeline(
                 emptyList()
             }
 
-        return MemoryContext(senderLabel = label, facts = personFacts, roomDigest = digest)
+        // 群画像：只有群聊且装了这个群的档案才注入
+        val groupDigest = loadGroupDigest(message)
+
+        return MemoryContext(
+            senderLabel = label,
+            facts = personFacts,
+            roomDigest = digest,
+            group = groupDigest,
+        )
     }
 
+    /**
+     * 记录一次群内互动：把发送者记入「本群见过的人」并刷新活跃时间。
+     *
+     * 每条群消息都调用（不论走规则、记忆指令还是 AI）——
+     * 这是群成员画像唯一的积累渠道，漏一次就少一个样本。
+     */
+    suspend fun noteGroupActivity(message: IncomingMessage) {
+        val config = configProvider()
+        if (!config.enabled) return
+        val store = groupStore ?: return
+        if (message.kind != MessageKind.GROUP_AT) return
+        val groupId = message.targetId?.takeIf { it.isNotBlank() } ?: return
+        store.touch(groupId, message.senderId, clock())
+    }
+
+    /** 处理群生命周期通知（加群/退群/新成员/主动消息开关）。 */
+    suspend fun handleGroupNotice(
+        notice: com.qbot.core.model.GroupNotice,
+        onGreeting: (suspend (String) -> Unit)? = null,
+    ) {
+        val config = configProvider()
+        if (!config.enabled) return
+        val store = groupStore ?: return
+        val now = clock()
+        val groupId = notice.groupId ?: return
+
+        when (notice.kind) {
+            com.qbot.core.model.GroupNoticeKind.ROBOT_ADDED -> {
+                val existing = store.find(groupId)
+                store.upsert(
+                    GroupProfile(
+                        groupId = groupId,
+                        botName = existing?.botName, // 再加回旧群时保留群名片
+                        joinedAt = now,
+                        lastSeenAt = now,
+                        active = true,
+                        proactiveAllowed = existing?.proactiveAllowed ?: true,
+                        seenMembers = existing?.seenMembers.orEmpty(),
+                    ),
+                )
+                notice.actorId?.let { store.touch(groupId, it, now) }
+                // 是否发问候由调用方（BotRuntime 读设置开关）决定，这里只负责回调
+                onGreeting?.invoke(groupId)
+            }
+
+            com.qbot.core.model.GroupNoticeKind.ROBOT_REMOVED -> {
+                val existing = store.find(groupId) ?: return
+                store.upsert(existing.copy(active = false, lastSeenAt = now))
+            }
+
+            com.qbot.core.model.GroupNoticeKind.MEMBER_ADDED -> {
+                // 新成员进群：确保群档存在 + 记入见过的人。
+                // 没有成员名单接口，每一次 MEMBER_ADDED 都是一个珍贵样本。
+                val existing = store.find(groupId)
+                if (existing == null) {
+                    store.upsert(
+                        GroupProfile(
+                            groupId = groupId,
+                            joinedAt = now,
+                            lastSeenAt = now,
+                        ),
+                    )
+                }
+                notice.actorId?.let { store.touch(groupId, it, now) }
+            }
+
+            com.qbot.core.model.GroupNoticeKind.PROACTIVE_ALLOWED -> {
+                val existing = store.find(groupId) ?: return
+                store.upsert(existing.copy(proactiveAllowed = true, lastSeenAt = now))
+            }
+
+            com.qbot.core.model.GroupNoticeKind.PROACTIVE_REJECTED -> {
+                val existing = store.find(groupId) ?: return
+                store.upsert(existing.copy(proactiveAllowed = false, lastSeenAt = now))
+            }
+
+            com.qbot.core.model.GroupNoticeKind.FRIEND_ADDED,
+            com.qbot.core.model.GroupNoticeKind.FRIEND_REMOVED,
+            -> Unit // 好友事件不建群档
+        }
+    }
+
+    /** 查询群档案（运行层判断主动消息权限、维护端群管理都用它）。 */
+    suspend fun groupProfile(groupId: String): GroupProfile? = groupStore?.find(groupId)
+
     /** 把一轮问答写进共享背景（回复后调用）。 */
-    suspend fun recordExchange(
-        message: IncomingMessage,
+    suspend fun recordExchange(        message: IncomingMessage,
         cleanText: String,
         answer: String,
     ) {
@@ -245,6 +357,68 @@ class MemoryPipeline(
             }
         }
 
+        // ---- 群感知指令（需要群档案存储） ----
+        val store = groupStore ?: return null
+        val groupId = message.targetId?.takeIf { it.isNotBlank() }
+
+        // 你叫什么 / 你是谁 → 本群名片优先，全局名兜底
+        if (text in BOT_NAME_COMMANDS) {
+            val groupName = groupId?.let { store.find(it) }?.botName
+            val globalName = botNameProvider?.invoke()?.takeIf { it.isNotBlank() }
+            return when {
+                groupName != null -> "我在这个群叫「$groupName」呀，有事叫我这个名字就行。"
+                globalName != null -> "官方名字是「$globalName」。" +
+                    "想给我改个名的话，在群里说「叫你XXX」就行。"
+                else -> "我还没有名字——在群里说「叫你XXX」就能给我取一个。"
+            }
+        }
+
+        // 叫你X → 设置/更新本群名片（仅群聊有效）
+        val renameMatch = RENAME_BOT_REGEX.find(text)
+        if (renameMatch != null) {
+            val newName = renameMatch.groupValues[1].trim()
+            if (message.kind != MessageKind.GROUP_AT || groupId == null) {
+                return "改名字这件事只在群里有效哦——在那个群里说「叫你$newName」就行。"
+            }
+            val existing = store.find(groupId)
+            store.upsert(
+                GroupProfile(
+                    groupId = groupId,
+                    botName = newName,
+                    joinedAt = existing?.joinedAt ?: clock(),
+                    lastSeenAt = clock(),
+                    active = true,
+                    proactiveAllowed = existing?.proactiveAllowed ?: true,
+                    seenMembers = existing?.seenMembers.orEmpty(),
+                ),
+            )
+            return "好，以后在这个群里我就叫「$newName」了。"
+        }
+
+        // 群里都有谁 / 群里有多少人 → 本群见过的人（有名字的列名字）
+        if (text in GROUP_MEMBERS_COMMANDS) {
+            if (message.kind != MessageKind.GROUP_AT || groupId == null) {
+                return "这个只能在群里问我哦。"
+            }
+            val profile = store.find(groupId)
+            val seen = profile?.seenMembers.orEmpty()
+            if (seen.isEmpty()) {
+                return "这个群我还不熟悉——大家多@我聊几句，慢慢就认识了。" +
+                    "想让我记住你的话，说一句「叫我XXX」。"
+            }
+            val named =
+                seen.mapNotNull { id ->
+                    identities.find(id)?.displayName?.let { name -> id to name }
+                }
+            val unnamedCount = seen.size - named.size
+            val header = "这个群里跟机器人有过交流的有 ${seen.size} 人："
+            val lines =
+                named.map { (_, name) -> "- $name" } +
+                    if (unnamedCount > 0) listOf("- 还有 $unnamedCount 位没告诉我名字") else emptyList()
+            return header + "\n" + lines.joinToString("\n") +
+                "\n（说「叫我XXX」可以让我记住你）"
+        }
+
         return null
     }
 
@@ -275,6 +449,20 @@ class MemoryPipeline(
     }
 
     // ---------- 内部 ----------
+
+    /** 装载群画像摘要（群聊 + 有群档时才非空）。 */
+    private suspend fun loadGroupDigest(message: IncomingMessage): GroupDigest? {
+        val store = groupStore ?: return null
+        if (message.kind != MessageKind.GROUP_AT) return null
+        val groupId = message.targetId?.takeIf { it.isNotBlank() } ?: return null
+        val profile = store.find(groupId) ?: return null
+        return GroupDigest(
+            groupId = groupId,
+            botName = profile.botName,
+            seenCount = profile.seenCount,
+            proactiveAllowed = profile.proactiveAllowed,
+        )
+    }
 
     /**
      * 展示名解析顺序：
