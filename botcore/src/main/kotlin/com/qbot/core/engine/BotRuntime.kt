@@ -384,13 +384,8 @@ class BotRuntime(
                 is ChitchatGate.Forced -> current.reason
 
                 is ChitchatGate.Candidate -> {
-                    // 抽样概率随人设性格浮动：话痨 ×1.4，高冷 ×0.7
-                    if (random() > (config.probability * personaBias.probabilityFactor).coerceAtMost(1.0)) {
-                        pipeline.markChitchatDecision(message, "不接：概率未命中")
-                        log(LogLevel.VERBOSE, TAG, "群聊消息不接：概率未命中")
-                        return
-                    }
                     if (config.aiJudge) {
+                        // AI 主导：每条候选都问模型，不再按概率抽样
                         val aiCfg = aiConfigProvider?.invoke()
                         val responder = aiResponder
                         if (aiCfg == null || responder == null ||
@@ -414,8 +409,16 @@ class BotRuntime(
                             log(LogLevel.VERBOSE, TAG, "群聊消息不接：AI 判断不需要接话")
                             return
                         }
+                        "AI 判断接话"
+                    } else {
+                        // 规则主导：抽样概率随人设性格浮动（话痨 ×1.4，高冷 ×0.7）
+                        if (random() > (config.probability * personaBias.probabilityFactor).coerceAtMost(1.0)) {
+                            pipeline.markChitchatDecision(message, "不接：概率未命中")
+                            log(LogLevel.VERBOSE, TAG, "群聊消息不接：概率未命中")
+                            return
+                        }
+                        "规则 ${current.score} 分"
                     }
-                    "规则 ${current.score} 分"
                 }
             }
 

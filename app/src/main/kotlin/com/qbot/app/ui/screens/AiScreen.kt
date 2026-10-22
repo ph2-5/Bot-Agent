@@ -1255,8 +1255,9 @@ private fun ChitchatCard(
             )
 
             SwitchRow(
-                title = "插话前让 AI 判断",
-                desc = "更自然，但每条候选消息多一次很小的模型调用",
+                title = "让 AI 决定要不要接话（推荐）",
+                desc = "开启后每条消息都交给 AI 判断（规则只挡单字、@别人等明显噪音），" +
+                    "最懂语境；每条多一次很小的模型调用（maxTokens=8）",
                 checked = config.aiJudge,
                 onCheckedChange = { onChange(config.copy(aiJudge = it)) },
                 enabled = config.enabled,
@@ -1296,7 +1297,7 @@ private fun ChitchatCard(
             )
 
             Text(
-                "候选消息参与概率 ${(config.probability * 100).toInt()}%",
+                "候选消息参与概率 ${(config.probability * 100).toInt()}%（仅关闭 AI 判断时生效）",
                 style = MaterialTheme.typography.labelMedium,
             )
             Slider(

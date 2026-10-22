@@ -21,12 +21,13 @@ class ChitchatPolicyTest {
         maxPerHour: Int = 20,
         maxPerDay: Int = 200,
         minScore: Int = 15,
+        aiJudge: Boolean = false,
     ) = ChitchatConfig(
         enabled = enabled,
         baseCooldownMillis = baseCooldownMillis,
         maxPerHour = maxPerHour,
         maxPerDay = maxPerDay,
-        aiJudge = false,
+        aiJudge = aiJudge,
         minScore = minScore,
     )
 
@@ -319,4 +320,28 @@ class ChitchatPolicyTest {
         assertEquals("两种特质都出现时不猜", PersonaBias.NEUTRAL, PersonaBias.personaBiasFor("话痨但高冷"))
         assertEquals("空人设保持中性", PersonaBias.NEUTRAL, PersonaBias.personaBiasFor(null))
     }
+
+    @Test
+    fun `AI 主导时普通陈述也进候选`() =
+        runTest {
+            // 话题正热的普通陈述：规则主导会被阈值拦下，AI 主导应交给模型
+            val recent =
+                listOf(
+                    roomMsg(senderId = "u1", content = "今晚吃什么"),
+                    roomMsg(senderId = "u2", content = "随便，都行"),
+                )
+            val ruleMode = policy.gate("g1", "今天好热啊", names, config(), recent = recent)
+            assertTrue("规则主导下应被拦，实际=$ruleMode", ruleMode is ChitchatGate.Skip)
+
+            val aiMode =
+                policy.gate("g1", "今天好热啊", names, config(aiJudge = true), recent = recent)
+            assertTrue("AI 主导下应交模型判断，实际=$aiMode", aiMode is ChitchatGate.Candidate)
+        }
+
+    @Test
+    fun `AI 主导时仍挡明显噪音`() =
+        runTest {
+            val gate = policy.gate("g1", "哦", names, config(aiJudge = true))
+            assertTrue("单字噪音不该浪费模型调用，实际=$gate", gate is ChitchatGate.Skip)
+        }
 }

@@ -19,7 +19,12 @@ data class ChitchatConfig(
     val maxPerHour: Int = 60,
     /** 每群每天最多接话次数；**0 表示不限制** */
     val maxPerDay: Int = 400,
-    /** 通过预筛后是否再让 AI 判断一次「该不该插话」 */
+    /** 通过预筛后是否再让 AI 判断一次「该不该插话」。
+     *
+     * 开启后为 **AI 主导**：规则层只挡明显噪音（单字、@别人、刷屏等强负分），
+     * 其余每条消息都交给模型判断，不再按分数与概率卡——语境理解交给 AI。
+     * 关闭时为规则主导：分数达阈值 → 按概率抽样 → 直接接话，零模型调用。
+     */
     val aiJudge: Boolean = true,
     /** 通过预筛后的参与概率（0~1），先随机筛掉一部分再问 AI，进一步省成本 */
     val probability: Double = 0.35,
@@ -232,7 +237,18 @@ class ChitchatPolicy(
                 return ChitchatGate.Skip("冷却中（${cooldown / 1000} 秒）")
             }
 
+            // AI 主导模式：规则层只负责挡"明显噪音"（单字、@别人、刷屏等
+            // 强负分消息），其余每条都作为候选交给 AI 判断——
+            // 分数不再当门槛，语境理解这种事交给模型。
             val score = score(text, recent, state)
+            if (config.aiJudge) {
+                if (score < 0) {
+                    return ChitchatGate.Skip("明显插不上话（噪音）")
+                }
+                return ChitchatGate.Candidate(score)
+            }
+
+            // 规则主导模式：分数达到阈值才进入候选（不调用 AI 判断）
             // 阈值随人设性格浮动：话痨放宽、高冷收紧
             val threshold = config.minScore + personaBias.scoreDelta
             if (score < threshold) {
