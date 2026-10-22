@@ -1,0 +1,247 @@
+package com.qbot.app.runtime
+
+import com.qbot.app.data.db.RoomMessageDao
+import com.qbot.app.data.db.RoomMessageEntity
+import com.qbot.app.data.repo.PersonaRepository
+import com.qbot.core.ai.AiConfig
+import com.qbot.core.ai.GrowthAction
+import com.qbot.core.ai.GrowthStats
+import com.qbot.core.ai.LlmClient
+import com.qbot.core.ai.Persona
+import com.qbot.core.ai.PersonaGrowth
+import com.qbot.core.ai.PersonaGrowthConfig
+import com.qbot.core.ai.PersonaGrowthPolicy
+import com.qbot.core.ai.PersonaGrowthState
+import com.qbot.core.ai.PersonaKind
+import com.qbot.core.ai.PersonaSeed
+import com.qbot.core.ai.PersonaSnapshotKind
+import com.qbot.core.ai.PersonaStage
+import com.qbot.core.ai.RoomMessage
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+
+/**
+ * 人格自主成长的调度器。
+ *
+ * 每 [TICK_MILLIS] 醒一次，判断"该不该破壳 / 该不该长一截"。
+ * 判定逻辑本身在 botcore 的 [PersonaGrowthPolicy]（纯函数、可单测），
+ * 这里只负责取样、调模型、写库。
+ *
+ * 三层并发保护：
+ * 1. [mutex] 的 `tryLock`：同一时刻只跑一次，拿不到就跳过本轮（不排队）；
+ * 2. `commitBirth` 的 `AND stage='EMBRYO'`：并发破壳只有一个成功；
+ * 3. `commitGrowth` 的 `updatedAt` CAS：用户手改时成长结果直接丢弃。
+ */
+class PersonaGrowthScheduler(
+    private val repo: PersonaRepository,
+    private val messages: RoomMessageDao,
+    private val aiConfig: () -> AiConfig,
+    private val growthConfig: () -> PersonaGrowthConfig,
+    private val client: LlmClient,
+    private val botName: () -> String?,
+    private val log: (String) -> Unit,
+    private val clock: () -> Long = System::currentTimeMillis,
+) {
+    companion object {
+        /** 检查频率：不追求实时，十分钟一次足够 */
+        const val TICK_MILLIS = 10 * 60_000L
+
+        /** 取样覆盖几个群 */
+        private const val SAMPLE_SCOPES = 3
+
+        /** 每个群取多少条 */
+        private const val SAMPLE_PER_SCOPE = 16
+    }
+
+    private val mutex = Mutex()
+    private val growth = PersonaGrowth(client)
+
+    fun start(scope: CoroutineScope): Job =
+        scope.launch {
+            while (isActive) {
+                delay(TICK_MILLIS)
+                runCatching { tick() }.onFailure {
+                    log("人格成长检查失败：${it.message ?: it::class.simpleName}")
+                }
+            }
+        }
+
+    /** 跑一次检查；外部（UI 的"立即成长"）也可以直接调。 */
+    suspend fun tick() {
+        if (!mutex.tryLock()) return
+        try {
+            runOnce()
+        } finally {
+            mutex.unlock()
+        }
+    }
+
+    /**
+     * 手动催一次：忽略消息量与间隔门槛。
+     *
+     * 用户在界面上点「立即成长」时用。仍然受冻结、AI 未配置、并发互斥约束。
+     */
+    suspend fun force(): Boolean {
+        if (!mutex.tryLock()) return false
+        try {
+            val ai = aiConfig()
+            if (!ai.enabled || !ai.isReady) return false
+            val profile = repo.active() ?: return false
+            if (profile.kind != PersonaKind.PROFILE || profile.frozen) return false
+            return if (profile.stage == PersonaStage.EMBRYO) {
+                birth(profile, ai)
+            } else {
+                grow(profile, messages.countSince(profile.msgCursor), ai)
+            }
+        } finally {
+            mutex.unlock()
+        }
+    }
+
+    private suspend fun runOnce() {
+        val config = growthConfig()
+        if (!config.enabled) return
+
+        val ai = aiConfig()
+        if (!ai.enabled || !ai.isReady) return
+
+        val profile = repo.active() ?: return
+        if (profile.kind != PersonaKind.PROFILE || profile.frozen) return
+
+        val pending = messages.countSince(profile.msgCursor)
+        val action =
+            PersonaGrowthPolicy.next(
+                state =
+                    PersonaGrowthState(
+                        stage = profile.stage,
+                        frozen = profile.frozen,
+                        growthCount = profile.growthCount,
+                        birthAt = profile.birthAt,
+                        lastGrownAt = profile.lastGrownAt,
+                    ),
+                pendingMessages = pending,
+                now = clock(),
+                config = config,
+            )
+
+        when (action) {
+            GrowthAction.NONE -> Unit
+            GrowthAction.BIRTH -> birth(profile, ai)
+            GrowthAction.GROW -> grow(profile, pending, ai)
+        }
+    }
+
+    /** 破壳：种子 + 群聊 → 第一版人格。返回是否真的写成。 */
+    private suspend fun birth(
+        profile: Persona,
+        ai: AiConfig,
+    ): Boolean {
+        val seed = PersonaSeed.of(profile.seedId)
+        val samples = takeSamples(profile.msgCursor)
+
+        // 破壳前的骨架永远留一版：用户以后觉得"还不如一开始"，可以回滚到这里
+        if (!repo.hasInitialSnapshot(profile.id)) {
+            repo.addSnapshot(
+                personaId = profile.id,
+                name = profile.name,
+                prompt = PersonaGrowth.embryoSkeleton(profile.seedId),
+                kind = PersonaSnapshotKind.INITIAL,
+                note = "种子骨架（破壳前，不可删除）",
+            )
+        }
+
+        val draft = growth.birth(seed, samples, botName(), ai)
+        val cursor = messages.maxId() ?: 0
+        val ok =
+            repo.commitBirth(
+                id = profile.id,
+                prompt = draft.prompt,
+                seedId = seed.name,
+                cursor = cursor,
+                note = draft.note,
+            )
+        if (!ok) {
+            // 期间已经被另一次破壳抢先，丢弃本次结果即可（没有写快照，无需清理）
+            log("人格破壳被并发取消")
+            return false
+        }
+        repo.addSnapshot(profile.id, profile.name, draft.prompt, PersonaSnapshotKind.BIRTH, draft.note)
+        log("人格破壳完成（${seed.label}，参考 ${samples.size} 条群聊）")
+        return true
+    }
+
+    /** 微调：只允许小步修正。返回是否真的写成。 */
+    private suspend fun grow(
+        profile: Persona,
+        pending: Int,
+        ai: AiConfig,
+    ): Boolean {
+        val samples = takeSamples(profile.msgCursor)
+        val stats =
+            GrowthStats(
+                pendingMessages = pending,
+                daysSinceLastGrowth =
+                    if (profile.lastGrownAt <= 0) {
+                        0
+                    } else {
+                        ((clock() - profile.lastGrownAt) / 86_400_000L).toInt()
+                    },
+                growthCount = profile.growthCount,
+            )
+        val draft = growth.grow(profile.prompt, samples, stats, ai)
+        val cursor = messages.maxId() ?: 0
+        val nextStage =
+            if (profile.growthCount + 1 >= PersonaGrowthPolicy.MATURE_GROWTHS) {
+                PersonaStage.MATURE
+            } else {
+                PersonaStage.GROWING
+            }
+
+        val ok =
+            repo.commitGrowth(
+                id = profile.id,
+                prompt = draft.prompt,
+                stage = nextStage,
+                cursor = cursor,
+                note = draft.note,
+                // CAS：用户在此期间手改过，就放弃这次成长——手改永远赢
+                expectedUpdatedAt = profile.updatedAt,
+            )
+        if (!ok) {
+            log("人格成长被手动编辑打断，本次放弃")
+            return false
+        }
+        repo.addSnapshot(profile.id, profile.name, draft.prompt, PersonaSnapshotKind.GROWTH, draft.note)
+        log("人格成长完成：${draft.note}")
+        return true
+    }
+
+    /**
+     * 跨群均衡取样。
+     *
+     * 只取最近一个群会让人格变成那个群的镜子——某个群连着刷三天，
+     * 机器人就会开始用那个群的黑话和情绪。取最活跃的 3 个群各 16 条。
+     */
+    private suspend fun takeSamples(cursor: Long): List<RoomMessage> {
+        val scopes = messages.topScopesSince(cursor, SAMPLE_SCOPES)
+        if (scopes.isEmpty()) return emptyList()
+        return scopes.flatMap { scope ->
+            messages.recentSince(scope, cursor, SAMPLE_PER_SCOPE)
+                .asReversed()
+                .map { it.toRoomMessage() }
+        }
+    }
+
+    private fun RoomMessageEntity.toRoomMessage(): RoomMessage =
+        RoomMessage(
+            senderId = senderId,
+            senderName = senderName,
+            role = role,
+            content = content,
+            timestampMillis = timestampMillis,
+        )
+}

@@ -7,8 +7,11 @@ import com.qbot.app.data.db.PersonaSnapshotDao
 import com.qbot.app.data.db.PersonaSnapshotEntity
 import com.qbot.core.ai.KnownPerson
 import com.qbot.core.ai.Persona
+import com.qbot.core.ai.PersonaKind
+import com.qbot.core.ai.PersonaSeed
 import com.qbot.core.ai.PersonaSnapshot
 import com.qbot.core.ai.PersonaSnapshotKind
+import com.qbot.core.ai.PersonaStage
 import com.qbot.core.ai.PersonaStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -16,11 +19,12 @@ import kotlinx.coroutines.flow.map
 /**
  * 人设仓库。
  *
- * 一头连 Room（实现 botcore 的 [PersonaStore]，供 AiResponder 的人设解析用），
- * 一头连维护端 UI（Flow 形式的列表、最近互动的人）。
+ * 2.3.0 起它管理两类行：
+ * - **人格档案**（PROFILE）：可以有多份，同一时刻只有一份 active；
+ * - **覆盖层**（OVERRIDE）：绑定到某个人 / 某个群，永远优先于档案。
  *
- * 另外管理「人设版本快照」：每次 AI 进化前把当前版本存一份，
- * 初始版本（INITIAL）不可删除，保证随时能回到最初的样子。
+ * 另外管理「人设版本快照」：初始版本（INITIAL）不可删除，
+ * 保证"人格被改坏还能回到最初"。
  */
 class PersonaRepository(
     private val personaDao: PersonaDao,
@@ -36,35 +40,258 @@ class PersonaRepository(
     val personas: Flow<List<Persona>> =
         personaDao.all().map { list -> list.map { it.toPersona() } }
 
+    /** 人格档案列表（激活的排最前） */
+    val profiles: Flow<List<Persona>> =
+        personaDao.profiles().map { list -> list.map { it.toPersona() } }
+
+    /** 当前激活的人格档案 */
+    fun observeActive(): Flow<Persona?> =
+        personaDao.observeActive().map { it?.toPersona() }
+
+    suspend fun active(): Persona? = personaDao.active()?.toPersona()
+
+    suspend fun countProfiles(): Int = personaDao.countProfiles()
+
     /** 最近互动过的人，供人设绑定时快速选择 */
     suspend fun recentPeople(limit: Int = 50): List<KnownPerson> =
         identityDao.recent(limit).map { KnownPerson(it.senderId, it.displayName) }
 
     override suspend fun all(): List<Persona> = personaDao.allOnce().map { it.toPersona() }
 
-    override suspend fun save(persona: Persona): Long =
-        personaDao.upsert(
+    /**
+     * 保存一条人设（UI 编辑 / 覆盖层用）。
+     *
+     * **元数据必须沿用库里已有的行**：界面传进来的 [Persona] 通常只带
+     * name/prompt/绑定关系，如果直接用它的默认值，一次编辑就会把
+     * PROFILE 降级成 OVERRIDE、把 activeSlot 清空——人格会"凭空消失"。
+     */
+    override suspend fun save(persona: Persona): Long {
+        val now = System.currentTimeMillis()
+        val existing = if (persona.id > 0) personaDao.findById(persona.id) else null
+        return personaDao.upsert(
             PersonaEntity(
                 id = persona.id,
                 senderId = persona.senderId?.takeIf { it.isNotBlank() },
                 scopeId = persona.scopeId?.takeIf { it.isNotBlank() },
                 name = persona.name,
                 prompt = persona.prompt,
-                updatedAt = System.currentTimeMillis(),
+                updatedAt = now,
+                kind = existing?.kind ?: persona.kind.name,
+                stage = existing?.stage ?: persona.stage.name,
+                seedId = existing?.seedId ?: persona.seedId,
+                activeSlot = existing?.activeSlot,
+                frozen = existing?.frozen ?: persona.frozen,
+                birthAt = existing?.birthAt ?: 0,
+                lastGrownAt = existing?.lastGrownAt ?: 0,
+                growthCount = existing?.growthCount ?: 0,
+                msgCursor = existing?.msgCursor ?: 0,
+                lastNote = existing?.lastNote.orEmpty(),
+                createdAt = existing?.createdAt ?: now,
             ),
         )
+    }
 
     override suspend fun delete(id: Long) {
-        personaDao.deleteById(id)
+        deleteProfileOrOverride(id)
     }
+
+    // ---------- 人格档案 ----------
+
+    /**
+     * 新建一份人格档案（默认 EMBRYO，等群聊攒够再破壳）。
+     *
+     * 一定先以 `activeSlot = null` 插入，再单独 [activate]——
+     * 直接插 1 会撞上唯一索引。
+     */
+    suspend fun createProfile(
+        name: String,
+        prompt: String = "",
+        stage: PersonaStage = PersonaStage.EMBRYO,
+        seedId: String? = null,
+    ): Long {
+        val now = System.currentTimeMillis()
+        val id =
+            personaDao.upsert(
+                PersonaEntity(
+                    senderId = null,
+                    scopeId = null,
+                    name = name,
+                    prompt = prompt,
+                    updatedAt = now,
+                    kind = PersonaKind.PROFILE.name,
+                    stage = stage.name,
+                    seedId = seedId,
+                    activeSlot = null,
+                    frozen = false,
+                    birthAt = now,
+                    createdAt = now,
+                ),
+            )
+        // 新建但没写 prompt 的档案补一条空快照没有意义，等破壳时再存 INITIAL
+        return id
+    }
+
+    /** 用随机性格种子新建一份档案（用户"零提示词起步"的入口）。 */
+    suspend fun createSeededProfile(seed: PersonaSeed = PersonaSeed.random()): Long =
+        createProfile(
+            name = seed.label,
+            prompt = "",
+            stage = PersonaStage.EMBRYO,
+            seedId = seed.name,
+        )
+
+    suspend fun activate(id: Long) {
+        personaDao.switchActive(id, System.currentTimeMillis())
+    }
+
+    /**
+     * 删除档案或覆盖层。
+     *
+     * 删的是激活档案时，先把激活位让给另一份档案；一份都不剩就允许删，
+     * 解析链会自动回落到种子骨架（不会出现"没有激活却还有档案"的中空态）。
+     */
+    suspend fun deleteProfileOrOverride(id: Long): Boolean {
+        val all = personaDao.allOnce()
+        val target = all.firstOrNull { it.id == id } ?: return false
+        if (target.activeSlot == 1) {
+            val next = all.firstOrNull { it.id != id && it.kind == PersonaKind.PROFILE.name }
+            if (next != null) {
+                personaDao.switchActive(next.id, System.currentTimeMillis())
+            }
+        }
+        personaDao.deleteById(id)
+        return true
+    }
+
+    /** 冻结 / 解冻自动成长。 */
+    suspend fun setFrozen(
+        id: Long,
+        frozen: Boolean,
+    ) {
+        val row = personaDao.findById(id) ?: return
+        personaDao.updateMeta(
+            id = id,
+            stage = row.stage,
+            seedId = row.seedId,
+            frozen = frozen,
+            at = System.currentTimeMillis(),
+        )
+    }
+
+    /** 重抽性格种子（只对 EMBRYO 有意义）并回到未破壳状态。 */
+    suspend fun reseed(
+        id: Long,
+        seed: PersonaSeed = PersonaSeed.random(),
+    ) {
+        val row = personaDao.findById(id) ?: return
+        val now = System.currentTimeMillis()
+        personaDao.updateMeta(
+            id = id,
+            stage = PersonaStage.EMBRYO.name,
+            seedId = seed.name,
+            frozen = row.frozen,
+            at = now,
+        )
+        // 正文清空，让骨架重新接管；名字也换成新种子的标签
+        personaDao.upsert(
+            row.copy(
+                name = seed.label,
+                prompt = "",
+                stage = PersonaStage.EMBRYO.name,
+                seedId = seed.name,
+                birthAt = now,
+                lastGrownAt = 0,
+                growthCount = 0,
+                msgCursor = 0,
+                lastNote = "",
+                updatedAt = now,
+            ),
+        )
+    }
+
+    /** 交给它自己养：把手动人设转成 GROWING，并从这里开始累计消息。 */
+    suspend fun handOverToGrowth(
+        id: Long,
+        cursor: Long,
+    ) {
+        val row = personaDao.findById(id) ?: return
+        val now = System.currentTimeMillis()
+        personaDao.upsert(
+            row.copy(
+                stage = PersonaStage.GROWING.name,
+                frozen = false,
+                birthAt = if (row.birthAt > 0) row.birthAt else now,
+                lastGrownAt = now,
+                msgCursor = cursor,
+                updatedAt = now,
+            ),
+        )
+    }
+
+    /**
+     * 导入备份时更新档案元数据。
+     *
+     * 不能用 [save]：它会刻意保留库里已有的 stage/seedId，
+     * 否则一次界面编辑就会把「成长期」降级成「手动」。导入是少数
+     * 需要显式覆盖元数据的场景，所以单独开一个口子。
+     */
+    suspend fun applyProfileMeta(
+        id: Long,
+        stage: PersonaStage,
+        seedId: String?,
+        frozen: Boolean,
+    ) {
+        personaDao.updateMeta(id, stage.name, seedId, frozen, System.currentTimeMillis())
+    }
+
+    /** 破壳写回；返回 false 表示期间已经破过壳（并发保护）。 */
+    suspend fun commitBirth(
+        id: Long,
+        prompt: String,
+        seedId: String?,
+        cursor: Long,
+        note: String,
+    ): Boolean =
+        personaDao.commitBirth(
+            id = id,
+            prompt = prompt,
+            seedId = seedId,
+            cursor = cursor,
+            at = System.currentTimeMillis(),
+            note = note,
+        ) > 0
+
+    /**
+     * 成长写回；返回 false 表示期间被手动改过（CAS 失败）。
+     *
+     * 调用方拿到 false 时必须把刚写的快照删掉——否则会出现
+     * "快照里有、实际没生效"的幽灵版本，回滚后人格直接倒退。
+     */
+    suspend fun commitGrowth(
+        id: Long,
+        prompt: String,
+        stage: PersonaStage,
+        cursor: Long,
+        note: String,
+        expectedUpdatedAt: Long,
+    ): Boolean =
+        personaDao.commitGrowth(
+            id = id,
+            prompt = prompt,
+            stage = stage.name,
+            cursor = cursor,
+            at = System.currentTimeMillis(),
+            note = note,
+            expected = expectedUpdatedAt,
+        ) > 0
 
     // ---------- 版本快照 ----------
 
-    /** 某个目标的历史版本（按时间倒序）；personaId 为 null 表示全局提示词 */
+    /** 某个目标的历史版本（按时间倒序） */
     suspend fun snapshots(personaId: Long?): List<PersonaSnapshot> =
         snapshotDao?.listFor(personaId)?.map { it.toSnapshot() }.orEmpty()
 
-    /** 当前目标是否已有初始存档（没有就先存一份再进化） */
+    /** 当前目标是否已有初始存档 */
     suspend fun hasInitialSnapshot(personaId: Long?): Boolean =
         snapshotDao?.countInitial(personaId)?.let { it > 0 } ?: false
 
@@ -116,5 +343,19 @@ class PersonaRepository(
             name = name,
             prompt = prompt,
             updatedAt = updatedAt,
+            kind =
+                runCatching { PersonaKind.valueOf(kind) }
+                    .getOrDefault(PersonaKind.OVERRIDE),
+            stage =
+                runCatching { PersonaStage.valueOf(stage) }
+                    .getOrDefault(PersonaStage.MANUAL),
+            seedId = seedId,
+            active = activeSlot == 1,
+            frozen = frozen,
+            growthCount = growthCount,
+            birthAt = birthAt,
+            lastGrownAt = lastGrownAt,
+            msgCursor = msgCursor,
+            lastNote = lastNote,
         )
 }

@@ -18,11 +18,17 @@ enum class PersonaSnapshotKind {
     /** 初始版本：第一次进化前自动存档，不可删除 */
     INITIAL,
 
-    /** AI 进化产生 */
+    /** 用户点「AI 优化」产生的大改 */
     EVOLVED,
 
     /** 手动保存 / 回滚前的存档 */
     MANUAL,
+
+    /** 自动破壳产生的第一版人格 */
+    BIRTH,
+
+    /** 自动微调产生的一版 */
+    GROWTH,
 }
 
 /** 一次人设进化的结果。 */
@@ -120,20 +126,8 @@ class PersonaEvolver(
         return PersonaEvolution(prompt = prompt, note = summarize(prompt))
     }
 
-    /** 去掉模型偶尔带上的代码块围栏与多余空白。 */
-    private fun sanitize(raw: String): String {
-        var text = raw.trim()
-        if (text.startsWith("```")) {
-            text = text.removePrefix("```")
-            val firstNewline = text.indexOf('\n')
-            if (firstNewline >= 0 && text.substring(0, firstNewline).isNotBlank()) {
-                // ```markdown 这类语言标记
-                text = text.substring(firstNewline + 1)
-            }
-            text = text.removeSuffix("```")
-        }
-        return text.trim()
-    }
+    /** 去掉模型偶尔带上的代码块围栏与多余空白（与人格成长共用同一实现）。 */
+    private fun sanitize(raw: String): String = PromptTextUtils.sanitize(raw)
 
     /** 用首行做一句话摘要，存进快照备注。 */
     private fun summarize(prompt: String): String {

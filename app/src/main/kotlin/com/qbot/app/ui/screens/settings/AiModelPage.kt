@@ -130,27 +130,15 @@ fun AiModelPage(onBack: () -> Unit) {
             )
         }
 
-        SectionHeader("系统提示词", "定义 AI 的角色与语气，每轮请求都会携带")
+        SectionHeader("人格", "2.3.0 起由独立的人格档案提供")
         SettingsCard {
-            OutlinedTextField(
-                value = systemPrompt,
-                onValueChange = { systemPrompt = it },
-                label = { Text("系统提示词") },
-                placeholder = { Text("例如：你是一个说话简短、偶尔毒舌的群友") },
-                minLines = 3,
-                modifier = Modifier.fillMaxWidth(),
+            HintText(
+                "机器人的性格、说话方式、兴趣与边界都在「AI → 人设」页管理：" +
+                    "那里能看到它自己长成什么样、这次改了什么、随时回滚。",
             )
-            // 提示词越长，每轮固定成本越高、前缀缓存越难稳定命中
-            val promptTokens = TokenEstimator.estimate(systemPrompt)
-            Text(
-                "约 $promptTokens tokens",
-                style = MaterialTheme.typography.labelSmall,
-                color =
-                    if (promptTokens > 1500) {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
+            HintText(
+                "不用自己写提示词。新建人格时只需挑一个性格种子，" +
+                    "它会先从群聊里破壳，之后按消息量自己微调。",
             )
         }
 

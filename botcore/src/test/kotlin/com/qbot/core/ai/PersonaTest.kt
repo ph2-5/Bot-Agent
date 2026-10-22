@@ -6,6 +6,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** 人设解析测试：人 → 群 → 全局 三级优先级。 */
@@ -98,10 +99,16 @@ class PersonaTest {
         }
 
     @Test
-    fun `解析器无人设也无兜底时返回 null`() =
+    fun `解析器无人设也无兜底时返回种子骨架`() =
         runTest {
             val resolver = PersonaResolver(InMemoryPersonaStore())
-            assertNull(resolver.promptFor(message()))
+            val resolved = resolver.resolve(message())
+            assertEquals(PersonaSource.EMBRYO, resolved.source)
+            assertEquals(PersonaStage.EMBRYO, resolved.stage)
+            assertTrue(
+                "骨架不能为空：空 system 会让模型退化成助手腔",
+                resolved.prompt.contains("[身份]"),
+            )
         }
 
     @Test

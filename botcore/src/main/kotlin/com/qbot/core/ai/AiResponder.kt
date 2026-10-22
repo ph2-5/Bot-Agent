@@ -52,8 +52,14 @@ data class AiConfig(
     val baseUrl: String = "https://api.deepseek.com",
     val apiKey: String = "",
     val model: String = "deepseek-chat",
-    val systemPrompt: String =
-        "你是一个运行在 QQ 里的助手。回答简洁友好，不要使用 Markdown 标题和代码块，因为 QQ 不支持渲染。",
+    /**
+     * 2.3.0 起废弃：人格由 [Persona] 档案提供，这里不再承载「机器人是谁」。
+     *
+     * 保留字段只为两个用途：
+     * 1. 兼容旧备份与旧 DataStore 数据（启动引导会把它迁移成第一条人格档案）；
+     * 2. 未注入 [PersonaResolver] 的纯测试/外部调用路径。
+     */
+    val systemPrompt: String = "",
     val temperature: Double = 0.7,
     val maxTokens: Int = 800,
     val mode: AiMode = AiMode.RULE_FIRST,
@@ -74,6 +80,18 @@ data class AiConfig(
     /** 配置是否可用。缺任何一项都会让每次请求都白跑一趟，故提前拦住。 */
     val isReady: Boolean
         get() = enabled && apiKey.isNotBlank() && model.isNotBlank() && baseUrl.isNotBlank()
+
+    companion object {
+        /**
+         * 2.2.0 及更早版本的出厂默认提示词。
+         *
+         * 迁移时用它判断"这条提示词是出厂值还是用户自己写的"——
+         * 出厂值不能被当成用户的人格档案导进来，否则新用户一升级
+         * 就凭空多出一个"QQ 助手"人格。
+         */
+        const val LEGACY_DEFAULT_SYSTEM_PROMPT: String =
+            "你是一个运行在 QQ 里的助手。回答简洁友好，不要使用 Markdown 标题和代码块，因为 QQ 不支持渲染。"
+    }
 }
 
 /**

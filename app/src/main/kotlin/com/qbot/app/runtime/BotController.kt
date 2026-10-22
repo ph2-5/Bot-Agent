@@ -11,6 +11,8 @@ import com.qbot.app.data.backup.GroupBotNameBackup
 import com.qbot.app.data.backup.LessonBackup
 import com.qbot.app.data.backup.MemoryBackup
 import com.qbot.app.data.backup.PersonaBackup
+import com.qbot.app.data.backup.PersonaGrowthBackup
+import com.qbot.app.data.backup.PersonaProfileBackup
 import com.qbot.app.data.backup.RuleBackup
 import com.qbot.app.data.db.AppDatabase
 import com.qbot.app.data.db.LogEntity
@@ -44,6 +46,10 @@ import com.qbot.core.ai.LlmClient
 import com.qbot.core.ai.MemoryConfig
 import com.qbot.core.ai.MemoryPipeline
 import com.qbot.core.ai.Persona
+import com.qbot.core.ai.PersonaGrowth
+import com.qbot.core.ai.PersonaKind
+import com.qbot.core.ai.PersonaSeed
+import com.qbot.core.ai.PersonaStage
 import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.PersonaResolver
 import com.qbot.core.ai.ScoreWeights
@@ -201,6 +207,27 @@ class BotController(
 
     /** 反思与正式回复共用连接池 */
     private val reflectionClient by lazy { LlmClient(http = http, logger = logger) }
+
+    /**
+     * 人格自主成长调度器。
+     *
+     * lazy 构造：只有真正需要它的路径（init / 手动成长）才会建出来，
+     * 测试里注入空依赖时不会因为多一个 OkHttp 客户端而变慢。
+     */
+    private val personaGrowthScheduler by lazy {
+        PersonaGrowthScheduler(
+            repo = personaRepository,
+            messages = database.roomMessageDao(),
+            aiConfig = { settings.aiConfig.value },
+            growthConfig = { settings.personaGrowthConfig.value },
+            client = LlmClient(http = http, logger = logger),
+            botName = { runtime?.botName },
+            log = { message -> appendLog(LogLevel.INFO, TAG, message) },
+        )
+    }
+
+    /** 引导只跑一次：init 与 start 可能同时触发 */
+    private val bootstrapMutex = Mutex()
 
     /** 身份存储（公开给维护端 UI 做备注名 / 忘掉某人）。 */
     fun identityStore(): RoomIdentityStore = identityStore
@@ -475,6 +502,18 @@ class BotController(
                 chimeLessonStore.trim(settings.chitchatConfig.value.maxLessons)
             }
         }
+
+        // 人格引导：旧设置里的系统提示词 → 第一条人格档案；零提示词用户则建种子档案
+        scope.launch {
+            runCatching { ensurePersonaBootstrap() }.onFailure {
+                appendLog(LogLevel.WARN, TAG, "人格引导失败：${it.message ?: it::class.simpleName}")
+            }
+        }
+
+        // 人格自主成长：每 10 分钟看一次"攒够没有"
+        runCatching { personaGrowthScheduler.start(scope) }.onFailure {
+            appendLog(LogLevel.WARN, TAG, "人格成长调度启动失败：${it.message}")
+        }
     }
 
     /** 启动机器人（幂等）。 */
@@ -492,6 +531,8 @@ class BotController(
         }
 
         scope.launch {
+            // 保证第一条消息就有人格：引导必须在 build 之前完成
+            runCatching { ensurePersonaBootstrap() }
             // 用 first() 直接取当前值：stateIn().value 在还没有订阅者时
             // 只会返回初始默认值，会导致省电模式设置被忽略。
             val powerSaving = settings.powerSaving.first()
@@ -591,6 +632,108 @@ class BotController(
      * @param instruction 用户的额外要求，如「更毒舌一点，但别骂人」
      * @return 新的提示词
      */
+    /**
+     * 人格引导（幂等）。
+     *
+     * 三种情况：
+     * 1. 库里已有档案 → 什么都不做；
+     * 2. 旧设置里有用户写的系统提示词 → 导成一条 MANUAL 档案并激活
+     *    （标 MANUAL 是刻意的：手写的东西不能被后台自动改写）；
+     * 3. 什么都没有（新用户 / 出厂默认）→ 随机种子建一份 EMBRYO 档案。
+     *
+     * 标记最后才写：任何一步失败都不能置位，下次启动会重试。
+     */
+    private suspend fun ensurePersonaBootstrap() =
+        bootstrapMutex.withLock {
+            val imported = settings.legacyPersonaImported()
+            if (imported && personaRepository.countProfiles() > 0) return@withLock
+
+            if (personaRepository.countProfiles() == 0) {
+                val legacy = settings.loadAiConfigOnce().systemPrompt.trim()
+                val usable =
+                    legacy.isNotEmpty() && legacy != AiConfig.LEGACY_DEFAULT_SYSTEM_PROMPT
+                if (usable) {
+                    val id =
+                        personaRepository.createProfile(
+                            name = "从旧设置继承的人格",
+                            prompt = legacy,
+                            stage = PersonaStage.MANUAL,
+                        )
+                    personaRepository.addSnapshot(
+                        personaId = id,
+                        name = "从旧设置继承的人格",
+                        prompt = legacy,
+                        kind = com.qbot.core.ai.PersonaSnapshotKind.INITIAL,
+                        note = "从旧的系统提示词导入（自动存档，不可删除）",
+                    )
+                    personaRepository.activate(id)
+                    appendLog(LogLevel.INFO, TAG, "人格引导：旧系统提示词已导入为一份人格档案")
+                }
+            }
+
+            if (personaRepository.active() == null) {
+                val seed = PersonaSeed.random()
+                val id = personaRepository.createSeededProfile(seed)
+                personaRepository.activate(id)
+                appendLog(LogLevel.INFO, TAG, "人格引导：已用「${seed.label}」种子创建第一份人格")
+            }
+            settings.markLegacyPersonaImported()
+        }
+
+    /** 当前激活的人格档案。 */
+    fun observeActivePersona(): Flow<Persona?> = personaRepository.observeActive()
+
+    /** 全部人格档案。 */
+    fun observePersonaProfiles(): Flow<List<Persona>> = personaRepository.profiles
+
+    /** 新建一份人格档案并立刻切换过去。 */
+    suspend fun createPersonaProfile(
+        name: String,
+        seed: PersonaSeed = PersonaSeed.random(),
+    ): Long {
+        val id = personaRepository.createProfile(name = name, seedId = seed.name)
+        personaRepository.activate(id)
+        appendLog(LogLevel.INFO, TAG, "新建人格「$name」（种子：${seed.label}）")
+        return id
+    }
+
+    suspend fun activatePersona(id: Long) {
+        personaRepository.activate(id)
+        appendLog(LogLevel.INFO, TAG, "已切换人格档案 #$id")
+    }
+
+    suspend fun deletePersona(id: Long) {
+        personaRepository.deleteProfileOrOverride(id)
+    }
+
+    suspend fun setPersonaFrozen(
+        id: Long,
+        frozen: Boolean,
+    ) {
+        personaRepository.setFrozen(id, frozen)
+    }
+
+    /** 重抽性格种子：正文清空，回到未破壳状态。 */
+    suspend fun reseedPersona(id: Long) {
+        personaRepository.reseed(id)
+    }
+
+    /** 把用户手写的人设交给自动成长，从当前消息位置开始累计。 */
+    suspend fun handOverPersonaToGrowth(id: Long) {
+        personaRepository.handOverToGrowth(id, database.roomMessageDao().maxId() ?: 0)
+        appendLog(LogLevel.INFO, TAG, "人格已交给自动成长")
+    }
+
+    /**
+     * 手动催一次成长（忽略消息量与间隔门槛）。
+     *
+     * 返回 false 表示没跑起来：没配 AI、正在跑、已冻结，或模型被守卫拦下。
+     */
+    suspend fun growPersonaNow(): Boolean =
+        runCatching { personaGrowthScheduler.force() }
+            .onFailure { appendLog(LogLevel.WARN, TAG, "手动成长失败：${it.message}") }
+            .getOrDefault(false)
+
     suspend fun evolvePersona(
         personaId: Long?,
         instruction: String? = null,
@@ -602,7 +745,45 @@ class BotController(
             val persona = personaId?.let { id -> personaRepository.all().firstOrNull { it.id == id } }
             val name = persona?.name ?: "全局默认"
             val current = (persona?.prompt ?: aiConfig.systemPrompt).trim()
-            require(current.isNotEmpty()) { "当前人设是空的，没有可优化的内容" }
+
+            // 还没破壳（或人设为空）：手动按钮从"优化"变成"按种子破壳"。
+            // 这条路径本来被 require(current.isNotEmpty()) 挡死了，
+            // 现在由 PersonaGrowth.birth 接管。
+            if (current.isEmpty()) {
+                require(persona != null) {
+                    "还没有人格档案，先去「AI · 人设」里新建一个"
+                }
+                val seed = PersonaSeed.of(persona.seedId)
+                val samples = recentSamplesForEvolution()
+                val draft =
+                    PersonaGrowth(LlmClient(http = http, logger = logger))
+                        .birth(seed, samples, runtime?.botName, aiConfig)
+                if (!personaRepository.hasInitialSnapshot(persona.id)) {
+                    personaRepository.addSnapshot(
+                        personaId = persona.id,
+                        name = persona.name,
+                        prompt = PersonaGrowth.embryoSkeleton(persona.seedId),
+                        kind = com.qbot.core.ai.PersonaSnapshotKind.INITIAL,
+                        note = "种子骨架（破壳前，不可删除）",
+                    )
+                }
+                personaRepository.commitBirth(
+                    id = persona.id,
+                    prompt = draft.prompt,
+                    seedId = seed.name,
+                    cursor = database.roomMessageDao().maxId() ?: 0,
+                    note = draft.note,
+                )
+                personaRepository.addSnapshot(
+                    personaId = persona.id,
+                    name = persona.name,
+                    prompt = draft.prompt,
+                    kind = com.qbot.core.ai.PersonaSnapshotKind.BIRTH,
+                    note = draft.note,
+                )
+                appendLog(LogLevel.INFO, TAG, "手动破壳完成（${seed.label}）")
+                return@runCatching draft.prompt
+            }
 
             if (!personaRepository.hasInitialSnapshot(personaId)) {
                 personaRepository.addSnapshot(
@@ -744,13 +925,39 @@ class BotController(
                             priority = rule.priority,
                         )
                     },
+                // 覆盖层与人格档案分开导：前者是"局部例外"，后者是"我是谁"
                 personas =
-                    personaRepository.all().map { persona ->
-                        PersonaBackup(
-                            name = persona.name,
-                            senderId = persona.senderId,
-                            scopeId = persona.scopeId,
-                            prompt = persona.prompt,
+                    personaRepository.all()
+                        .filter { it.kind == PersonaKind.OVERRIDE }
+                        .map { persona ->
+                            PersonaBackup(
+                                name = persona.name,
+                                senderId = persona.senderId,
+                                scopeId = persona.scopeId,
+                                prompt = persona.prompt,
+                            )
+                        },
+                personaProfiles =
+                    personaRepository.all()
+                        .filter { it.kind == PersonaKind.PROFILE }
+                        .map { persona ->
+                            PersonaProfileBackup(
+                                name = persona.name,
+                                prompt = persona.prompt,
+                                isActive = persona.active,
+                                stage = persona.stage.name,
+                                seedId = persona.seedId,
+                                frozen = persona.frozen,
+                                growthCount = persona.growthCount,
+                            )
+                        },
+                personaGrowth =
+                    settings.personaGrowthConfig.value.let { growth ->
+                        PersonaGrowthBackup(
+                            enabled = growth.enabled,
+                            birthMessages = growth.birthMessages,
+                            growMessages = growth.growMessages,
+                            growIntervalHours = growth.growIntervalHours,
                         )
                     },
                 displayNames =
@@ -949,10 +1156,101 @@ class BotController(
             ruleCount++
         }
 
+        // ---- 人格档案：必须在覆盖层之前导入 ----
+        var profileNew = 0
+        var profileUpdated = 0
+        val profilesBefore = personaRepository.all().filter { it.kind == PersonaKind.PROFILE }
+
+        suspend fun upsertProfile(
+            name: String,
+            prompt: String,
+            stageName: String,
+            seedId: String?,
+            frozen: Boolean,
+            isActive: Boolean,
+        ): Long {
+            val stage =
+                runCatching { PersonaStage.valueOf(stageName) }
+                    .getOrDefault(PersonaStage.MANUAL)
+            val hit = profilesBefore.firstOrNull { it.name == name }
+            val id =
+                if (hit != null) {
+                    personaRepository.save(hit.copy(prompt = prompt))
+                    personaRepository.applyProfileMeta(hit.id, stage, seedId, frozen)
+                    profileUpdated++
+                    hit.id
+                } else {
+                    val created =
+                        personaRepository.createProfile(
+                            name = name,
+                            prompt = prompt,
+                            stage = stage,
+                            seedId = seedId,
+                        )
+                    personaRepository.applyProfileMeta(created, stage, seedId, frozen)
+                    profileNew++
+                    created
+                }
+            if (isActive) personaRepository.activate(id)
+            return id
+        }
+
+        if (backup.personaProfiles.isNotEmpty()) {
+            backup.personaProfiles.forEach { dto ->
+                upsertProfile(
+                    name = dto.name,
+                    prompt = dto.prompt,
+                    stageName = dto.stage,
+                    seedId = dto.seedId,
+                    frozen = dto.frozen,
+                    isActive = dto.isActive,
+                )
+            }
+            applied++
+        } else {
+            // 旧备份没有档案概念：优先用"全局人设行"，其次用 ai.systemPrompt
+            val legacyGlobal =
+                backup.personas.firstOrNull {
+                    it.senderId.isNullOrBlank() && it.scopeId.isNullOrBlank() && it.prompt.isNotBlank()
+                }
+            val legacyPrompt =
+                legacyGlobal?.prompt
+                    ?: backup.ai?.systemPrompt
+                        ?.takeIf {
+                            it.isNotBlank() && it != AiConfig.LEGACY_DEFAULT_SYSTEM_PROMPT
+                        }
+            if (legacyPrompt != null && profilesBefore.isEmpty()) {
+                upsertProfile(
+                    name = legacyGlobal?.name ?: "从旧备份继承的人格",
+                    prompt = legacyPrompt,
+                    stageName = PersonaStage.MANUAL.name,
+                    seedId = null,
+                    frozen = false,
+                    isActive = true,
+                )
+            }
+            // 两者都没有 → 保留本机现有档案：不能因为导入了旧配置就清空人格
+        }
+
+        backup.personaGrowth?.let { growth ->
+            settings.savePersonaGrowthConfig(
+                com.qbot.core.ai.PersonaGrowthConfig.normalize(
+                    enabled = growth.enabled,
+                    birthMessages = growth.birthMessages,
+                    growMessages = growth.growMessages,
+                    growIntervalHours = growth.growIntervalHours,
+                ),
+            )
+            applied++
+        }
+
         var personaNew = 0
         var personaUpdated = 0
         val existing = personaRepository.all()
-        backup.personas.forEach { dto ->
+        // 旧备份里的"全局人设行"已经在上面变成档案了，这里跳过，避免它变成覆盖层抢人格
+        backup.personas
+            .filterNot { it.senderId.isNullOrBlank() && it.scopeId.isNullOrBlank() }
+            .forEach { dto ->
             val hit =
                 existing.find {
                     it.name == dto.name && it.senderId == dto.senderId && it.scopeId == dto.scopeId
@@ -1001,10 +1299,12 @@ class BotController(
         appendLog(
             LogLevel.INFO,
             TAG,
-            "配置导入完成：规则 $ruleCount 条、人设 +$personaNew/更新$personaUpdated、" +
+            "配置导入完成：规则 $ruleCount 条、人格档案 +$profileNew/更新$profileUpdated、" +
+                "人设覆盖 +$personaNew/更新$personaUpdated、" +
                 "备注 $nameCount、群名片 $groupNameCount、经验 $lessonCount 条、配置项 $applied",
         )
-        return "导入完成：规则 $ruleCount 条，人设新增 $personaNew、更新 $personaUpdated，" +
+        return "导入完成：规则 $ruleCount 条，人格档案新增 $profileNew、更新 $profileUpdated，" +
+            "人设覆盖新增 $personaNew、更新 $personaUpdated，" +
             "备注名 $nameCount，群名片 $groupNameCount，经验 $lessonCount 条，配置组 $applied 项" +
             (if (backup.credentials != null) "（含凭证，需重新启动机器人生效）" else "")
     }
@@ -1033,12 +1333,9 @@ class BotController(
 
         // AI 链路：OpenAI 兼容客户端 + 落库历史 + 应答器。
         // AiConfig 通过 provider 在每条消息处理时现取，改设置无需重启。
-        // 人设解析按 人→群→全局 查库，查不到回退到设置里的系统提示词。
-        val personaResolver =
-            PersonaResolver(
-                store = personaRepository,
-                fallbackProvider = { settings.aiConfig.value.systemPrompt },
-            )
+        // 人格解析：覆盖层 → 激活档案 → 种子骨架，永不返回空——
+        // 空 system 会让 PromptAssembler 整条不注入，模型立刻退化成客服腔。
+        val personaResolver = PersonaResolver(store = personaRepository)
         val aiResponder =
             AiResponder(
                 client = LlmClient(http = http, logger = logger),

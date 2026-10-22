@@ -143,7 +143,7 @@ interface AiHistoryDao {
         ChimeDecisionEntity::class,
         ChimeLessonEntity::class,
     ],
-    version = 9,
+    version = 10,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -429,6 +429,72 @@ abstract class AppDatabase : RoomDatabase() {
                 override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
                     db.execSQL("ALTER TABLE chime_decisions ADD COLUMN addresseeKind TEXT")
                     db.execSQL("ALTER TABLE chime_decisions ADD COLUMN addresseeName TEXT")
+                }
+            }
+
+        /**
+         * v9 → v10：人设从「一段字符串」升格为「人格档案」。
+         *
+         * 加 11 列把档案的元数据补齐；同时做三件语义迁移：
+         * 1. 无绑定的全局行升格为档案，有绑定的降级为覆盖；
+         * 2. **旧人设一律标 MANUAL**——用户手写的东西不能被后台悄悄改写，
+         *    想让它自己长，由用户在界面上显式点开；
+         * 3. 激活最近更新的那一条，并补一条 INITIAL 快照，保证升级前的版本可回滚。
+         *
+         * 注意 DDL 的列类型 / NOT NULL / DEFAULT 必须与 [PersonaEntity] 上的
+         * `@ColumnInfo(defaultValue)` 逐字符一致：本库开着
+         * `fallbackToDestructiveMigration()`，schema 校验失败会**静默清库**。
+         * 索引名必须是 Room 的生成规则 `index_<table>_<column>`。
+         */
+        val MIGRATION_9_10 =
+            object : androidx.room.migration.Migration(9, 10) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    fun add(sql: String) = db.execSQL("ALTER TABLE personas ADD COLUMN $sql")
+                    add("kind TEXT NOT NULL DEFAULT 'OVERRIDE'")
+                    add("stage TEXT NOT NULL DEFAULT 'MANUAL'")
+                    add("seedId TEXT")
+                    add("activeSlot INTEGER")
+                    add("frozen INTEGER NOT NULL DEFAULT 0")
+                    add("birthAt INTEGER NOT NULL DEFAULT 0")
+                    add("lastGrownAt INTEGER NOT NULL DEFAULT 0")
+                    add("growthCount INTEGER NOT NULL DEFAULT 0")
+                    add("msgCursor INTEGER NOT NULL DEFAULT 0")
+                    add("lastNote TEXT NOT NULL DEFAULT ''")
+                    add("createdAt INTEGER NOT NULL DEFAULT 0")
+
+                    db.execSQL(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS index_personas_activeSlot " +
+                            "ON personas(activeSlot)",
+                    )
+
+                    // 语义迁移：有绑定的是覆盖层，没绑定的是档案
+                    db.execSQL(
+                        "UPDATE personas SET kind = 'PROFILE' " +
+                            "WHERE IFNULL(senderId,'') = '' AND IFNULL(scopeId,'') = ''",
+                    )
+                    db.execSQL(
+                        "UPDATE personas SET kind = 'OVERRIDE' " +
+                            "WHERE IFNULL(senderId,'') <> '' OR IFNULL(scopeId,'') <> ''",
+                    )
+                    db.execSQL(
+                        "UPDATE personas SET createdAt = updatedAt WHERE kind = 'PROFILE'",
+                    )
+
+                    // 只激活最近更新的那一条：单行赋值，绝不能用无条件 UPDATE，
+                    // 否则唯一索引冲突会让 Room 在打开数据库时直接崩。
+                    db.execSQL(
+                        "UPDATE personas SET activeSlot = 1 WHERE id = (" +
+                            "SELECT id FROM personas WHERE kind = 'PROFILE' " +
+                            "ORDER BY updatedAt DESC, id DESC LIMIT 1)",
+                    )
+
+                    // 升级前的人工版本必须永远可回滚
+                    db.execSQL(
+                        "INSERT INTO persona_snapshots(personaId, name, prompt, kind, note, createdAt) " +
+                            "SELECT id, name, prompt, 'INITIAL', " +
+                            "'升级到 2.3.0 之前的版本（自动存档）', updatedAt " +
+                            "FROM personas WHERE activeSlot = 1",
+                    )
                 }
             }
     }

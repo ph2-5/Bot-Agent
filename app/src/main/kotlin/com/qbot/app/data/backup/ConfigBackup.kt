@@ -22,7 +22,7 @@ import kotlinx.serialization.json.Json
  */
 @Serializable
 data class ConfigBackup(
-    val version: Int = 1,
+    val version: Int = 2,
     @SerialName("exported_at") val exportedAt: Long,
     val credentials: CredentialsBackup? = null,
     val ai: AiBackup? = null,
@@ -35,6 +35,10 @@ data class ConfigBackup(
     @SerialName("group_bot_names") val groupBotNames: List<GroupBotNameBackup> = emptyList(),
     /** 2.0.0 新增：从反馈学到的接话经验（用户的训练成果，换机不该丢） */
     @SerialName("chime_lessons") val chimeLessons: List<LessonBackup> = emptyList(),
+    /** 2.3.0 新增：人格档案（不含快照历史与游标——运行数据不搬家） */
+    @SerialName("persona_profiles") val personaProfiles: List<PersonaProfileBackup> = emptyList(),
+    /** 2.3.0 新增：人格成长参数 */
+    @SerialName("persona_growth") val personaGrowth: PersonaGrowthBackup? = null,
 ) {
     companion object {
         private val json =
@@ -133,6 +137,33 @@ data class PersonaBackup(
     @SerialName("sender_id") val senderId: String? = null,
     @SerialName("scope_id") val scopeId: String? = null,
     val prompt: String,
+)
+
+/**
+ * 人格档案的备份形态。
+ *
+ * 刻意不导 `msgCursor` / `lastGrownAt` / `birthAt` / 快照历史：
+ * 那些是"这台设备上长到哪儿了"，搬到新机器上只会让成长节奏错乱。
+ */
+@Serializable
+data class PersonaProfileBackup(
+    val name: String,
+    val prompt: String,
+    /** 同一次备份里最多认一条激活 */
+    @SerialName("is_active") val isActive: Boolean = false,
+    /** EMBRYO / GROWING / MATURE / MANUAL */
+    val stage: String = "MANUAL",
+    @SerialName("seed_id") val seedId: String? = null,
+    val frozen: Boolean = false,
+    @SerialName("growth_count") val growthCount: Int = 0,
+)
+
+@Serializable
+data class PersonaGrowthBackup(
+    val enabled: Boolean = true,
+    @SerialName("birth_messages") val birthMessages: Int = 60,
+    @SerialName("grow_messages") val growMessages: Int = 150,
+    @SerialName("grow_interval_hours") val growIntervalHours: Int = 12,
 )
 
 @Serializable

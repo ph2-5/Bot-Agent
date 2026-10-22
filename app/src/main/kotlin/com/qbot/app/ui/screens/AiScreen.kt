@@ -28,6 +28,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
@@ -40,9 +41,11 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.qbot.app.BotApplication
@@ -51,6 +54,11 @@ import com.qbot.app.data.repo.observeSummaries
 import com.qbot.core.ai.KnownPerson
 import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.Persona
+import com.qbot.core.ai.PersonaGrowth
+import com.qbot.core.ai.PersonaKind
+import com.qbot.core.ai.PersonaSeed
+import com.qbot.core.ai.PersonaSections
+import com.qbot.core.ai.PersonaStage
 import com.qbot.core.ai.PersonaSnapshot
 import com.qbot.core.ai.PersonaSnapshotKind
 import com.qbot.core.ai.RoomMessage
@@ -333,18 +341,24 @@ private fun RenameDialog(
 
 @Composable
 private fun PersonaTab() {
-    val context = androidx.compose.ui.platform.LocalContext.current
+    val context = LocalContext.current
     val app = context.applicationContext as BotApplication
     val controller = app.controller
-    val repository = app.controller.personaRepository
     val scope = rememberCoroutineScope()
 
-    val personas by repository.personas.collectAsState(initial = emptyList())
-    val aiConfig by controller.aiConfig.collectAsState()
-    var editing by remember { mutableStateOf<Persona?>(null) }
+    val active by controller.observeActivePersona().collectAsState(initial = null)
+    val profiles by controller.observePersonaProfiles().collectAsState(initial = emptyList())
+    val allPersonas by controller.personaRepository.personas.collectAsState(initial = emptyList())
+    val overrides = allPersonas.filter { it.kind == PersonaKind.OVERRIDE }
+
     var creating by remember { mutableStateOf(false) }
+    var editingProfile by remember { mutableStateOf<Persona?>(null) }
+    var editingOverride by remember { mutableStateOf<Persona?>(null) }
     var evolveTarget by remember { mutableStateOf<PersonaTarget?>(null) }
     var historyTarget by remember { mutableStateOf<PersonaTarget?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var hint by remember { mutableStateOf<String?>(null) }
+    var coverageOpen by rememberSaveable { mutableStateOf(false) }
 
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -355,65 +369,131 @@ private fun PersonaTab() {
                     .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            ) {
-                Column(Modifier.padding(16.dp)) {
-                    Text(
-                        "人设优先级：对某个人 > 对某个群 > 全局",
-                        fontWeight = FontWeight.Bold,
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "同一级别有多条时，用最近更新的那条。全部删光则回退到「设置」页里的默认系统提示词。" +
-                            "人设内容保持稳定不要频繁改动——前缀缓存命不上会变慢、变贵。",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+            val current = active
+            if (current == null) {
+                EmptyHint(
+                    "还没有人格",
+                    "点右下角 + 建一个。不用写任何提示词——它会先带着一个随机性格，再从群聊里慢慢长成自己的样子。",
+                )
+            } else {
+                ActivePersonaCard(
+                    persona = current,
+                    busy = busy,
+                    onEdit = { editingProfile = current },
+                    onHistory = {
+                        historyTarget = PersonaTarget(current.id, current.name, current.prompt)
+                    },
+                    onGrow = {
+                        scope.launch {
+                            busy = true
+                            val ok = controller.growPersonaNow()
+                            busy = false
+                            hint =
+                                if (ok) {
+                                    "已经长了一版，去「成长日记」看它这次改了什么"
+                                } else {
+                                    "这次没跑起来：可能 AI 未配置、已冻结，或模型觉得没什么可改的"
+                                }
+                        }
+                    },
+                    onFreeze = { frozen ->
+                        scope.launch { controller.setPersonaFrozen(current.id, frozen) }
+                    },
+                    onReseed = {
+                        scope.launch {
+                            controller.reseedPersona(current.id)
+                            hint = "已换一个性格种子，正文清空，等群聊重新破壳"
+                        }
+                    },
+                    onHandOver = {
+                        scope.launch {
+                            controller.handOverPersonaToGrowth(current.id)
+                            hint = "已交给它自己养：以后按消息量自动微调"
+                        }
+                    },
+                )
+            }
+
+            hint?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+
+            val others = profiles.filter { !it.active }
+            if (others.isNotEmpty()) {
+                Text(
+                    "其他人格档案（未生效）",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                others.forEach { profile ->
+                    InactiveProfileRow(
+                        persona = profile,
+                        onActivate = {
+                            scope.launch {
+                                controller.activatePersona(profile.id)
+                                hint = "已切换到「${profile.name}」，下一句话就是它的声音"
+                            }
+                        },
+                        onDuplicate = {
+                            scope.launch {
+                                controller.createPersonaProfile("${profile.name} 副本")
+                            }
+                        },
+                        onDelete = { scope.launch { controller.deletePersona(profile.id) } },
                     )
                 }
             }
 
-            if (personas.isEmpty()) {
-                EmptyHint(
-                    "还没有人设",
-                    "点右下角 + 新建。可以给全局一个默认人设，再给某个群或某个人单独定制。",
-                )
-            }
-
-            // 全局系统提示词：所有没单独人设的对话都用它。
-            // 它不在这张 personas 表里，单独给一个入口，才能被 AI 优化与回滚。
-            PersonaTargetCard(
-                title = "全局系统提示词",
-                subtitle = "所有没有单独人设的对话都用它",
-                prompt = aiConfig.systemPrompt,
-                onEvolve = {
-                    evolveTarget =
-                        PersonaTarget(id = null, name = "全局默认", prompt = aiConfig.systemPrompt)
-                },
-                onHistory = {
-                    historyTarget =
-                        PersonaTarget(id = null, name = "全局默认", prompt = aiConfig.systemPrompt)
-                },
-            )
-
-            personas.forEach { persona ->
-                PersonaCard(
-                    persona = persona,
-                    onEdit = { editing = persona },
-                    onEvolve = {
-                        evolveTarget =
-                            PersonaTarget(persona.id, persona.name, persona.prompt)
-                    },
-                    onHistory = {
-                        historyTarget =
-                            PersonaTarget(persona.id, persona.name, persona.prompt)
-                    },
-                    onDelete = {
-                        scope.launch {
-                            repository.delete(persona.id)
+            // 覆盖层默认折叠：它是"局部例外"，不是主路径
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            ) {
+                Column(Modifier.padding(12.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.clickable { coverageOpen = !coverageOpen },
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("按人或按群单独设定", fontWeight = FontWeight.Medium)
+                            Text(
+                                "覆盖优先于人格档案：只影响指定的某个人或某个群",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
-                    },
-                )
+                        Text(if (coverageOpen) "收起" else "展开", style = MaterialTheme.typography.labelMedium)
+                    }
+                    if (coverageOpen) {
+                        Spacer(Modifier.height(8.dp))
+                        overrides.forEach { override ->
+                            OverrideRow(
+                                persona = override,
+                                onEdit = { editingOverride = override },
+                                onDelete = {
+                                    scope.launch { controller.deletePersona(override.id) }
+                                },
+                            )
+                        }
+                        TextButton(
+                            onClick = {
+                                editingOverride =
+                                    Persona(
+                                        name = "",
+                                        prompt = "",
+                                        scopeId = "",
+                                        kind = PersonaKind.OVERRIDE,
+                                    )
+                            },
+                        ) {
+                            Text("+ 新增一条覆盖")
+                        }
+                    }
+                }
             }
 
             Spacer(Modifier.height(88.dp))
@@ -423,23 +503,46 @@ private fun PersonaTab() {
             onClick = { creating = true },
             modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
         ) {
-            Icon(Icons.Default.Add, contentDescription = "新建人设")
+            Icon(Icons.Default.Add, contentDescription = "新建人格")
         }
     }
 
-    if (creating || editing != null) {
-        PersonaEditorDialog(
-            initial = editing,
-            recentPeople = { repository.recentPeople() },
-            onDismiss = {
-                creating = false
-                editing = null
-            },
-            onSave = { persona ->
+    if (creating) {
+        PersonaCreateDialog(
+            onDismiss = { creating = false },
+            onConfirm = { name, seed ->
                 scope.launch {
-                    repository.save(persona)
+                    controller.createPersonaProfile(name, seed)
                     creating = false
-                    editing = null
+                    hint = "已创建「$name」，性格种子是「${seed.label}」。聊够消息它就破壳了。"
+                }
+            },
+        )
+    }
+
+    editingProfile?.let { persona ->
+        PersonaBodyDialog(
+            persona = persona,
+            onDismiss = { editingProfile = null },
+            onSave = { name, prompt ->
+                scope.launch {
+                    controller.personaRepository.save(persona.copy(name = name, prompt = prompt))
+                    editingProfile = null
+                    hint = "已保存。你手改的这版会覆盖它自己长出来的内容"
+                }
+            },
+        )
+    }
+
+    editingOverride?.let { persona ->
+        PersonaEditorDialog(
+            initial = if (persona.id == 0L) null else persona,
+            recentPeople = { controller.personaRepository.recentPeople() },
+            onDismiss = { editingOverride = null },
+            onSave = { saved ->
+                scope.launch {
+                    controller.personaRepository.save(saved)
+                    editingOverride = null
                 }
             },
         )
@@ -460,63 +563,319 @@ private fun PersonaTab() {
             load = { controller.personaSnapshots(target.id) },
             onRestore = { snapshot ->
                 scope.launch {
-                    if (target.id != null) {
-                        repository.all().firstOrNull { it.id == target.id }?.let {
-                            repository.save(it.copy(prompt = snapshot.prompt))
-                        }
-                    } else {
-                        app.settings.saveAiConfig(
-                            controller.aiConfig.value.copy(systemPrompt = snapshot.prompt),
-                        )
+                    controller.personaRepository.all().firstOrNull { it.id == target.id }?.let {
+                        controller.personaRepository.save(it.copy(prompt = snapshot.prompt))
                     }
                     historyTarget = null
+                    hint = "已回滚到那一版"
                 }
             },
-            onDelete = { id -> scope.launch { repository.deleteSnapshot(id) } },
+            onDelete = { id -> scope.launch { controller.personaRepository.deleteSnapshot(id) } },
         )
     }
 }
 
-/** 人设优化/历史的目标：id 为 null 表示全局系统提示词。 */
-private data class PersonaTarget(
-    val id: Long?,
-    val name: String,
-    val prompt: String,
-)
-
-/** 全局系统提示词卡片：只有优化与历史两个动作（正文在「AI 接入」里编辑）。 */
+/** 当前生效的人格档案。 */
 @Composable
-private fun PersonaTargetCard(
-    title: String,
-    subtitle: String,
-    prompt: String,
-    onEvolve: () -> Unit,
+private fun ActivePersonaCard(
+    persona: Persona,
+    busy: Boolean,
+    onEdit: () -> Unit,
     onHistory: () -> Unit,
+    onGrow: () -> Unit,
+    onFreeze: (Boolean) -> Unit,
+    onReseed: () -> Unit,
+    onHandOver: () -> Unit,
 ) {
+    val sections =
+        PersonaSections.parse(persona.prompt)
+            ?: PersonaSections.parse(PersonaGrowth.embryoSkeleton(persona.seedId))
+    val seed = PersonaSeed.of(persona.seedId)
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
     ) {
-        Column(Modifier.padding(16.dp)) {
-            Text(title, fontWeight = FontWeight.Medium)
-            Text(
-                subtitle,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                prompt.take(120) + if (prompt.length > 120) "…" else "",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(onClick = onEvolve) { Text("AI 优化") }
-                TextButton(onClick = onHistory) { Text("版本历史") }
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(persona.name, fontWeight = FontWeight.Bold)
+                    Text(
+                        buildString {
+                            append(stageLabel(persona.stage))
+                            append(" · 种子「").append(seed.label).append("」")
+                            if (persona.growthCount > 0) {
+                                append(" · 已成长 ").append(persona.growthCount).append(" 次")
+                            }
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                TextButton(onClick = { onFreeze(!persona.frozen) }) {
+                    Text(if (persona.frozen) "已冻结" else "冻结")
+                }
+            }
+
+            if (persona.stage == PersonaStage.EMBRYO) {
+                Text(
+                    "还没破壳：现在用的是种子骨架，聊够消息它会自己写出第一版人格。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            sections?.let { PersonaSectionsView(it) }
+
+            if (persona.lastNote.isNotBlank()) {
+                Text(
+                    "上次：${persona.lastNote}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(onClick = onEdit) { Text("编辑") }
+                TextButton(onClick = onHistory) { Text("成长日记") }
+                TextButton(onClick = onGrow, enabled = !busy) {
+                    Text(if (busy) "成长中…" else "立即成长")
+                }
+                if (persona.stage == PersonaStage.EMBRYO) {
+                    TextButton(onClick = onReseed, enabled = !busy) { Text("换种子") }
+                }
+                if (persona.stage == PersonaStage.MANUAL) {
+                    TextButton(onClick = onHandOver, enabled = !busy) { Text("交给它自己养") }
+                }
             }
         }
     }
 }
+
+/** 五段渲染：身份段加锁标，告诉用户这段改不了。 */
+@Composable
+private fun PersonaSectionsView(sections: PersonaSections) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        SectionLine("身份", sections.identity, locked = true)
+        SectionLine("性格", sections.traits)
+        SectionLine("说话方式", sections.voice)
+        SectionLine("兴趣", sections.interests)
+        SectionLine("边界", sections.bounds)
+    }
+}
+
+@Composable
+private fun SectionLine(
+    label: String,
+    body: String,
+    locked: Boolean = false,
+) {
+    Column {
+        Text(
+            if (locked) "$label 🔒" else label,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (locked) {
+                MaterialTheme.colorScheme.outline
+            } else {
+                MaterialTheme.colorScheme.primary
+            },
+        )
+        Text(body, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+private fun stageLabel(stage: PersonaStage): String =
+    when (stage) {
+        PersonaStage.EMBRYO -> "破壳中"
+        PersonaStage.GROWING -> "成长中"
+        PersonaStage.MATURE -> "已成熟"
+        PersonaStage.MANUAL -> "手动设定"
+    }
+
+/** 未生效的档案：可以切过去，也可以复制一份再改。 */
+@Composable
+private fun InactiveProfileRow(
+    persona: Persona,
+    onActivate: () -> Unit,
+    onDuplicate: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(persona.name, fontWeight = FontWeight.Medium)
+                    Text(
+                        "${stageLabel(persona.stage)} · 未生效",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                TextButton(onClick = onActivate) { Text("切换") }
+                TextButton(onClick = onDuplicate) { Text("复制") }
+                IconButton(onClick = onDelete) {
+                    Icon(Icons.Default.Delete, contentDescription = "删除")
+                }
+            }
+        }
+    }
+}
+
+/** 覆盖层（按人/按群）的一行。 */
+@Composable
+private fun OverrideRow(
+    persona: Persona,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(persona.name.ifBlank { "未命名" }, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                when {
+                    !persona.senderId.isNullOrBlank() -> "仅对某人生效"
+                    !persona.scopeId.isNullOrBlank() -> "仅对群 ${persona.scopeId} 生效"
+                    else -> "未绑定"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        TextButton(onClick = onEdit) { Text("编辑") }
+        IconButton(onClick = onDelete) {
+            Icon(Icons.Default.Delete, contentDescription = "删除")
+        }
+    }
+}
+
+/** 新建人格：名字 + 随机/指定性格种子。 */
+@Composable
+private fun PersonaCreateDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (String, PersonaSeed) -> Unit,
+) {
+    var seed by remember { mutableStateOf(PersonaSeed.random()) }
+    var name by remember { mutableStateOf(seed.label) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("新建人格") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    "不用写提示词。先给它一个性格原点，剩下的从群聊里长。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("名字") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text("性格种子", style = MaterialTheme.typography.labelMedium)
+                PersonaSeed.entries.forEach { option ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier =
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    seed = option
+                                    if (name.isBlank() || name == seed.label) name = option.label
+                                }
+                                .padding(vertical = 4.dp),
+                    ) {
+                        RadioButton(selected = seed == option, onClick = {
+                            seed = option
+                            if (name.isBlank()) name = option.label
+                        })
+                        Text(option.label, modifier = Modifier.weight(1f))
+                        Text(
+                            option.traits.take(18) + "…",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(name.trim().ifBlank { seed.label }, seed) },
+            ) { Text("创建") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
+/** 编辑档案正文（不含绑定范围——档案永远是全局的）。 */
+@Composable
+private fun PersonaBodyDialog(
+    persona: Persona,
+    onDismiss: () -> Unit,
+    onSave: (String, String) -> Unit,
+) {
+    var name by remember { mutableStateOf(persona.name) }
+    var prompt by remember { mutableStateOf(persona.prompt) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("编辑人格") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("名字") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = prompt,
+                    onValueChange = { prompt = it },
+                    label = { Text("人格正文") },
+                    supportingText = {
+                        Text(
+                            "保留 [身份][性格][说话方式][兴趣][边界] 五段。" +
+                                "改完这版会成为自动成长的新基准。",
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    },
+                    minLines = 8,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onSave(name.trim().ifBlank { persona.name }, prompt.trim()) },
+                enabled = prompt.isNotBlank(),
+            ) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
+/** 人设优化/历史的目标。id 一定是真实档案——全局提示词的概念已移除。 */
+private data class PersonaTarget(
+    val id: Long,
+    val name: String,
+    val prompt: String,
+)
 
 /**
  * AI 优化人设对话框。
@@ -652,6 +1011,8 @@ private fun PersonaSnapshotDialog(
                                                 PersonaSnapshotKind.INITIAL -> "初始版本"
                                                 PersonaSnapshotKind.EVOLVED -> "AI 优化"
                                                 PersonaSnapshotKind.MANUAL -> "手动保存"
+                                                PersonaSnapshotKind.BIRTH -> "自动破壳"
+                                                PersonaSnapshotKind.GROWTH -> "自动成长"
                                             },
                                             style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.primary,
@@ -694,54 +1055,6 @@ private fun PersonaSnapshotDialog(
     )
 }
 
-@Composable
-private fun PersonaCard(
-    persona: Persona,
-    onEdit: () -> Unit,
-    onDelete: () -> Unit,
-    onEvolve: () -> Unit = {},
-    onHistory: () -> Unit = {},
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-    ) {
-        Column(Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(persona.name, fontWeight = FontWeight.Medium)
-                    Text(
-                        text =
-                        when {
-                            !persona.senderId.isNullOrBlank() -> "仅对某人生效"
-                            !persona.scopeId.isNullOrBlank() -> "仅对本群生效"
-                            else -> "全局默认"
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
-                IconButton(onClick = onEdit) {
-                    Icon(Icons.Default.Edit, contentDescription = "编辑")
-                }
-                IconButton(onClick = onDelete) {
-                    Icon(Icons.Default.Delete, contentDescription = "删除")
-                }
-            }
-            Spacer(Modifier.height(4.dp))
-            Text(
-                text = persona.prompt.take(120) + if (persona.prompt.length > 120) "…" else "",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(onClick = onEvolve) { Text("AI 优化") }
-                TextButton(onClick = onHistory) { Text("版本历史") }
-            }
-        }
-    }
-}
-
 /** 人设编辑器：名称 + 提示词 + 生效范围（全局 / 群 / 人）。 */
 @Composable
 private fun PersonaEditorDialog(
@@ -752,7 +1065,7 @@ private fun PersonaEditorDialog(
 ) {
     var name by remember { mutableStateOf(initial?.name.orEmpty()) }
     var prompt by remember { mutableStateOf(initial?.prompt.orEmpty()) }
-    var scope by remember { mutableIntStateOf(0) } // 0 全局 1 群 2 人
+    var scope by remember { mutableIntStateOf(0) } // 0 群 1 人（全局人格由档案承担）
     var scopeId by remember { mutableStateOf(initial?.scopeId.orEmpty()) }
     var senderId by remember { mutableStateOf(initial?.senderId.orEmpty()) }
     var people by remember { mutableStateOf<List<KnownPerson>>(emptyList()) }
@@ -766,12 +1079,12 @@ private fun PersonaEditorDialog(
         if (initial != null) {
             when {
                 !initial.senderId.isNullOrBlank() -> {
-                    scope = 2
+                    scope = 1
                     senderId = initial.senderId.orEmpty()
                 }
 
                 !initial.scopeId.isNullOrBlank() -> {
-                    scope = 1
+                    scope = 0
                     scopeId = initial.scopeId.orEmpty()
                 }
 
@@ -811,22 +1124,22 @@ private fun PersonaEditorDialog(
                     FilterChip(
                         selected = scope == 0,
                         onClick = { scope = 0 },
-                        label = { Text("全局") },
+                        label = { Text("按群") },
                     )
                     FilterChip(
                         selected = scope == 1,
                         onClick = { scope = 1 },
-                        label = { Text("按群") },
-                    )
-                    FilterChip(
-                        selected = scope == 2,
-                        onClick = { scope = 2 },
                         label = { Text("按人") },
                     )
                 }
+                Text(
+                    "只想改整体性格？用「AI · 人设」页的人格档案，那里才是它自己。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
 
                 when (scope) {
-                    1 ->
+                    0 ->
                         OutlinedTextField(
                             value = scopeId,
                             onValueChange = { scopeId = it },
@@ -836,7 +1149,7 @@ private fun PersonaEditorDialog(
                             modifier = Modifier.fillMaxWidth(),
                         )
 
-                    2 -> {
+                    1 -> {
                         if (people.isEmpty()) {
                             Text(
                                 "还没有互动过的人。先让机器人在群里聊几句，这里就会出现可绑定的人。",
@@ -875,14 +1188,16 @@ private fun PersonaEditorDialog(
                     onSave(
                         Persona(
                             id = initial?.id ?: 0,
-                            senderId = senderId.takeIf { scope == 2 }?.takeIf { it.isNotBlank() },
-                            scopeId = scopeId.takeIf { scope == 1 }?.takeIf { it.isNotBlank() },
+                            senderId = senderId.takeIf { scope == 1 }?.takeIf { it.isNotBlank() },
+                            scopeId = scopeId.takeIf { scope == 0 }?.takeIf { it.isNotBlank() },
                             name = name.trim().ifBlank { "未命名人设" },
                             prompt = prompt.trim(),
                         ),
                     )
                 },
-                enabled = name.isNotBlank() && prompt.isNotBlank(),
+                enabled =
+                    name.isNotBlank() && prompt.isNotBlank() &&
+                        (scopeId.isNotBlank() || senderId.isNotBlank()),
             ) { Text("保存") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },

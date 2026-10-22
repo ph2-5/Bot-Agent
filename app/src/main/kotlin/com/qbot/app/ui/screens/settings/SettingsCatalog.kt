@@ -93,6 +93,13 @@ private fun builtinEntries(onRequestBatteryWhitelist: () -> Unit): List<Settings
             subtitle = { ChitchatSubtitle() },
         ) { onBack -> ChitchatPage(onBack = onBack) },
         SettingsEntry(
+            id = "persona_growth",
+            group = "智能",
+            title = "人格成长",
+            icon = Icons.Filled.Psychology,
+            subtitle = { PersonaGrowthSubtitle() },
+        ) { onBack -> PersonaGrowthPage(onBack = onBack) },
+        SettingsEntry(
             id = "manual_send",
             group = "工具",
             title = "手动发送",
@@ -143,6 +150,18 @@ private fun AiSubtitle(): String {
         !config.enabled -> "未启用"
         config.model.isBlank() -> "已启用，未填模型"
         else -> config.model
+    }
+}
+
+@Composable
+private fun PersonaGrowthSubtitle(): String {
+    val context = LocalContext.current
+    val app = context.applicationContext as BotApplication
+    val config by app.settings.personaGrowthConfig.collectAsState()
+    return if (config.enabled) {
+        "自动成长 开 · 每 ${config.growMessages} 条 / ${config.growIntervalHours} 小时"
+    } else {
+        "自动成长已关闭"
     }
 }
 

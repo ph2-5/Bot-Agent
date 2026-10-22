@@ -1,11 +1,13 @@
 package com.qbot.app.data.db
 
+import androidx.room.ColumnInfo
 import androidx.room.Dao
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.Insert
 import androidx.room.PrimaryKey
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
 
@@ -175,6 +177,42 @@ interface RoomMessageDao {
     @Query("SELECT DISTINCT scopeKey FROM room_messages")
     suspend fun allScopes(): List<String>
 
+    // ---------- 人格成长的"新增消息"统计 ----------
+
+    /** 全局最大 id：成长游标的初值 */
+    @Query("SELECT MAX(id) FROM room_messages")
+    suspend fun maxId(): Long?
+
+    /**
+     * 自游标以来的新增消息数。
+     *
+     * trim 只删 id 更小的旧行、id 单调递增，所以按 id 计数不会被 trim 影响——
+     * 这正是用游标而不是时间窗的原因（三天不开机、一开涌进 500 条时，
+     * 时间窗会骗着连跑多次成长）。
+     */
+    @Query("SELECT COUNT(*) FROM room_messages WHERE id > :afterId")
+    suspend fun countSince(afterId: Long): Int
+
+    /** 自游标以来最活跃的几个会话范围，用于跨群均衡取样 */
+    @Query(
+        "SELECT scopeKey FROM room_messages WHERE id > :afterId " +
+            "GROUP BY scopeKey ORDER BY COUNT(*) DESC LIMIT :limit",
+    )
+    suspend fun topScopesSince(
+        afterId: Long,
+        limit: Int,
+    ): List<String>
+
+    @Query(
+        "SELECT * FROM room_messages WHERE scopeKey = :scopeKey AND id > :afterId " +
+            "ORDER BY id DESC LIMIT :limit",
+    )
+    suspend fun recentSince(
+        scopeKey: String,
+        afterId: Long,
+        limit: Int,
+    ): List<RoomMessageEntity>
+
     /** 回填处理结论：判断耗时较长，先入库再更新，查看器才能显示"为什么没回" */
     @Query(
         "UPDATE room_messages SET decision = :decision " +
@@ -188,12 +226,19 @@ interface RoomMessageDao {
 }
 
 /**
- * 人设（角色卡）。
+ * 人设（角色卡 / 人格档案）。
  *
- * senderId / scopeId 的绑定组合决定生效范围，解析优先级为
- * 人 → 群 → 全局（见 botcore 的 resolvePersona）。
+ * 2.3.0 起这张表同时承担两件事：
+ * - `kind = PROFILE`：完整的人格档案，可以有多份，但只有一条 [activeSlot] = 1；
+ * - `kind = OVERRIDE`：绑定到某个人 / 某个群的局部覆盖，永远优先于档案。
+ *
+ * 唯一索引 + 可空槽位：激活行写 1、其余写 NULL。SQLite 的唯一索引允许多个 NULL，
+ * 于是"最多一条激活"成了数据库级约束，不靠代码自觉。
  */
-@Entity(tableName = "personas")
+@Entity(
+    tableName = "personas",
+    indices = [Index(value = ["activeSlot"], unique = true)],
+)
 data class PersonaEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     /** 绑定的 senderId；null 表示不绑定到具体某个人 */
@@ -201,8 +246,23 @@ data class PersonaEntity(
     /** 绑定的群/频道 openid；null 表示不绑定到具体群 */
     val scopeId: String?,
     val name: String,
+    /** 五段式人格正文；EMBRYO 阶段为空 */
     val prompt: String,
     val updatedAt: Long,
+    /** PROFILE / OVERRIDE */
+    @ColumnInfo(defaultValue = "OVERRIDE") val kind: String = "OVERRIDE",
+    /** EMBRYO / GROWING / MATURE / MANUAL */
+    @ColumnInfo(defaultValue = "MANUAL") val stage: String = "MANUAL",
+    val seedId: String? = null,
+    val activeSlot: Int? = null,
+    @ColumnInfo(defaultValue = "0") val frozen: Boolean = false,
+    @ColumnInfo(defaultValue = "0") val birthAt: Long = 0,
+    @ColumnInfo(defaultValue = "0") val lastGrownAt: Long = 0,
+    @ColumnInfo(defaultValue = "0") val growthCount: Int = 0,
+    /** 上次成长时的 room_messages 最大 id */
+    @ColumnInfo(defaultValue = "0") val msgCursor: Long = 0,
+    @ColumnInfo(defaultValue = "") val lastNote: String = "",
+    @ColumnInfo(defaultValue = "0") val createdAt: Long = 0,
 )
 
 @Dao
@@ -221,6 +281,96 @@ interface PersonaDao {
 
     @Query("SELECT * FROM personas WHERE id = :id")
     suspend fun findById(id: Long): PersonaEntity?
+
+    // ---------- 人格档案 ----------
+
+    @Query("SELECT * FROM personas WHERE activeSlot = 1 LIMIT 1")
+    fun observeActive(): Flow<PersonaEntity?>
+
+    @Query("SELECT * FROM personas WHERE activeSlot = 1 LIMIT 1")
+    suspend fun active(): PersonaEntity?
+
+    @Query("SELECT * FROM personas WHERE kind = 'PROFILE' ORDER BY activeSlot DESC, createdAt ASC")
+    fun profiles(): Flow<List<PersonaEntity>>
+
+    @Query("SELECT COUNT(*) FROM personas WHERE kind = 'PROFILE'")
+    suspend fun countProfiles(): Int
+
+    @Query("UPDATE personas SET activeSlot = NULL WHERE activeSlot IS NOT NULL")
+    suspend fun clearActive()
+
+    @Query("UPDATE personas SET activeSlot = 1, updatedAt = :at WHERE id = :id")
+    suspend fun setActive(id: Long, at: Long)
+
+    /**
+     * 切换激活档案。
+     *
+     * 必须先清空再置位：单条 `CASE WHEN` 更新在 SQLite 里是逐行执行的，
+     * 给新行写 1 的瞬间旧行还是 1，唯一索引会直接报冲突。
+     */
+    @Transaction
+    suspend fun switchActive(id: Long, at: Long) {
+        clearActive()
+        setActive(id, at)
+    }
+
+    /** 激活行不可删，否则会出现"没有激活却还有档案"的中空态 */
+    @Query("DELETE FROM personas WHERE id = :id AND activeSlot IS NULL")
+    suspend fun deleteIfInactive(id: Long): Int
+
+    /** 冻结 / 解冻、重抽种子、转手动等元数据更新 */
+    @Query(
+        "UPDATE personas SET stage = :stage, seedId = :seedId, frozen = :frozen, " +
+            "updatedAt = :at WHERE id = :id",
+    )
+    suspend fun updateMeta(
+        id: Long,
+        stage: String,
+        seedId: String?,
+        frozen: Boolean,
+        at: Long,
+    )
+
+    /**
+     * 破壳写回。
+     *
+     * `AND stage = 'EMBRYO'` 是防重复破壳的第二道闸（第一道是调度器里的 Mutex）：
+     * 两次并发破壳时，第二次必然影响 0 行。
+     */
+    @Query(
+        "UPDATE personas SET prompt = :prompt, stage = 'GROWING', seedId = :seedId, " +
+            "msgCursor = :cursor, growthCount = 1, birthAt = :at, lastGrownAt = :at, " +
+            "lastNote = :note, updatedAt = :at WHERE id = :id AND stage = 'EMBRYO'",
+    )
+    suspend fun commitBirth(
+        id: Long,
+        prompt: String,
+        seedId: String?,
+        cursor: Long,
+        at: Long,
+        note: String,
+    ): Int
+
+    /**
+     * 成长写回。
+     *
+     * `AND updatedAt = :expected` 是 CAS：期间用户手改过（updatedAt 变了），
+     * 本次成长结果直接丢弃——手改永远赢。
+     */
+    @Query(
+        "UPDATE personas SET prompt = :prompt, stage = :stage, msgCursor = :cursor, " +
+            "growthCount = growthCount + 1, lastGrownAt = :at, lastNote = :note, " +
+            "updatedAt = :at WHERE id = :id AND updatedAt = :expected",
+    )
+    suspend fun commitGrowth(
+        id: Long,
+        prompt: String,
+        stage: String,
+        cursor: Long,
+        at: Long,
+        note: String,
+        expected: Long,
+    ): Int
 }
 
 /**

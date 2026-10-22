@@ -16,6 +16,7 @@ import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.MemoryConfig
+import com.qbot.core.ai.PersonaGrowthConfig
 import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.ThinkingMode
 import kotlinx.coroutines.CoroutineScope
@@ -121,6 +122,13 @@ class SettingsRepository(private val context: Context) {
         val CHITCHAT_MAX_LESSONS = intPreferencesKey("chitchat_max_lessons")
         val CHITCHAT_MAX_INJECTED = intPreferencesKey("chitchat_max_injected")
         val CHITCHAT_JUDGE_CONTEXT = intPreferencesKey("chitchat_judge_context")
+
+        // ---- 人格成长（2.3.0） ----
+        val PERSONA_LEGACY_IMPORTED = booleanPreferencesKey("persona_legacy_imported")
+        val PERSONA_GROWTH_ENABLED = booleanPreferencesKey("persona_growth_enabled")
+        val PERSONA_BIRTH_MESSAGES = intPreferencesKey("persona_birth_messages")
+        val PERSONA_GROW_MESSAGES = intPreferencesKey("persona_grow_messages")
+        val PERSONA_GROW_INTERVAL = intPreferencesKey("persona_grow_interval_hours")
     }
 
     private companion object {
@@ -207,6 +215,11 @@ class SettingsRepository(private val context: Context) {
     private val _chitchatConfig = MutableStateFlow(ChitchatConfig())
     val chitchatConfig: StateFlow<ChitchatConfig> = _chitchatConfig.asStateFlow()
 
+    /** 人格自主成长参数。 */
+    private val _personaGrowthConfig = MutableStateFlow(PersonaGrowthConfig())
+    val personaGrowthConfig: StateFlow<PersonaGrowthConfig> =
+        _personaGrowthConfig.asStateFlow()
+
     init {
         // DataStore 的变更合并进 StateFlow；加密偏好里的 apiKey 每次重新读，
         // 保证用户在设置页改完 Key 后保存即可生效。
@@ -216,6 +229,7 @@ class SettingsRepository(private val context: Context) {
                 _memoryConfig.value = readMemoryConfig(prefs)
                 _greetingConfig.value = readGreetingConfig(prefs)
                 _chitchatConfig.value = readChitchatConfig(prefs)
+                _personaGrowthConfig.value = readPersonaGrowthConfig(prefs)
             }
         }
     }
@@ -269,6 +283,53 @@ class SettingsRepository(private val context: Context) {
                 prefs[Keys.GREETING_TEXT] = config.text
             }
         }
+    }
+
+    private fun readPersonaGrowthConfig(prefs: Preferences): PersonaGrowthConfig {
+        val defaults = PersonaGrowthConfig()
+        return PersonaGrowthConfig.normalize(
+            enabled = prefs[Keys.PERSONA_GROWTH_ENABLED] ?: defaults.enabled,
+            birthMessages = prefs[Keys.PERSONA_BIRTH_MESSAGES] ?: defaults.birthMessages,
+            growMessages = prefs[Keys.PERSONA_GROW_MESSAGES] ?: defaults.growMessages,
+            growIntervalHours =
+                prefs[Keys.PERSONA_GROW_INTERVAL] ?: defaults.growIntervalHours,
+        )
+    }
+
+    fun savePersonaGrowthConfig(config: PersonaGrowthConfig) {
+        val normalized =
+            PersonaGrowthConfig.normalize(
+                enabled = config.enabled,
+                birthMessages = config.birthMessages,
+                growMessages = config.growMessages,
+                growIntervalHours = config.growIntervalHours,
+            )
+        _personaGrowthConfig.value = normalized
+        scope.launch {
+            context.dataStore.edit { prefs ->
+                prefs[Keys.PERSONA_GROWTH_ENABLED] = normalized.enabled
+                prefs[Keys.PERSONA_BIRTH_MESSAGES] = normalized.birthMessages
+                prefs[Keys.PERSONA_GROW_MESSAGES] = normalized.growMessages
+                prefs[Keys.PERSONA_GROW_INTERVAL] = normalized.growIntervalHours
+            }
+        }
+    }
+
+    // ---------- 人格引导 ----------
+
+    /**
+     * 直接读首帧配置。
+     *
+     * [aiConfig] 是 StateFlow，进程刚起来时可能还没收到第一次发射（值是默认值），
+     * 迁移判断不能依赖它，否则会把"出厂默认"误判成用户写的人格。
+     */
+    suspend fun loadAiConfigOnce(): AiConfig = readAiConfig(context.dataStore.data.first())
+
+    suspend fun legacyPersonaImported(): Boolean =
+        context.dataStore.data.first()[Keys.PERSONA_LEGACY_IMPORTED] ?: false
+
+    suspend fun markLegacyPersonaImported() {
+        context.dataStore.edit { it[Keys.PERSONA_LEGACY_IMPORTED] = true }
     }
 
     private fun readChitchatConfig(prefs: Preferences): ChitchatConfig {
