@@ -180,8 +180,9 @@ class GroupAwarenessTest {
         runTest {
             pipeline.handleGroupNotice(notice(GroupNoticeKind.ROBOT_ADDED))
 
-            val reply = pipeline.handleMemoryCommand(groupMessage("叫你小白"), "叫你小白")
-            assertEquals("好，以后在这个群里我就叫「小白」了。", reply)
+            val outcome = pipeline.handleMemoryCommand(groupMessage("叫你小白"), "叫你小白")
+            assertEquals("好，以后在这个群里我就叫「小白」了。", outcome!!.fallback)
+            assertTrue("事实材料应说明新名字", outcome.directive.contains("改成了「小白」"))
             assertEquals("小白", groups.find("group-1")!!.botName)
         }
 
@@ -211,8 +212,11 @@ class GroupAwarenessTest {
                     timestampMillis = 1_700_000_000_000,
                     raw = buildJsonObject { },
                 )
-            val reply = pipeline.handleMemoryCommand(dm, "叫你小白")
-            assertTrue("应提示只在群里有效，实际=$reply", reply!!.contains("只在群里有效"))
+            val outcome = pipeline.handleMemoryCommand(dm, "叫你小白")
+            assertTrue(
+                "应提示只在群里有效，实际=${outcome?.fallback}",
+                outcome!!.fallback.contains("只在群里有效"),
+            )
         }
 
     @Test
@@ -221,8 +225,9 @@ class GroupAwarenessTest {
             pipeline.handleGroupNotice(notice(GroupNoticeKind.ROBOT_ADDED))
             pipeline.handleMemoryCommand(groupMessage("叫你小白"), "叫你小白")
 
-            val reply = pipeline.handleMemoryCommand(groupMessage("你叫什么"), "你叫什么")
-            assertTrue(reply!!.contains("小白"))
+            val outcome = pipeline.handleMemoryCommand(groupMessage("你叫什么"), "你叫什么")
+            assertTrue("事实材料应含群名片", outcome!!.directive.contains("小白"))
+            assertTrue("兜底文案应含群名片", outcome.fallback.contains("小白"))
         }
 
     @Test
@@ -230,8 +235,9 @@ class GroupAwarenessTest {
         runTest {
             pipeline.handleGroupNotice(notice(GroupNoticeKind.ROBOT_ADDED))
 
-            val reply = pipeline.handleMemoryCommand(groupMessage("你是谁"), "你是谁")
-            assertTrue(reply!!.contains("官方机器人"))
+            val outcome = pipeline.handleMemoryCommand(groupMessage("你是谁"), "你是谁")
+            assertTrue("事实材料应含官方名字", outcome!!.directive.contains("官方机器人"))
+            assertTrue("兜底文案应含官方名字", outcome.fallback.contains("官方机器人"))
         }
 
     @Test
@@ -246,12 +252,17 @@ class GroupAwarenessTest {
             // 第三个只说话没报名
             pipeline.handleGroupNotice(notice(GroupNoticeKind.MEMBER_ADDED, actorId = "m3"))
 
-            val reply = pipeline.handleMemoryCommand(groupMessage("群里都有谁"), "群里都有谁")
+            val outcome = pipeline.handleMemoryCommand(groupMessage("群里都有谁"), "群里都有谁")
             // 拉机器人进来的 member-op + 小明 + 小红 + m3
-            assertTrue("应报 4 人，实际=$reply", reply!!.contains("4 人"))
-            assertTrue(reply.contains("小明"))
-            assertTrue(reply.contains("小红"))
-            assertTrue("member-op 与 m3 没报过名字", reply.contains("还有 2 位没告诉我名字"))
+            assertTrue("兜底文案应报 4 人，实际=${outcome?.fallback}", outcome!!.fallback.contains("4 人"))
+            assertTrue("事实材料应报 4 人", outcome.directive.contains("共 4 人"))
+            assertTrue("事实材料应列出名字", outcome.directive.contains("小明"))
+            assertTrue("事实材料应列出名字", outcome.directive.contains("小红"))
+            assertTrue(
+                "事实材料应说明有 2 位没报名字",
+                outcome.directive.contains("还有 2 位没有告诉你名字"),
+            )
+            assertTrue("member-op 与 m3 没报过名字", outcome.fallback.contains("还有 2 位没告诉我名字"))
         }
 
     @Test
@@ -259,8 +270,15 @@ class GroupAwarenessTest {
         runTest {
             // 加群事件没带操作人（平台可能不下发 op_member_openid）：见过的人为空
             pipeline.handleGroupNotice(notice(GroupNoticeKind.ROBOT_ADDED, actorId = null))
-            val reply = pipeline.handleMemoryCommand(groupMessage("群里都有谁"), "群里都有谁")
-            assertTrue(reply!!.contains("还不熟悉"))
+            val outcome = pipeline.handleMemoryCommand(groupMessage("群里都有谁"), "群里都有谁")
+            assertTrue("事实材料应说明不熟悉", outcome!!.directive.contains("还不熟悉"))
+            assertTrue("兜底文案应说明不熟悉", outcome.fallback.contains("还不熟悉"))
+        }
+
+    @Test
+    fun `指令复述开关默认开启`() =
+        runTest {
+            assertTrue(pipeline.currentConfig().personaRewrite)
         }
 
     // ---------- 上下文注入 ----------

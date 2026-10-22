@@ -3,6 +3,7 @@ package com.qbot.core.engine
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.AiResponder
+import com.qbot.core.ai.CommandOutcome
 import com.qbot.core.ai.MemoryPipeline
 import com.qbot.core.api.OpenApi
 import com.qbot.core.gateway.GatewayClient
@@ -179,19 +180,13 @@ class BotRuntime(
         // 不论这条消息最终走规则、记忆指令还是 AI，样本都不能漏。
         memoryPipeline?.noteGroupActivity(message)
 
-        // 记忆管理指令（我的记忆 / 忘掉X / 我是谁）优先于规则与 AI：
-        // 它们是本地数据库操作，不依赖 AI 开关，且比任何规则都更具体。
+        // 记忆/群管理指令（我的记忆 / 忘掉X / 我是谁 / 叫你X / 群里都有谁）
+        // 优先于规则与 AI：副作用是本地数据库操作，不依赖 AI 开关，
+        // 且比任何规则都更具体。回复分两层：人设复述 → 固定句式兜底。
         val pipeline = memoryPipeline
-        val memoryReply = pipeline?.handleMemoryCommand(message, text)
-        if (memoryReply != null) {
-            runCatching {
-                sendReply(message, memoryReply)
-                pipeline.recordExchange(message, text, memoryReply)
-                log(LogLevel.INFO, TAG, "记忆指令 → 已回复")
-            }.onFailure { t ->
-                logger.e(TAG, "记忆指令回复失败", t)
-                log(LogLevel.ERROR, TAG, "记忆指令回复失败：${t.message}")
-            }
+        val outcome = pipeline?.handleMemoryCommand(message, text)
+        if (outcome != null) {
+            replyWithCommandOutcome(pipeline, message, outcome, text)
             return
         }
 
@@ -225,6 +220,62 @@ class BotRuntime(
 
         // 规则未命中且 AI 未启用/不处理时静默丢弃，避免对每条消息都回一句
         log(LogLevel.DEBUG, TAG, "无匹配规则，忽略")
+    }
+
+    /**
+     * 指令结果回复：人设复述优先，固定句式兜底。
+     *
+     * 指令的副作用在 [MemoryPipeline.handleMemoryCommand] 里已本地完成，
+     * 这里只决定「怎么说」：人设复述开着且 AI 可用，就让模型拿着
+     * directive 里的事实结果自己说；否则直接发兜底文案——
+     * 关掉 AI 或 API 抖动时指令功能不会退化。
+     */
+    private suspend fun replyWithCommandOutcome(
+        pipeline: MemoryPipeline,
+        message: IncomingMessage,
+        outcome: CommandOutcome,
+        text: String,
+    ) {
+        val responder = aiResponder?.takeIf { pipeline.currentConfig().personaRewrite }
+        val aiConfig =
+            aiConfigProvider?.invoke()?.takeIf { it.enabled && it.isReady }
+
+        var reply = outcome.fallback
+        var viaAi = false
+        if (responder != null && aiConfig != null) {
+            runCatching {
+                // 复述同样要吃记忆上下文：人设提示词 + 关于此人的事实 +
+                // 群画像，模型才知道「对方是谁、这群什么情况」。
+                val memory = pipeline.buildContext(message, botId, text)
+                val answer =
+                    responder.reply(
+                        message,
+                        aiConfig,
+                        memory,
+                        directive = outcome.directive,
+                    )
+                if (answer.isNotBlank()) {
+                    reply = answer
+                    viaAi = true
+                }
+            }.onFailure { t ->
+                logger.e(TAG, "指令人设复述失败，改用兜底文案", t)
+                log(LogLevel.WARN, TAG, "指令人设复述失败，改用兜底文案：${t.message}")
+            }
+        }
+
+        runCatching {
+            sendReply(message, reply)
+            pipeline.recordExchange(message, text, reply)
+            log(
+                LogLevel.INFO,
+                TAG,
+                if (viaAi) "记忆指令 → 人设复述已回复" else "记忆指令 → 兜底文案已回复",
+            )
+        }.onFailure { t ->
+            logger.e(TAG, "记忆指令回复失败", t)
+            log(LogLevel.ERROR, TAG, "记忆指令回复失败：${t.message}")
+        }
     }
 
     /** 命中本地规则，按模板回复。这一轮也会写进共享群聊背景。 */

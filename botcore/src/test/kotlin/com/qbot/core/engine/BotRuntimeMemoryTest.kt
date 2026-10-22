@@ -40,7 +40,8 @@ import org.junit.Test
  *
  * 覆盖用户最关心的三件事：
  * 1. 群里能认出是谁（日志显示展示名而不是 openid）；
- * 2. 记忆管理指令（我的记忆 / 忘掉我）不经过 LLM 直接应答；
+ * 2. 记忆管理指令（我的记忆 / 忘掉我）由 LLM 按人设复述，
+ *    关闭复述开关时走固定句式兜底；
  * 3. 不同人的会话历史互相隔离。
  */
 class BotRuntimeMemoryTest {
@@ -202,7 +203,7 @@ class BotRuntimeMemoryTest {
         }
 
     @Test
-    fun `我的记忆指令不经过 LLM 直接应答`() =
+    fun `我的记忆指令由 LLM 按人设复述`() =
         runBlocking {
             val logs = CopyOnWriteArrayList<LogEntry>()
             val (runtime, _, _) =
@@ -221,10 +222,38 @@ class BotRuntimeMemoryTest {
 
             assertTrue("应发出回复", sentMessages.isNotEmpty())
             assertTrue(
-                "回复应回放事实，实际：${sentMessages.lastOrNull()}",
+                "LLM 应拿到事实材料复述，实际请求：${llmBodies.drop(llmBefore)}",
+                llmBodies.size > llmBefore &&
+                    llmBodies.drop(llmBefore).any { it.contains("喜欢吃辣") },
+            )
+        }
+
+    @Test
+    fun `关闭人设复述后指令走固定句式兜底`() =
+        runBlocking {
+            val logs = CopyOnWriteArrayList<LogEntry>()
+            val (runtime, _, _) =
+                buildRuntime(
+                    scope = this,
+                    config = aiConfig(),
+                    memoryConfig = MemoryConfig(personaRewrite = false),
+                    logSink = capturingSink(logs),
+                )
+
+            // 先让机器人记住一条事实
+            runtime.onMessage(message("我喜欢吃辣"))
+            awaitOutcome(logs, "AI 已回复", expected = 1)
+
+            sentMessages.clear()
+            val llmBefore = llmBodies.size
+            runtime.onMessage(message("我的记忆"))
+            awaitOutcome(logs, "记忆指令")
+
+            assertTrue(
+                "兜底文案应回放事实，实际：${sentMessages.lastOrNull()}",
                 sentMessages.last().contains("喜欢吃辣"),
             )
-            assertEquals("记忆指令不应打 LLM", llmBefore, llmBodies.size)
+            assertEquals("兜底路径不应打 LLM", llmBefore, llmBodies.size)
         }
 
     @Test
@@ -232,7 +261,12 @@ class BotRuntimeMemoryTest {
         runBlocking {
             val logs = CopyOnWriteArrayList<LogEntry>()
             val (runtime, _, _) =
-                buildRuntime(scope = this, config = aiConfig(), logSink = capturingSink(logs))
+                buildRuntime(
+                    scope = this,
+                    config = aiConfig(),
+                    memoryConfig = MemoryConfig(personaRewrite = false),
+                    logSink = capturingSink(logs),
+                )
 
             runtime.onMessage(message("我喜欢吃辣"))
             awaitOutcome(logs, "AI 已回复", expected = 1)
@@ -240,7 +274,10 @@ class BotRuntimeMemoryTest {
             runtime.onMessage(message("忘掉我"))
             awaitOutcome(logs, "记忆指令")
 
-            assertTrue(sentMessages.last().contains("已清空"))
+            assertTrue(
+                "兜底文案应确认清空，实际：${sentMessages.lastOrNull()}",
+                sentMessages.last().contains("已清空"),
+            )
         }
 
     @Test

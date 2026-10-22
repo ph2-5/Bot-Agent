@@ -19,6 +19,14 @@ data class MemoryConfig(
     val learnNames: Boolean = true,
     /** 是否从消息里提取事实 */
     val learnFacts: Boolean = true,
+    /**
+     * 结构化指令（我叫什么 / 我的记忆 / 叫你X / 群里都有谁）的回复
+     * 是否交给 AI 按人设复述。
+     *
+     * 关闭时退回固定句式（"你叫小明呀"那种）——与人设割裂，
+     * 但不消耗 API、不依赖 AI 配置，适合只把机器人当工具用的场景。
+     */
+    val personaRewrite: Boolean = true,
 )
 
 /**
@@ -38,6 +46,14 @@ val NameSource.priority: Int
             NameSource.DECLARED -> 2
             NameSource.PLATFORM -> 1
         }
+
+/** 来源的自然语言描述，供指令复述时向 AI 交代名字的来历。 */
+fun NameSource.describe(): String =
+    when (this) {
+        NameSource.MANUAL -> "维护者手动备注的"
+        NameSource.DECLARED -> "对方自己告诉你的"
+        NameSource.PLATFORM -> "平台报文里自带的"
+    }
 
 /**
  * 身份名录：senderId → 展示名。
@@ -299,14 +315,19 @@ class MemoryPipeline(
     }
 
     /**
-     * 记忆管理指令拦截。
+     * 记忆/群管理指令拦截。
      *
-     * @return 回复文本；不是记忆指令返回 null（交回正常处理流程）
+     * 副作用（改名片、删记忆）在这里本地完成；回复文案不写死——
+     * 返回 [CommandOutcome]：directive 是给 AI 复述的事实材料，
+     * fallback 是 AI 不可用时的兜底。由调用方（BotRuntime）按
+     * [MemoryConfig.personaRewrite] 与 AI 可用性二选一。
+     *
+     * @return 指令结果；不是记忆指令返回 null（交回正常处理流程）
      */
     suspend fun handleMemoryCommand(
         message: IncomingMessage,
         cleanText: String,
-    ): String? {
+    ): CommandOutcome? {
         val config = configProvider()
         if (!config.enabled) return null
         val senderId = message.senderId ?: return null
@@ -317,9 +338,17 @@ class MemoryPipeline(
         if (text in WHO_AM_I_COMMANDS) {
             val entry = identities.find(senderId)
             return if (entry != null) {
-                "你叫${entry.displayName}呀，我一直记得。"
+                CommandOutcome(
+                    directive = "对方的展示名是「${entry.displayName}」" +
+                        "（${entry.source.describe()}），你一直记得。",
+                    fallback = "你叫${entry.displayName}呀，我一直记得。",
+                )
             } else {
-                "我还不认识你——发一句「叫我XXX」告诉我吧。"
+                CommandOutcome(
+                    directive = "你还不认识对方：对方没有告诉过你名字，" +
+                        "你也没有任何关于对方名字的记录。",
+                    fallback = "我还不认识你——发一句「叫我XXX」告诉我吧。",
+                )
             }
         }
 
@@ -327,10 +356,17 @@ class MemoryPipeline(
         if (text in SHOW_MEMORY_COMMANDS) {
             val list = facts.facts(senderId)
             return if (list.isEmpty()) {
-                "我还没有关于你的记忆。多聊几句，或者直接告诉我「我喜欢XXX」。"
+                CommandOutcome(
+                    directive = "你还没有关于对方的任何记忆记录。",
+                    fallback = "我还没有关于你的记忆。多聊几句，或者直接告诉我「我喜欢XXX」。",
+                )
             } else {
                 val body = list.take(20).joinToString("\n") { "- ${it.text}" }
-                "关于你，我记得这些：\n$body\n（说「忘掉X」可以删掉某条，「忘掉我」全部清空）"
+                CommandOutcome(
+                    directive = "你记录的关于对方的事实如下：\n$body",
+                    fallback = "关于你，我记得这些：\n$body\n" +
+                        "（说「忘掉X」可以删掉某条，「忘掉我」全部清空）",
+                )
             }
         }
 
@@ -339,7 +375,16 @@ class MemoryPipeline(
             val count = facts.facts(senderId).size
             facts.deleteAll(senderId)
             identities.forget(senderId)
-            return if (count > 0) "已清空关于你的 $count 条记忆，我们重新认识。" else "我本来就没有关于你的记忆。"
+            return CommandOutcome(
+                directive = "你刚刚清空了关于对方的全部记忆" +
+                    "（共 $count 条）以及对方的名字记录，" +
+                    "现在你不记得关于对方的任何事情。",
+                fallback = if (count > 0) {
+                    "已清空关于你的 $count 条记忆，我们重新认识。"
+                } else {
+                    "我本来就没有关于你的记忆。"
+                },
+            )
         }
 
         // 忘掉 X
@@ -349,11 +394,19 @@ class MemoryPipeline(
             if (keyword.isNotEmpty()) {
                 val matched = facts.facts(senderId).filter { it.text.contains(keyword) }
                 matched.forEach { facts.delete(it.id) }
-                return if (matched.isEmpty()) {
-                    "我没有找到关于「$keyword」的记忆。"
-                } else {
-                    "已忘掉关于「$keyword」的 ${matched.size} 条记忆。"
-                }
+                return CommandOutcome(
+                    directive = if (matched.isEmpty()) {
+                        "对方让你忘掉关于「$keyword」的记忆，" +
+                            "但你没有找到相关记录，什么也没有删除。"
+                    } else {
+                        "你刚刚忘掉了关于「$keyword」的 ${matched.size} 条记忆。"
+                    },
+                    fallback = if (matched.isEmpty()) {
+                        "我没有找到关于「$keyword」的记忆。"
+                    } else {
+                        "已忘掉关于「$keyword」的 ${matched.size} 条记忆。"
+                    },
+                )
             }
         }
 
@@ -366,10 +419,23 @@ class MemoryPipeline(
             val groupName = groupId?.let { store.find(it) }?.botName
             val globalName = botNameProvider?.invoke()?.takeIf { it.isNotBlank() }
             return when {
-                groupName != null -> "我在这个群叫「$groupName」呀，有事叫我这个名字就行。"
-                globalName != null -> "官方名字是「$globalName」。" +
-                    "想给我改个名的话，在群里说「叫你XXX」就行。"
-                else -> "我还没有名字——在群里说「叫你XXX」就能给我取一个。"
+                groupName != null -> CommandOutcome(
+                    directive = "你在这个群的名字叫「$groupName」，" +
+                        "是群里的人给你取的，大家会用这个名字称呼你。",
+                    fallback = "我在这个群叫「$groupName」呀，有事叫我这个名字就行。",
+                )
+
+                globalName != null -> CommandOutcome(
+                    directive = "你在这个群还没有群昵称；" +
+                        "你的官方名字是「$globalName」。",
+                    fallback = "官方名字是「$globalName」。" +
+                        "想给我改个名的话，在群里说「叫你XXX」就行。",
+                )
+
+                else -> CommandOutcome(
+                    directive = "你还没有名字：既没有群昵称，也查不到官方名字。",
+                    fallback = "我还没有名字——在群里说「叫你XXX」就能给我取一个。",
+                )
             }
         }
 
@@ -378,7 +444,11 @@ class MemoryPipeline(
         if (renameMatch != null) {
             val newName = renameMatch.groupValues[1].trim()
             if (message.kind != MessageKind.GROUP_AT || groupId == null) {
-                return "改名字这件事只在群里有效哦——在那个群里说「叫你$newName」就行。"
+                return CommandOutcome(
+                    directive = "对方想在私聊里给你改名字，但改名只在群里有效，" +
+                        "你向对方说明了这一点。",
+                    fallback = "改名字这件事只在群里有效哦——在那个群里说「叫你$newName」就行。",
+                )
             }
             val existing = store.find(groupId)
             store.upsert(
@@ -392,35 +462,58 @@ class MemoryPipeline(
                     seenMembers = existing?.seenMembers.orEmpty(),
                 ),
             )
-            return "好，以后在这个群里我就叫「$newName」了。"
+            return CommandOutcome(
+                directive = "你刚刚在这个群把名字改成了「$newName」，" +
+                    "从此大家会用这个名字称呼你。",
+                fallback = "好，以后在这个群里我就叫「$newName」了。",
+            )
         }
 
         // 群里都有谁 / 群里有多少人 → 本群见过的人（有名字的列名字）
         if (text in GROUP_MEMBERS_COMMANDS) {
             if (message.kind != MessageKind.GROUP_AT || groupId == null) {
-                return "这个只能在群里问我哦。"
+                return CommandOutcome(
+                    directive = "对方在群外问群里有哪些人，你说明这只能在群里问。",
+                    fallback = "这个只能在群里问我哦。",
+                )
             }
             val profile = store.find(groupId)
             val seen = profile?.seenMembers.orEmpty()
             if (seen.isEmpty()) {
-                return "这个群我还不熟悉——大家多@我聊几句，慢慢就认识了。" +
-                    "想让我记住你的话，说一句「叫我XXX」。"
+                return CommandOutcome(
+                    directive = "这个群你还不熟悉：没有见过任何成员，" +
+                        "也不知道任何人的名字。",
+                    fallback = "这个群我还不熟悉——大家多@我聊几句，慢慢就认识了。" +
+                        "想让我记住你的话，说一句「叫我XXX」。",
+                )
             }
             val named =
                 seen.mapNotNull { id ->
                     identities.find(id)?.displayName?.let { name -> id to name }
                 }
             val unnamedCount = seen.size - named.size
-            val header = "这个群里跟机器人有过交流的有 ${seen.size} 人："
-            val lines =
-                named.map { (_, name) -> "- $name" } +
-                    if (unnamedCount > 0) listOf("- 还有 $unnamedCount 位没告诉我名字") else emptyList()
-            return header + "\n" + lines.joinToString("\n") +
-                "\n（说「叫我XXX」可以让我记住你）"
+            val nameList = named.joinToString("、") { (_, name) -> name }
+            return CommandOutcome(
+                directive = "这个群里跟你有过交流的成员共 ${seen.size} 人。" +
+                    "其中你知道名字的有：$nameList" +
+                    if (unnamedCount > 0) {
+                        "；还有 $unnamedCount 位没有告诉你名字。"
+                    } else {
+                        "。"
+                    } +
+                    "（平台不提供完整成员名单，以上是你通过群事件与聊天积累到的，不要编造其他成员。）",
+                fallback = "这个群里跟机器人有过交流的有 ${seen.size} 人：\n" +
+                    named.joinToString("\n") { (_, name) -> "- $name" } +
+                    (if (unnamedCount > 0) "\n- 还有 $unnamedCount 位没告诉我名字" else "") +
+                    "\n（说「叫我XXX」可以让我记住你）",
+            )
         }
 
         return null
     }
+
+    /** 当前记忆配置（运行层判断指令复述开关用，避免重复读 DataStore）。 */
+    fun currentConfig(): MemoryConfig = configProvider()
 
     /** 启动时收敛：事实总量与共享背景条数。 */
     suspend fun trimAll() {

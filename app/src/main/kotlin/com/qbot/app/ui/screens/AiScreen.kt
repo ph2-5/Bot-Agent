@@ -273,6 +273,15 @@ private fun MemoryConfigCard(
                 enabled = config.enabled,
             )
 
+            SwitchRow(
+                title = "指令回复人设化",
+                desc = "「我叫什么 / 我的记忆 / 叫你X / 群里都有谁」等指令的结果" +
+                    "交给 AI 按人设语气说出，不再用固定句式；关闭后走固定文案，不消耗 API",
+                checked = config.personaRewrite,
+                onCheckedChange = { onChange(config.copy(personaRewrite = it)) },
+                enabled = config.enabled,
+            )
+
             Text(
                 "每人最多保留 ${config.factsPerPerson} 条事实（超出自动淘汰最旧的）",
                 style = MaterialTheme.typography.labelMedium,

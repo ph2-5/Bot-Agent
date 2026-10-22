@@ -85,6 +85,7 @@ class SettingsRepository(private val context: Context) {
         val MEMORY_ROOM_SIZE = intPreferencesKey("memory_room_size")
         val MEMORY_LEARN_NAMES = booleanPreferencesKey("memory_learn_names")
         val MEMORY_LEARN_FACTS = booleanPreferencesKey("memory_learn_facts")
+        val MEMORY_PERSONA_REWRITE = booleanPreferencesKey("memory_persona_rewrite")
 
         // ---- 群感知 ----
         val GREETING_ENABLED = booleanPreferencesKey("greeting_enabled")
@@ -189,6 +190,8 @@ class SettingsRepository(private val context: Context) {
             roomContextSize = prefs[Keys.MEMORY_ROOM_SIZE] ?: defaults.roomContextSize,
             learnNames = prefs[Keys.MEMORY_LEARN_NAMES] ?: defaults.learnNames,
             learnFacts = prefs[Keys.MEMORY_LEARN_FACTS] ?: defaults.learnFacts,
+            personaRewrite =
+                prefs[Keys.MEMORY_PERSONA_REWRITE] ?: defaults.personaRewrite,
         )
     }
 
@@ -203,6 +206,7 @@ class SettingsRepository(private val context: Context) {
                 prefs[Keys.MEMORY_ROOM_SIZE] = config.roomContextSize
                 prefs[Keys.MEMORY_LEARN_NAMES] = config.learnNames
                 prefs[Keys.MEMORY_LEARN_FACTS] = config.learnFacts
+                prefs[Keys.MEMORY_PERSONA_REWRITE] = config.personaRewrite
             }
         }
     }

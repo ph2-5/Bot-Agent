@@ -62,7 +62,10 @@ class GatewayClientIntegrationTest {
         runCatching { server.shutdown() }
     }
 
-    private fun buildClient(listener: GatewayListener? = null): GatewayClient {
+    private fun buildClient(
+        listener: GatewayListener? = null,
+        monitorIntervalMillis: Long = 10_000L,
+    ): GatewayClient {
         val auth =
             AccessTokenManager(
                 appId = "appid",
@@ -84,6 +87,7 @@ class GatewayClientIntegrationTest {
             intents = Intents.DEFAULT,
             listener = listener,
             properties = mapOf("\$os" to "test"),
+            monitorIntervalMillis = monitorIntervalMillis,
         )
     }
 
@@ -470,6 +474,59 @@ class GatewayClientIntegrationTest {
         val after = server.requestCount
         Thread.sleep(500)
         assertEquals("停止后不应再发起任何请求", after, server.requestCount)
+    }
+
+    @Test
+    fun `心跳 ACK 长期缺失时判定僵死并主动重连`() {
+        enqueueToken()
+        enqueueGateway()
+        // Hello 给一个很短的心跳周期；服务端只收不发 ACK，模拟半开连接：
+        // Socket 看着是通的，心跳也发得出去，但永远等不到回音。
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onOpen(
+                        webSocket: WebSocket,
+                        response: Response,
+                    ) {
+                        webSocket.send("""{"op":10,"d":{"heartbeat_interval":100}}""")
+                    }
+
+                    override fun onMessage(
+                        webSocket: WebSocket,
+                        text: String,
+                    ) {
+                        if (Json.frameOp(text) == OpCode.IDENTIFY) {
+                            webSocket.send(
+                                """{"op":0,"s":1,"t":"READY","d":{"version":1,"session_id":"sid-1"}}""",
+                            )
+                        }
+                        // 其余帧（心跳）一律不回 ACK
+                    }
+                },
+            ),
+        )
+
+        client = buildClient(monitorIntervalMillis = 100L)
+        client.start()
+        assertEquals(ConnectionState.READY, waitForStatus(ConnectionState.READY).state)
+
+        // 阈值 100ms × 2.5 = 250ms，监控 100ms 一轮：
+        // 若仍按"必须等过 ACK 才检测"的老逻辑，状态会永远停在 READY（僵尸连接）。
+        val deadline = System.currentTimeMillis() + 3_000L
+        var leftReady = false
+        while (System.currentTimeMillis() < deadline) {
+            if (client.status.value.state != ConnectionState.READY) {
+                leftReady = true
+                break
+            }
+            Thread.sleep(20)
+        }
+        assertTrue(
+            "ACK 缺失应触发僵死重连，实际 state=${client.status.value.state} " +
+                "error=${client.status.value.lastError}",
+            leftReady,
+        )
     }
 
     @Test

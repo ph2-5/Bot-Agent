@@ -233,28 +233,40 @@ class AiResponder(
      *
      * @param memory 本条消息的记忆上下文（展示名 / 事实 / 群聊背景），
      *   由 [MemoryPipeline.buildContext] 准备；为空时退化为纯对话模式。
+     * @param directive 结构化指令的执行结果（见 [CommandOutcome.directive]）。
+     *   非空时本轮不是普通对话，而是「按人设复述指令结果」：任务说明会
+     *   拼在本轮问题里，人设与记忆照常注入——固定句式与人设割裂的
+     *   问题由此解决。会话历史只记录用户的原始话术，不记录包装文本。
      * @return 助手回复文本；失败时抛出 [LlmException]，由调用方决定兜底话术。
      */
     suspend fun reply(
         message: IncomingMessage,
         config: AiConfig,
         memory: MemoryContext? = null,
+        directive: String? = null,
     ): String {
         val key = ConversationKeys.history(message)
-        val question = extractQuestion(message)
+        val rawQuestion = extractQuestion(message)
         val systemPrompt = personaResolver?.invoke(message) ?: config.systemPrompt
 
         lockFor(key).withLock {
             // 清空指令不调用模型，直接重置上下文
-            if (question.lowercase() in CLEAR_COMMANDS) {
+            if (rawQuestion.lowercase() in CLEAR_COMMANDS) {
                 history.clear(key)
                 return "已清空与本会话的上下文，可以开始新对话了。"
             }
 
-            if (question.isBlank()) return "请问你想问什么？"
+            if (rawQuestion.isBlank()) return "请问你想问什么？"
 
             val historyLimit = (config.contextTurns * 2).coerceIn(2, 40)
             val stored = history.load(key, historyLimit)
+
+            val question =
+                if (directive.isNullOrBlank()) {
+                    rawQuestion
+                } else {
+                    wrapDirective(directive, rawQuestion)
+                }
 
             val result =
                 try {
@@ -266,14 +278,35 @@ class AiResponder(
                     callLlm(halved, question, config, memory, systemPrompt)
                 }
 
-            // 成功后才写入历史：失败的请求不应污染上下文
-            history.append(key, ChatMessage(role = "user", content = question))
+            // 成功后才写入历史：失败的请求不应污染上下文。
+            // 记录用户的原始话术而非包装后的任务说明——
+            // 否则下一轮历史里会残留「【指令结果】…」这类内部文本。
+            history.append(key, ChatMessage(role = "user", content = rawQuestion))
             history.append(key, ChatMessage(role = "assistant", content = result.content))
             history.trim(key, historyLimit)
 
             return truncate(result.content)
         }
     }
+
+    /**
+     * 把指令执行结果包装成「人设复述任务」。
+     *
+     * 指令的执行在本地完成（改名片、删记忆都是数据库操作），
+     * 但表达层统一交还人设：「你叫小明呀」配上毒舌人设就是人格分裂，
+     * 不如让模型拿着事实结果用自己的语气说。
+     */
+    private fun wrapDirective(
+        directive: String,
+        rawQuestion: String,
+    ): String =
+        buildString {
+            append("【指令结果】").append(directive)
+            append("\n【任务】以上是本地指令的执行结果。请严格依据它，")
+            append("用你的人设和语气自然地回复这句话：「").append(rawQuestion).append("」。")
+            append("要像你本来就知道一样说出来，不要提及指令、系统、数据库等字眼；")
+            append("结果中的关键信息（名字、数量、条目）必须如实保留，不得编造。")
+        }
 
     /** 最近一次成功调用的用量（供维护端展示缓存命中率），无调用时为 null。 */
     private val _lastUsage = MutableStateFlow<LlmUsage?>(null)

@@ -44,7 +44,7 @@ import org.junit.Test
  * 1. 被拉进群 → 建档 + （可选）发问候语；
  * 2. 新成员进群 → 记入「见过的人」；
  * 3. 被移出群 → 标记不活跃；
- * 4. 群名片指令（叫你X）不经过 LLM 直接应答。
+ * 4. 群名片指令（叫你X）本地改档 + LLM 按人设复述，AI 不可用时走兜底文案。
  */
 class BotRuntimeGroupTest {
     private lateinit var server: MockWebServer
@@ -99,6 +99,7 @@ class BotRuntimeGroupTest {
         scope: CoroutineScope,
         greetingText: String? = null,
         logSink: LogSink? = null,
+        aiEnabled: Boolean = true,
     ): BotRuntime {
         val auth =
             AccessTokenManager(
@@ -135,7 +136,7 @@ class BotRuntimeGroupTest {
             scope = scope,
             logSink = logSink,
             aiResponder = AiResponder(client = LlmClient(http = http), history = InMemoryAiHistoryStore()),
-            aiConfigProvider = { aiConfig() },
+            aiConfigProvider = { aiConfig().copy(enabled = aiEnabled) },
             memoryPipeline = pipeline,
             greetingTextProvider = { greetingText },
         )
@@ -292,7 +293,7 @@ class BotRuntimeGroupTest {
         }
 
     @Test
-    fun `叫你X 指令不经过 LLM 直接改群名片`() =
+    fun `叫你X 指令由 LLM 按人设复述`() =
         runBlocking {
             val runtime = buildRuntime(scope = this)
             runtime.onRawEvent("GROUP_ADD_ROBOT", rawEvent("GROUP_ADD_ROBOT", actorId = null))
@@ -303,10 +304,29 @@ class BotRuntimeGroupTest {
             runtime.onMessage(groupMessage("叫你小白"))
             awaitSent(1)
             assertTrue(
-                "应回复确认改名，实际：$sentMessages",
+                "LLM 请求应带上改名结果作为复述材料，实际请求：$llmBodies",
+                llmBodies.any { it.contains("改成了「小白」") },
+            )
+            assertTrue("应已发出回复，实际发送：$sentMessages", sentMessages.isNotEmpty())
+            assertEquals("小白", groups.find("group-openid")!!.botName)
+        }
+
+    @Test
+    fun `AI 不可用时指令走兜底文案`() =
+        runBlocking {
+            val runtime = buildRuntime(scope = this, aiEnabled = false)
+            runtime.onRawEvent("GROUP_ADD_ROBOT", rawEvent("GROUP_ADD_ROBOT", actorId = null))
+            withTimeout(15_000) {
+                while (groups.find("group-openid") == null) delay(50)
+            }
+
+            runtime.onMessage(groupMessage("叫你小白"))
+            awaitSent(1)
+            assertTrue(
+                "兜底文案应确认改名，实际发送：$sentMessages",
                 sentMessages.any { it.contains("小白") },
             )
-            assertTrue("改名指令不应触发 LLM", llmBodies.isEmpty())
+            assertTrue("兜底路径不应触发 LLM", llmBodies.isEmpty())
             assertEquals("小白", groups.find("group-openid")!!.botName)
         }
 }

@@ -241,9 +241,10 @@ class MemoryPipelineTest {
         runBlocking {
             pipeline.buildContext(message("我喜欢吃辣"), "bot", "我喜欢吃辣")
 
-            val reply = pipeline.handleMemoryCommand(message("我的记忆"), "我的记忆")
-            assertNotNull(reply)
-            assertTrue(reply!!.contains("喜欢吃辣"))
+            val outcome = pipeline.handleMemoryCommand(message("我的记忆"), "我的记忆")
+            assertNotNull(outcome)
+            assertTrue("事实材料应含事实", outcome!!.directive.contains("喜欢吃辣"))
+            assertTrue("兜底文案应含事实", outcome.fallback.contains("喜欢吃辣"))
         }
 
     @Test
@@ -251,15 +252,17 @@ class MemoryPipelineTest {
         runTest {
             pipeline.buildContext(message("叫我小明"), "bot", "叫我小明")
 
-            val reply = pipeline.handleMemoryCommand(message("我叫什么"), "我叫什么")
-            assertTrue(reply!!.contains("小明"))
+            val outcome = pipeline.handleMemoryCommand(message("我叫什么"), "我叫什么")
+            assertTrue("事实材料应含名字", outcome!!.directive.contains("小明"))
+            assertTrue("兜底文案应含名字", outcome.fallback.contains("小明"))
         }
 
     @Test
     fun `不认识时我问什么给出引导`() =
         runTest {
-            val reply = pipeline.handleMemoryCommand(message("我是谁"), "我是谁")
-            assertTrue(reply!!.contains("还不认识"))
+            val outcome = pipeline.handleMemoryCommand(message("我是谁"), "我是谁")
+            assertTrue("事实材料应说明不认识", outcome!!.directive.contains("还不认识"))
+            assertTrue("兜底文案应给出引导", outcome.fallback.contains("还不认识"))
         }
 
     @Test
@@ -269,10 +272,27 @@ class MemoryPipelineTest {
             clock.tick()
             pipeline.buildContext(message("我讨厌胡萝卜"), "bot", "我讨厌胡萝卜")
 
-            val reply = pipeline.handleMemoryCommand(message("忘掉胡萝卜"), "忘掉胡萝卜")
-            assertTrue(reply!!.contains("已忘掉"))
+            val outcome = pipeline.handleMemoryCommand(message("忘掉胡萝卜"), "忘掉胡萝卜")
+            assertTrue("兜底文案应确认删除", outcome!!.fallback.contains("已忘掉"))
+            assertTrue(
+                "事实材料应说明删了什么",
+                outcome.directive.contains("忘掉了关于「胡萝卜」的 1 条记忆"),
+            )
             assertTrue(facts.facts("sender-1").none { it.text.contains("胡萝卜") })
             assertTrue(facts.facts("sender-1").any { it.text.contains("辣") })
+        }
+
+    @Test
+    fun `忘掉未命中的关键词不删任何东西`() =
+        runTest {
+            pipeline.buildContext(message("我喜欢吃辣"), "bot", "我喜欢吃辣")
+
+            val outcome = pipeline.handleMemoryCommand(message("忘掉菠菜"), "忘掉菠菜")
+            assertTrue(
+                "事实材料应说明没找到",
+                outcome!!.directive.contains("没有找到相关记录"),
+            )
+            assertEquals(1, facts.facts("sender-1").size)
         }
 
     @Test
@@ -281,10 +301,22 @@ class MemoryPipelineTest {
             pipeline.buildContext(message("叫我小明"), "bot", "叫我小明")
             pipeline.buildContext(message("我喜欢吃辣"), "bot", "我喜欢吃辣")
 
-            val reply = pipeline.handleMemoryCommand(message("忘掉我"), "忘掉我")
-            assertTrue(reply!!.contains("已清空"))
+            val outcome = pipeline.handleMemoryCommand(message("忘掉我"), "忘掉我")
+            assertTrue("兜底文案应确认清空", outcome!!.fallback.contains("已清空"))
+            assertTrue("事实材料应说明清空后果", outcome.directive.contains("不记得关于对方的任何事情"))
             assertTrue(facts.facts("sender-1").isEmpty())
             assertNull(identities.find("sender-1"))
+        }
+
+    @Test
+    fun `空记忆的查看指令给引导`() =
+        runTest {
+            val outcome = pipeline.handleMemoryCommand(message("我的记忆"), "我的记忆")
+            assertTrue(
+                "事实材料应说明没有记忆",
+                outcome!!.directive.contains("还没有关于对方的任何记忆"),
+            )
+            assertTrue("兜底文案应给引导", outcome.fallback.contains("多聊几句"))
         }
 
     @Test

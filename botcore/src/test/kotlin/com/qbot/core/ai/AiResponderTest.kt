@@ -333,4 +333,49 @@ class AiResponderTest {
             assertTrue("应关闭思考模式，实际=$body", body.contains("\"thinking\""))
             assertTrue("应为 disabled，实际=$body", body.contains("disabled"))
         }
+
+    // ---------- 指令结果复述（directive） ----------
+
+    @Test
+    fun `指令结果被包装进本轮问题交给模型`() =
+        runBlocking {
+            enqueueAnswer("你叫小明，我一直记着呢")
+            val reply =
+                responder.reply(
+                    message("我叫什么"),
+                    config(),
+                    directive = "对方的展示名是「小明」（对方自己告诉你的）",
+                )
+            assertEquals("你叫小明，我一直记着呢", reply)
+
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue("应带上指令结果，实际=$body", body.contains("【指令结果】"))
+            assertTrue("应带上事实材料", body.contains("对方的展示名是「小明」"))
+            assertTrue("应带上复述任务说明", body.contains("【任务】"))
+            assertTrue("应带上用户原话", body.contains("我叫什么"))
+        }
+
+    @Test
+    fun `指令复述的会话历史只记原始话术`() =
+        runBlocking {
+            enqueueAnswer("记住了")
+            responder.reply(message("叫你小白"), config(), directive = "你刚刚把名字改成了「小白」")
+
+            val stored = history.load("g:group-1:user-1", 10)
+            assertEquals(2, stored.size)
+            assertEquals("user", stored[0].role)
+            assertEquals("用户原话应原文入历史", "叫你小白", stored[0].content)
+            assertFalse(
+                "包装文本不应泄漏进历史",
+                stored[0].content.contains("【指令结果】"),
+            )
+        }
+
+    @Test
+    fun `clear 指令优先于指令复述且不调用模型`() =
+        runBlocking {
+            val reply = responder.reply(message("clear"), config(), directive = "任意结果")
+            assertTrue(reply.contains("已清空"))
+            assertEquals(0, server.requestCount)
+        }
 }

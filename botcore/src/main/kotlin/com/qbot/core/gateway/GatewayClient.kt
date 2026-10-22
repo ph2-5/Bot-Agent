@@ -81,6 +81,8 @@ class GatewayClient(
             "\$browser" to "QBotMobile",
             "\$device" to "QBotMobile",
         ),
+    /** 僵死检测轮询间隔；测试里调小以免等 10 秒 */
+    private val monitorIntervalMillis: Long = MONITOR_INTERVAL_MILLIS,
 ) {
     companion object {
         private const val TAG = "Gateway"
@@ -90,6 +92,15 @@ class GatewayClient(
 
         /** 僵死检测轮询间隔 */
         private const val MONITOR_INTERVAL_MILLIS = 10_000L
+
+        /**
+         * 心跳发送失败后立即重连的频率保护窗口。
+         *
+         * 发送失败说明连接已废，没必要再等一个心跳周期；
+         * 但若服务端整体不可达，每次失败都立即重连会变成秒级空转，
+         * 因此同一窗口内只触发一次，其余交给退避节奏。
+         */
+        private const val HEARTBEAT_SEND_FAIL_GUARD_MILLIS = 5_000L
 
         /**
          * 触发限频后的冷静期时长。
@@ -130,8 +141,9 @@ class GatewayClient(
     @Volatile
     private var lastHeartbeatAckAt: Long = 0L
 
+    /** 上一次心跳发送失败的时刻，用于立即重连的频率保护 */
     @Volatile
-    private var awaitingAck: Boolean = false
+    private var lastHeartbeatSendFailAt: Long = 0L
 
     @Volatile
     private var running: Boolean = false
@@ -455,7 +467,6 @@ class GatewayClient(
         }
 
         lastHeartbeatAckAt = clock.nowMillis()
-        awaitingAck = false
         startHeartbeat(myEpoch)
     }
 
@@ -539,7 +550,6 @@ class GatewayClient(
     }
 
     private fun onHeartbeatAck() {
-        awaitingAck = false
         lastHeartbeatAckAt = clock.nowMillis()
         updateStatus { copy(lastHeartbeatAckMillis = lastHeartbeatAckAt) }
         logger.v(TAG, "心跳 ACK")
@@ -561,11 +571,15 @@ class GatewayClient(
                         continue
                     }
                     if (!send(buildHeartbeat(lastSeq))) {
-                        logger.w(TAG, "心跳发送失败，等待僵死检测触发重连")
+                        logger.w(TAG, "心跳发送失败，连接已废，立即重连")
+                        val now = clock.nowMillis()
+                        if (now - lastHeartbeatSendFailAt > HEARTBEAT_SEND_FAIL_GUARD_MILLIS) {
+                            lastHeartbeatSendFailAt = now
+                            reconnectNow("心跳发送失败")
+                        }
                         continue
                     }
                     lastHeartbeatSentAt = clock.nowMillis()
-                    awaitingAck = true
                     logger.v(TAG, "已发送心跳 seq=$lastSeq")
                 }
             }
@@ -583,11 +597,14 @@ class GatewayClient(
         monitorJob =
             scope.launch {
                 while (isActive) {
-                    delay(MONITOR_INTERVAL_MILLIS)
+                    delay(monitorIntervalMillis)
                     if (!running) continue
                     if (_status.state != ConnectionState.READY) continue
-                    if (!awaitingAck) continue
+                    if (lastHeartbeatAckAt == 0L) continue
 
+                    // 只依据 ACK 时间戳判定，不看 awaitingAck：
+                    // 发送失败时它不会被置位，早期实现据此跳过检测，
+                    // 把"连接已废但通知栏仍显示已在线"的僵尸连接误判成正常。
                     val overdue = clock.nowMillis() - lastHeartbeatAckAt
                     val threshold = (heartbeatInterval * HEARTBEAT_TIMEOUT_FACTOR).toLong()
                     if (overdue > threshold) {
