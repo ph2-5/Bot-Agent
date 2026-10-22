@@ -30,6 +30,10 @@ interface IdentityDao {
     @Query("SELECT * FROM identities WHERE senderId = :senderId")
     suspend fun find(senderId: String): IdentityEntity?
 
+    /** 批量查名字：组装群画像时一次查完，避免 N 次单查 */
+    @Query("SELECT * FROM identities WHERE senderId IN (:senderIds)")
+    suspend fun findMany(senderIds: List<String>): List<IdentityEntity>
+
     @Upsert
     suspend fun upsert(entry: IdentityEntity)
 
@@ -189,4 +193,55 @@ interface PersonaDao {
 
     @Query("SELECT * FROM personas WHERE id = :id")
     suspend fun findById(id: Long): PersonaEntity?
+}
+
+/**
+ * 人设版本快照。
+ *
+ * 每次 AI 进化前后各存一版，初始版本（INITIAL）在第一次进化前自动写入，
+ * 不可删除——这是"人设被改坏还能回去"的最后一道保险。
+ *
+ * personaId 为 null 表示全局系统提示词（AiConfig.systemPrompt）。
+ */
+@Entity(
+    tableName = "persona_snapshots",
+    indices = [Index("personaId")],
+)
+data class PersonaSnapshotEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val personaId: Long?,
+    val name: String,
+    val prompt: String,
+    /** INITIAL / EVOLVED / MANUAL */
+    val kind: String,
+    val note: String,
+    val createdAt: Long,
+)
+
+@Dao
+interface PersonaSnapshotDao {
+    @Query("SELECT * FROM persona_snapshots WHERE personaId IS :personaId ORDER BY createdAt DESC")
+    fun observeFor(personaId: Long?): Flow<List<PersonaSnapshotEntity>>
+
+    @Query("SELECT * FROM persona_snapshots WHERE personaId IS :personaId ORDER BY createdAt DESC")
+    suspend fun listFor(personaId: Long?): List<PersonaSnapshotEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM persona_snapshots WHERE personaId IS :personaId AND kind = 'INITIAL'",
+    )
+    suspend fun countInitial(personaId: Long?): Int
+
+    @Insert
+    suspend fun insert(snapshot: PersonaSnapshotEntity): Long
+
+    @Query("DELETE FROM persona_snapshots WHERE id = :id AND kind != 'INITIAL'")
+    suspend fun deleteNonInitial(id: Long)
+
+    /** 只保留最近 N 条非初始版本，防止无限增长 */
+    @Query(
+        "DELETE FROM persona_snapshots WHERE personaId IS :personaId AND kind != 'INITIAL' " +
+            "AND id NOT IN (SELECT id FROM persona_snapshots WHERE personaId IS :personaId " +
+            "ORDER BY createdAt DESC LIMIT :keep)",
+    )
+    suspend fun trim(personaId: Long?, keep: Int)
 }

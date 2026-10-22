@@ -13,20 +13,20 @@ import kotlinx.coroutines.sync.withLock
 data class ChitchatConfig(
     /** 总开关 */
     val enabled: Boolean = false,
-    /** 基础冷却时间（毫秒）；实际冷却会按群活跃度自适应缩放 */
-    val baseCooldownMillis: Long = 90_000L,
-    /** 每群每小时最多主动接话次数（硬上限，防打扰/防封） */
-    val maxPerHour: Int = 20,
-    /** 每群每天最多接话次数 */
-    val maxPerDay: Int = 200,
+    /** 基础冷却时间（毫秒）；下限 1 秒，实际冷却按群活跃度自适应缩放 */
+    val baseCooldownMillis: Long = 45_000L,
+    /** 每群每小时最多接话次数；**0 表示不限制** */
+    val maxPerHour: Int = 60,
+    /** 每群每天最多接话次数；**0 表示不限制** */
+    val maxPerDay: Int = 400,
     /** 通过预筛后是否再让 AI 判断一次「该不该插话」 */
     val aiJudge: Boolean = true,
     /** 通过预筛后的参与概率（0~1），先随机筛掉一部分再问 AI，进一步省成本 */
-    val probability: Double = 0.2,
+    val probability: Double = 0.35,
     /** 有人叫机器人的名字时必须接话 */
     val answerOnName: Boolean = true,
     /** 规则打分阈值：低于它就放弃，不进入 AI 判断 */
-    val minScore: Int = 40,
+    val minScore: Int = 25,
 )
 
 /**
@@ -67,7 +67,10 @@ class ChitchatPolicy(
         private const val DAY_MILLIS = 24 * 60 * 60_000L
 
         /** 被叫名字时的最小间隔，避免名字是常用词时刷屏 */
-        private const val NAME_MIN_GAP_MILLIS = 20_000L
+        private const val NAME_MIN_GAP_MILLIS = 5_000L
+
+        /** 冷却下限：配置再小也不低于 1 秒，避免每条都触发 */
+        private const val MIN_COOLDOWN_MILLIS = 1_000L
 
         /** 最多跟踪多少个群的状态，防止长期运行时无限增长 */
         private const val MAX_TRACKED_GROUPS = 128
@@ -140,10 +143,14 @@ class ChitchatPolicy(
             val state = stateOf(groupId)
             pruneQuota(state, now)
 
-            if (state.speakTimes.count { it >= now - HOUR_MILLIS } >= config.maxPerHour) {
-                return ChitchatGate.Skip("本小时已达上限 ${config.maxPerHour} 次")
+            // 0 = 不限制。上限为 0 时直接跳过检查，方便"只想靠冷却控制节奏"的用法。
+            if (config.maxPerHour > 0) {
+                val hourCount = state.speakTimes.count { it >= now - HOUR_MILLIS }
+                if (hourCount >= config.maxPerHour) {
+                    return ChitchatGate.Skip("本小时已达上限 ${config.maxPerHour} 次")
+                }
             }
-            if (state.speakTimes.size >= config.maxPerDay) {
+            if (config.maxPerDay > 0 && state.speakTimes.size >= config.maxPerDay) {
                 return ChitchatGate.Skip("本日已达上限 ${config.maxPerDay} 次")
             }
 
@@ -206,6 +213,9 @@ class ChitchatPolicy(
      * - 5 分钟内 ≥12 条（聊得正热）→ 冷却 ×2，少插嘴；
      * - 5 分钟内 ≤2 条（冷场）→ 冷却 ×0.6，更愿意接话；
      * - 其余不变。
+     *
+     * 结果不低于 1 秒：把基础冷却调到 1 秒的用户想要的是"几乎每条都能评估"，
+     * 但 0.6 倍会算出 0，等于绕过了"每条只评估一次"的语义。
      */
     private fun adaptiveCooldown(
         state: GroupState,
@@ -219,7 +229,7 @@ class ChitchatPolicy(
                 recent <= 2 -> 0.6
                 else -> 1.0
             }
-        return (config.baseCooldownMillis * factor).toLong()
+        return (config.baseCooldownMillis * factor).toLong().coerceAtLeast(MIN_COOLDOWN_MILLIS)
     }
 
     /**
@@ -234,8 +244,8 @@ class ChitchatPolicy(
         // 疑问句是最强的"需要有人接"信号：普通提问应正好达到默认阈值
         if (QUESTION_WORDS.any { text.contains(it) }) score += 30
         if (text.length <= 3) score -= 20
-        // @ 了别人：大概率是两个人之间的对话
-        if (text.contains("<@!") || text.startsWith("@")) score -= 10
+        // @ 了别人：大概率是两个人之间的对话，强负分压到阈值以下
+        if (text.contains("<@!") || text.startsWith("@")) score -= 20
         return score
     }
 }

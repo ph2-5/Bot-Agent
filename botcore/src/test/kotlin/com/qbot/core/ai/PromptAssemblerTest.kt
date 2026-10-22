@@ -309,4 +309,54 @@ class PromptAssemblerTest {
         assertFalse("背景应被砍掉", messages.any { it.content.contains("小红") })
         assertTrue(messages.last().content.contains("问题"))
     }
+
+    @Test
+    fun `群成员名册与机器人自我称呼进入群画像`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "你是毒舌群友",
+                memory =
+                    memory(
+                        label = "小明",
+                        group =
+                            GroupDigest(
+                                groupId = "g",
+                                botName = "小白",
+                                seenCount = 6,
+                                knownMembers = listOf("小明", "小红"),
+                                unnamedCount = 4,
+                            ),
+                    ),
+                history = emptyList(),
+                question = "群里都有谁",
+                tokenBudget = 10_000,
+            )
+
+        val groupBlock = messages.first { it.role == "system" && it.content.contains("QQ 群里聊天") }
+        assertTrue("应声明自己的群名片", groupBlock.content.contains("小白"))
+        assertTrue("应列出认识的人", groupBlock.content.contains("小明"))
+        assertTrue("应列出认识的人", groupBlock.content.contains("小红"))
+        assertTrue("应说明还有多少人没报名", groupBlock.content.contains("另有 4 位"))
+        assertTrue("应禁止编造", groupBlock.content.contains("不要编造"))
+        assertTrue("应声明当前说话人的名字", groupBlock.content.contains("正在跟你说话的这个人叫「小明」"))
+    }
+
+    @Test
+    fun `事实块声明当前称呼并作废旧称呼`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "你是助手",
+                memory = memory(label = "小红", facts = listOf(fact("喜欢吃辣"))),
+                history = emptyList(),
+                question = "我叫什么",
+                tokenBudget = 10_000,
+            )
+
+        val factsBlock = messages.first { it.content.contains("喜欢吃辣") }
+        assertTrue(
+            "改名后必须声明以此为准",
+            factsBlock.content.contains("对方现在的名字是「小红」"),
+        )
+        assertTrue("旧称呼应作废", factsBlock.content.contains("旧称呼一律作废"))
+    }
 }

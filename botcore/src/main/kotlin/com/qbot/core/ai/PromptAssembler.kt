@@ -81,7 +81,20 @@ class PromptAssembler {
                 cost += lineCost
             }
             if (lines.isNotEmpty()) {
-                val header = "关于对方（${memory?.senderLabel ?: "对方"}）你记得的事："
+                // 称呼声明并入事实块：改名后必须压倒历史里的旧称呼。
+                // 模型很容易从历史对话里捡起旧名字（真实反馈过），
+                // 所以每轮都明确"以此为准"。
+                val who = memory?.senderLabel?.takeIf { it.isNotBlank() }
+                val header =
+                    buildString {
+                        if (who != null) {
+                            append("对方现在的名字是「$who」，以此为准；")
+                            append("历史对话里出现过的旧称呼一律作废。\n")
+                        }
+                        append("关于对方")
+                        if (who != null) append("（$who）")
+                        append("你记得的事：")
+                    }
                 val block = header + "\n" + lines.joinToString("\n")
                 result += ChatMessage(role = "system", content = block)
                 remaining -= TokenEstimator.estimate(block)
@@ -100,9 +113,22 @@ class PromptAssembler {
                 } else {
                     "你在这个群还没有昵称，被问到名字时用官方名字即可。"
                 }
-            lines +=
-                "这个群里跟你有过交流的成员约 ${group.seenCount} 人" +
-                    "（平台不提供完整成员名单，不要编造群成员姓名；有人问「群里都有谁」时如实说明数量）。"
+            memory?.senderLabel?.takeIf { it.isNotBlank() }?.let { who ->
+                lines += "正在跟你说话的这个人叫「$who」，以此为准；历史里的旧称呼作废。"
+            }
+            lines += "这个群里跟你有过交流的成员约 ${group.seenCount} 人。"
+            if (group.knownMembers.isNotEmpty()) {
+                lines +=
+                    "你认识的人：" + group.knownMembers.joinToString("、") +
+                        if (group.unnamedCount > 0) {
+                            "（另有 ${group.unnamedCount} 位没告诉你名字）"
+                        } else {
+                            ""
+                        }
+                lines += "被问到群里有哪些人时只报上面这些名字，不要编造。"
+            } else {
+                lines += "你还不知道任何人的名字，被问到时如实说明，不要编造群成员姓名。"
+            }
             if (!group.proactiveAllowed) {
                 lines += "本群管理员关闭了主动消息，不要发送与当前对话无关的内容。"
             }

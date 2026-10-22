@@ -99,6 +99,7 @@ class BotController(
         PersonaRepository(
             personaDao = database.personaDao(),
             identityDao = database.identityDao(),
+            snapshotDao = database.personaSnapshotDao(),
         )
 
     /** 身份存储，供维护端「备注名 / 忘掉某人」与管线共用。 */
@@ -307,6 +308,77 @@ class BotController(
         }
         return reply
     }
+
+    /**
+     * 用 AI 优化一条人设。
+     *
+     * 进化前先把当前版本存为 INITIAL（只存一次），因此第一次优化永远可回滚；
+     * 之后每版都留快照，最多保留 [PersonaRepository] 的 20 条。
+     *
+     * @param personaId 人设 id；null 表示「全局系统提示词」
+     * @param instruction 用户的额外要求，如「更毒舌一点，但别骂人」
+     * @return 新的提示词
+     */
+    suspend fun evolvePersona(
+        personaId: Long?,
+        instruction: String? = null,
+    ): Result<String> =
+        runCatching {
+            val aiConfig = settings.aiConfig.value
+            require(aiConfig.enabled && aiConfig.isReady) { "先在「AI 接入」里配置并启用模型" }
+
+            val persona = personaId?.let { id -> personaRepository.all().firstOrNull { it.id == id } }
+            val name = persona?.name ?: "全局默认"
+            val current = (persona?.prompt ?: aiConfig.systemPrompt).trim()
+            require(current.isNotEmpty()) { "当前人设是空的，没有可优化的内容" }
+
+            if (!personaRepository.hasInitialSnapshot(personaId)) {
+                personaRepository.addSnapshot(
+                    personaId = personaId,
+                    name = name,
+                    prompt = current,
+                    kind = com.qbot.core.ai.PersonaSnapshotKind.INITIAL,
+                    note = "初始版本（自动存档，不可删除）",
+                )
+            }
+
+            val evolution =
+                com.qbot.core.ai.PersonaEvolver(LlmClient(http = http, logger = logger))
+                    .evolve(
+                        personaName = name,
+                        currentPrompt = current,
+                        samples = recentSamplesForEvolution(),
+                        instruction = instruction,
+                        config = aiConfig,
+                    )
+
+            if (persona != null) {
+                personaRepository.save(persona.copy(prompt = evolution.prompt))
+            } else {
+                // 全局人设就是「AI 接入」里的系统提示词
+                settings.saveAiConfig(aiConfig.copy(systemPrompt = evolution.prompt))
+            }
+            personaRepository.addSnapshot(
+                personaId = personaId,
+                name = name,
+                prompt = evolution.prompt,
+                kind = com.qbot.core.ai.PersonaSnapshotKind.EVOLVED,
+                note = instruction?.takeIf { it.isNotBlank() } ?: "AI 优化",
+            )
+            evolution.prompt
+        }
+
+    /** 取最近活跃群的一段群聊作为进化样本；没有群就直接用空样本。 */
+    private suspend fun recentSamplesForEvolution(): List<com.qbot.core.ai.RoomMessage> {
+        val active = runCatching { groupStore.allActive() }.getOrDefault(emptyList())
+        val groupId = active.maxByOrNull { it.lastSeenAt }?.groupId ?: return emptyList()
+        return runCatching { memoryPipeline.recentGroupMessages(groupId, 40) }
+            .getOrDefault(emptyList())
+    }
+
+    /** 某个目标的版本历史（UI 用）。 */
+    suspend fun personaSnapshots(personaId: Long?) =
+        personaRepository.snapshots(personaId)
 
     private fun build(
         appId: String,

@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -53,6 +54,8 @@ import com.qbot.core.ai.KnownPerson
 import com.qbot.core.ai.MemoryConfig
 import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.Persona
+import com.qbot.core.ai.PersonaSnapshot
+import com.qbot.core.ai.PersonaSnapshotKind
 import com.qbot.core.ai.UserFact
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -414,12 +417,16 @@ private fun RenameDialog(
 private fun PersonaTab() {
     val context = androidx.compose.ui.platform.LocalContext.current
     val app = context.applicationContext as BotApplication
+    val controller = app.controller
     val repository = app.controller.personaRepository
     val scope = rememberCoroutineScope()
 
     val personas by repository.personas.collectAsState(initial = emptyList())
+    val aiConfig by controller.aiConfig.collectAsState()
     var editing by remember { mutableStateOf<Persona?>(null) }
     var creating by remember { mutableStateOf(false) }
+    var evolveTarget by remember { mutableStateOf<PersonaTarget?>(null) }
+    var historyTarget by remember { mutableStateOf<PersonaTarget?>(null) }
 
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -455,10 +462,34 @@ private fun PersonaTab() {
                 )
             }
 
+            // 全局系统提示词：所有没单独人设的对话都用它。
+            // 它不在这张 personas 表里，单独给一个入口，才能被 AI 优化与回滚。
+            PersonaTargetCard(
+                title = "全局系统提示词",
+                subtitle = "所有没有单独人设的对话都用它",
+                prompt = aiConfig.systemPrompt,
+                onEvolve = {
+                    evolveTarget =
+                        PersonaTarget(id = null, name = "全局默认", prompt = aiConfig.systemPrompt)
+                },
+                onHistory = {
+                    historyTarget =
+                        PersonaTarget(id = null, name = "全局默认", prompt = aiConfig.systemPrompt)
+                },
+            )
+
             personas.forEach { persona ->
                 PersonaCard(
                     persona = persona,
                     onEdit = { editing = persona },
+                    onEvolve = {
+                        evolveTarget =
+                            PersonaTarget(persona.id, persona.name, persona.prompt)
+                    },
+                    onHistory = {
+                        historyTarget =
+                            PersonaTarget(persona.id, persona.name, persona.prompt)
+                    },
                     onDelete = {
                         scope.launch {
                             repository.delete(persona.id)
@@ -495,6 +526,254 @@ private fun PersonaTab() {
             },
         )
     }
+
+    evolveTarget?.let { target ->
+        PersonaEvolveDialog(
+            target = target,
+            onDismiss = { evolveTarget = null },
+            onRun = { instruction -> controller.evolvePersona(target.id, instruction) },
+        )
+    }
+
+    historyTarget?.let { target ->
+        PersonaSnapshotDialog(
+            target = target,
+            onDismiss = { historyTarget = null },
+            load = { controller.personaSnapshots(target.id) },
+            onRestore = { snapshot ->
+                scope.launch {
+                    if (target.id != null) {
+                        repository.all().firstOrNull { it.id == target.id }?.let {
+                            repository.save(it.copy(prompt = snapshot.prompt))
+                        }
+                    } else {
+                        app.settings.saveAiConfig(
+                            controller.aiConfig.value.copy(systemPrompt = snapshot.prompt),
+                        )
+                    }
+                    historyTarget = null
+                }
+            },
+            onDelete = { id -> scope.launch { repository.deleteSnapshot(id) } },
+        )
+    }
+}
+
+/** 人设优化/历史的目标：id 为 null 表示全局系统提示词。 */
+private data class PersonaTarget(
+    val id: Long?,
+    val name: String,
+    val prompt: String,
+)
+
+/** 全局系统提示词卡片：只有优化与历史两个动作（正文在「AI 接入」里编辑）。 */
+@Composable
+private fun PersonaTargetCard(
+    title: String,
+    subtitle: String,
+    prompt: String,
+    onEvolve: () -> Unit,
+    onHistory: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text(title, fontWeight = FontWeight.Medium)
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                prompt.take(120) + if (prompt.length > 120) "…" else "",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = onEvolve) { Text("AI 优化") }
+                TextButton(onClick = onHistory) { Text("版本历史") }
+            }
+        }
+    }
+}
+
+/**
+ * AI 优化人设对话框。
+ *
+ * 初始版本由 [BotController.evolvePersona] 在第一次优化前自动存档，
+ * 所以这里不重复做"保存"动作，只负责收集额外要求并展示结果。
+ */
+@Composable
+private fun PersonaEvolveDialog(
+    target: PersonaTarget,
+    onDismiss: () -> Unit,
+    onRun: suspend (String?) -> Result<String>,
+) {
+    var instruction by remember { mutableStateOf("") }
+    var running by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+    var failed by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    AlertDialog(
+        onDismissRequest = { if (!running) onDismiss() },
+        title = { Text("AI 优化人设") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("目标：${target.name}", style = MaterialTheme.typography.labelMedium)
+                Text(
+                    "AI 会参考最近的群聊，在不改变身份设定的前提下补全表达习惯与边界。" +
+                        "初始版本会自动存档，随时可以回滚。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = instruction,
+                    onValueChange = { instruction = it },
+                    label = { Text("额外要求（可选）") },
+                    placeholder = { Text("例如：更毒舌一点，但别骂人") },
+                    minLines = 2,
+                    enabled = !running,
+                )
+                message?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.labelSmall,
+                        color =
+                            if (failed) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                            },
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !running,
+                onClick = {
+                    scope.launch {
+                        running = true
+                        message = null
+                        onRun(instruction.takeIf { it.isNotBlank() })
+                            .onSuccess {
+                                failed = false
+                                message = "已更新，新版本已存档"
+                            }
+                            .onFailure {
+                                failed = true
+                                message = it.message ?: "优化失败"
+                            }
+                        running = false
+                    }
+                },
+            ) {
+                Text(if (running) "优化中…" else "开始优化")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !running) { Text("关闭") }
+        },
+    )
+}
+
+/** 版本历史：查看、回滚、删除非初始版本。 */
+@Composable
+private fun PersonaSnapshotDialog(
+    target: PersonaTarget,
+    onDismiss: () -> Unit,
+    load: suspend () -> List<PersonaSnapshot>,
+    onRestore: (PersonaSnapshot) -> Unit,
+    onDelete: (Long) -> Unit,
+) {
+    var items by remember { mutableStateOf<List<PersonaSnapshot>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    LaunchedEffect(target.id) {
+        items = load()
+        loading = false
+    }
+    val format = remember { SimpleDateFormat("MM-dd HH:mm", Locale.CHINA) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("版本历史 · ${target.name}") },
+        text = {
+            when {
+                loading -> Text("读取中…")
+                items.isEmpty() ->
+                    Text(
+                        "还没有版本记录。第一次用 AI 优化时会自动保存初始版本。",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+
+                else ->
+                    Column(
+                        modifier =
+                            Modifier
+                                .heightIn(max = 420.dp)
+                                .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items.forEach { snap ->
+                            Card(
+                                colors = CardDefaults.cardColors(
+                                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                ),
+                            ) {
+                                Column(
+                                    Modifier.padding(10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            when (snap.kind) {
+                                                PersonaSnapshotKind.INITIAL -> "初始版本"
+                                                PersonaSnapshotKind.EVOLVED -> "AI 优化"
+                                                PersonaSnapshotKind.MANUAL -> "手动保存"
+                                            },
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.primary,
+                                        )
+                                        Spacer(Modifier.weight(1f))
+                                        Text(
+                                            format.format(Date(snap.createdAt)),
+                                            style = MaterialTheme.typography.labelSmall,
+                                        )
+                                    }
+                                    Text(snap.note, style = MaterialTheme.typography.labelSmall)
+                                    Text(
+                                        snap.prompt.take(80) +
+                                            if (snap.prompt.length > 80) "…" else "",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Row {
+                                        TextButton(onClick = { onRestore(snap) }) {
+                                            Text("回滚到此版")
+                                        }
+                                        if (snap.kind != PersonaSnapshotKind.INITIAL) {
+                                            TextButton(
+                                                onClick = {
+                                                    onDelete(snap.id)
+                                                    items = items.filterNot { it.id == snap.id }
+                                                },
+                                            ) {
+                                                Text("删除")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+    )
 }
 
 @Composable
@@ -502,6 +781,8 @@ private fun PersonaCard(
     persona: Persona,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
+    onEvolve: () -> Unit = {},
+    onHistory: () -> Unit = {},
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -535,6 +816,10 @@ private fun PersonaCard(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = onEvolve) { Text("AI 优化") }
+                TextButton(onClick = onHistory) { Text("版本历史") }
+            }
         }
     }
 }
@@ -864,27 +1149,36 @@ private fun ChitchatCard(
             )
 
             Text(
-                "冷却 ${config.baseCooldownMillis / 1000} 秒（群里聊得热闹时自动放慢，冷场时加快）",
+                "冷却 ${config.baseCooldownMillis / 1000} 秒（群里聊得热闹时自动放慢，冷场时加快；最低 1 秒）",
                 style = MaterialTheme.typography.labelMedium,
             )
             Slider(
-                value = (config.baseCooldownMillis / 1000).toFloat(),
+                value = (config.baseCooldownMillis / 1000).toFloat().coerceIn(1f, 300f),
                 onValueChange = {
-                    onChange(config.copy(baseCooldownMillis = it.toInt().coerceIn(30, 300) * 1000L))
+                    onChange(config.copy(baseCooldownMillis = it.toInt().coerceIn(1, 300) * 1000L))
                 },
-                valueRange = 30f..300f,
+                valueRange = 1f..300f,
                 enabled = config.enabled,
             )
 
             Text(
-                "每小时最多接话 ${config.maxPerHour} 次",
+                if (config.maxPerHour <= 0) {
+                    "每小时接话：无上限"
+                } else {
+                    "每小时最多接话 ${config.maxPerHour} 次"
+                },
                 style = MaterialTheme.typography.labelMedium,
             )
             Slider(
-                value = config.maxPerHour.toFloat(),
-                onValueChange = { onChange(config.copy(maxPerHour = it.toInt().coerceIn(1, 60))) },
-                valueRange = 1f..60f,
+                value = config.maxPerHour.toFloat().coerceIn(0f, 200f),
+                onValueChange = { onChange(config.copy(maxPerHour = it.toInt().coerceIn(0, 200))) },
+                valueRange = 0f..200f,
                 enabled = config.enabled,
+            )
+            Text(
+                "调到 0 表示不限制（只靠冷却控制节奏）",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
             Text(

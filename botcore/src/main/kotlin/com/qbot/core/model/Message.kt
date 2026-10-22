@@ -192,9 +192,10 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
     val senderName =
         when (kind) {
             MessageKind.GUILD, MessageKind.DIRECT -> obj.nestedStringOrNull("member", "nick")
-            // 全量群消息的 author.username 是真实 QQ 昵称——
-            // 这是平台唯一主动提供昵称的场景，值得记进身份名录。
-            MessageKind.GROUP_MESSAGE -> obj.nestedStringOrNull("author", "username")
+            // 群消息的 author.username 是真实 QQ 昵称。全量模式一定有；
+            // @ 消息官方文档未列出，但部分场景会带，有就白捡一个真名。
+            MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE ->
+                obj.nestedStringOrNull("author", "username")
             else -> null
         }
 

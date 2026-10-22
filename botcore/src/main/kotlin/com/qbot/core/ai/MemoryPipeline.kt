@@ -75,6 +75,15 @@ interface IdentityStore {
     /** 查条目；没有返回 null */
     suspend fun find(senderId: String): IdentityEntry?
 
+    /**
+     * 批量查条目。
+     *
+     * 组装群画像时要一次拿到几十个成员的名字，逐个 find 在 Room 上会是几十次查询；
+     * 默认实现是循环，数据库实现应覆盖成单条 IN 查询。
+     */
+    suspend fun findMany(senderIds: Collection<String>): Map<String, IdentityEntry> =
+        senderIds.mapNotNull { id -> find(id)?.let { id to it } }.toMap()
+
     /** 记录/更新展示名。仅当来源优先级不低于已有条目时才覆盖。 */
     suspend fun remember(
         senderId: String,
@@ -401,6 +410,16 @@ class MemoryPipeline(
         return roomContext.recent(ConversationKeys.room(message), limit)
     }
 
+    /** 按群 id 读最近对话（人设进化取样等场景，手上没有消息对象）。 */
+    suspend fun recentGroupMessages(
+        groupId: String,
+        limit: Int,
+    ): List<RoomMessage> {
+        val config = configProvider()
+        if (!config.enabled || !config.roomContextEnabled) return emptyList()
+        return roomContext.recent(ConversationKeys.groupRoom(groupId), limit)
+    }
+
     /**
      * 记忆/群管理指令拦截。
      *
@@ -636,12 +655,47 @@ class MemoryPipeline(
         if (message.kind != MessageKind.GROUP_AT && message.kind != MessageKind.GROUP_MESSAGE) return null
         val groupId = message.targetId?.takeIf { it.isNotBlank() } ?: return null
         val profile = store.find(groupId) ?: return null
+        val seen = profile.seenMembers
+        // 只查前 40 个成员的名称（一次 IN 查询），最多展示 8 个：
+        // 群画像要短、要稳定，塞 500 个名字既费 token 也刷屏。
+        val known =
+            if (seen.isEmpty()) {
+                emptyList()
+            } else {
+                identities.findMany(seen.take(40)).values
+                    .map { it.displayName }
+                    .distinct()
+                    .take(8)
+            }
         return GroupDigest(
             groupId = groupId,
             botName = profile.botName,
             seenCount = profile.seenCount,
             proactiveAllowed = profile.proactiveAllowed,
+            knownMembers = known,
+            unnamedCount = (seen.size - known.size).coerceAtLeast(0),
         )
+    }
+
+    /**
+     * 观察机器人在本群被怎么称呼。
+     *
+     * 群昵称没有查询接口，但 @ 消息的 mentions 里可能带着机器人自己的
+     * username（往往就是群名片）。只在用户还没手动设置时采用——
+     * 「叫你X」与维护端备注永远优先。
+     */
+    suspend fun observeBotName(
+        groupId: String,
+        name: String?,
+    ) {
+        val config = configProvider()
+        if (!config.enabled) return
+        val store = groupStore ?: return
+        val clean = name?.trim().orEmpty()
+        if (clean.isEmpty()) return
+        val existing = store.find(groupId) ?: return
+        if (existing.botName != null) return
+        store.upsert(existing.copy(botName = clean))
     }
 
     /**

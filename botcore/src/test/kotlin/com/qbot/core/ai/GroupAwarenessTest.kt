@@ -281,6 +281,43 @@ class GroupAwarenessTest {
             assertTrue(pipeline.currentConfig().personaRewrite)
         }
 
+    @Test
+    fun `mentions 里的群昵称会被采用`() =
+        runTest {
+            pipeline.handleGroupNotice(notice(GroupNoticeKind.ROBOT_ADDED))
+
+            // @ 消息的 mentions 里机器人自己的 username 往往就是群名片
+            pipeline.observeBotName("group-1", "小助手")
+
+            assertEquals("小助手", groups.find("group-1")!!.botName)
+        }
+
+    @Test
+    fun `手动设置的群名片不会被 mentions 覆盖`() =
+        runTest {
+            pipeline.handleGroupNotice(notice(GroupNoticeKind.ROBOT_ADDED))
+            pipeline.handleMemoryCommand(groupMessage("叫你小白"), "叫你小白")
+
+            pipeline.observeBotName("group-1", "另一个名字")
+
+            assertEquals("小白", groups.find("group-1")!!.botName)
+        }
+
+    @Test
+    fun `群画像带上已知成员名册`() =
+        runTest {
+            pipeline.handleGroupNotice(notice(GroupNoticeKind.ROBOT_ADDED))
+            pipeline.noteGroupActivity(groupMessage("大家好", senderId = "m1"))
+            pipeline.resolveLabel(groupMessage("叫我小明", senderId = "m1"), "叫我小明")
+            pipeline.noteGroupActivity(groupMessage("大家好", senderId = "m2"))
+            pipeline.resolveLabel(groupMessage("叫我小红", senderId = "m2"), "叫我小红")
+
+            val ctx = pipeline.buildContext(groupMessage("在吗"), "bot", "在吗")
+            val digest = ctx.group!!
+            assertTrue("应带出已知成员", digest.knownMembers.containsAll(listOf("小明", "小红")))
+            assertTrue("未报名的人应计入 unnamed", digest.unnamedCount >= 1)
+        }
+
     // ---------- 上下文注入 ----------
 
     @Test

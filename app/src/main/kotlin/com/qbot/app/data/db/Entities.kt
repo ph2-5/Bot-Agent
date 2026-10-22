@@ -137,10 +137,11 @@ interface AiHistoryDao {
         FactEntity::class,
         RoomMessageEntity::class,
         PersonaEntity::class,
+        PersonaSnapshotEntity::class,
         GroupEntity::class,
         GroupMemberEntity::class,
     ],
-    version = 4,
+    version = 5,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -157,6 +158,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun roomMessageDao(): RoomMessageDao
 
     abstract fun personaDao(): PersonaDao
+
+    abstract fun personaSnapshotDao(): PersonaSnapshotDao
 
     abstract fun groupDao(): GroupDao
 
@@ -266,6 +269,35 @@ abstract class AppDatabase : RoomDatabase() {
                     db.execSQL(
                         "CREATE UNIQUE INDEX IF NOT EXISTS index_group_members_groupId_memberId" +
                             " ON group_members(groupId, memberId)",
+                    )
+                }
+            }
+
+        /**
+         * v4 → v5：人设版本快照。
+         *
+         * 纯增量迁移。`personaId` 允许 NULL（全局系统提示词），
+         * 因此 Room 生成的列类型是 INTEGER（可空）。
+         */
+        val MIGRATION_4_5 =
+            object : androidx.room.migration.Migration(4, 5) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS persona_snapshots (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            personaId INTEGER,
+                            name TEXT NOT NULL,
+                            prompt TEXT NOT NULL,
+                            kind TEXT NOT NULL,
+                            note TEXT NOT NULL,
+                            createdAt INTEGER NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS index_persona_snapshots_personaId" +
+                            " ON persona_snapshots(personaId)",
                     )
                 }
             }

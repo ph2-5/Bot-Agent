@@ -61,6 +61,21 @@ class RoomIdentityStore(
         dao.delete(senderId)
     }
 
+    override suspend fun findMany(senderIds: Collection<String>): Map<String, IdentityEntry> {
+        if (senderIds.isEmpty()) return emptyMap()
+        return dao.findMany(senderIds.toList()).associate { entity ->
+            entity.senderId to
+                IdentityEntry(
+                    senderId = entity.senderId,
+                    displayName = entity.displayName,
+                    source =
+                        runCatching { NameSource.valueOf(entity.source) }
+                            .getOrDefault(NameSource.PLATFORM),
+                    updatedAt = entity.updatedAt,
+                )
+        }
+    }
+
     override suspend fun recentKnown(limit: Int): List<KnownPerson> =
         dao.recent(limit).map { KnownPerson(it.senderId, it.displayName) }
 

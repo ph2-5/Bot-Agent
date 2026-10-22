@@ -226,6 +226,10 @@ data class GroupDigest(
     val botName: String?,
     val seenCount: Int,
     val proactiveAllowed: Boolean = true,
+    /** 群体中已知的成员展示名（最多 8 个），供模型回答「群里都有谁」 */
+    val knownMembers: List<String> = emptyList(),
+    /** 见过但没有名字的成员数 */
+    val unnamedCount: Int = 0,
 )
 
 /**
@@ -269,9 +273,12 @@ object ConversationKeys {
         when (message.kind) {
             com.qbot.core.model.MessageKind.GROUP_AT,
             com.qbot.core.model.MessageKind.GROUP_MESSAGE,
-            -> "g:${message.targetId}"
+            -> groupRoom(message.targetId.orEmpty())
             com.qbot.core.model.MessageKind.GUILD -> "c:${message.targetId}"
             com.qbot.core.model.MessageKind.DIRECT -> "d:${message.targetId}"
             com.qbot.core.model.MessageKind.C2C -> "u:${message.targetId}"
         }
+
+    /** 群背景的键（没有消息对象时用，如人设进化取样）。 */
+    fun groupRoom(groupId: String): String = "g:$groupId"
 }

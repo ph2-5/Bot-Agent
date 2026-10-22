@@ -48,9 +48,29 @@ class ChitchatPolicyTest {
     fun `叫名字也有最小间隔防止刷屏`() =
         runTest {
             policy.markSpoke("g1")
-            now += 5_000
+            now += 3_000
             val gate = policy.gate("g1", "小白，小白！", names, config())
             assertTrue("刚说过话时名字也不该连续触发，实际=$gate", gate is ChitchatGate.Skip)
+        }
+
+    @Test
+    fun `冷却下限为 1 秒`() =
+        runTest {
+            // 配置 1 秒时，冷场 ×0.6 不应算出 0 或负数
+            assertEquals(1_000L, policy.cooldownFor("g1", config(baseCooldownMillis = 1_000)))
+        }
+
+    @Test
+    fun `每小时上限为零时不限制`() =
+        runTest {
+            repeat(50) {
+                policy.markSpoke("g1")
+                now += 1_000
+            }
+            // 越过冷却再看配额：此时只应有"无上限"生效
+            now += 60_000
+            val gate = policy.gate("g1", "今晚有人开黑吗", names, config(maxPerHour = 0))
+            assertTrue("0 表示无上限，应进入候选，实际=$gate", gate is ChitchatGate.Candidate)
         }
 
     @Test

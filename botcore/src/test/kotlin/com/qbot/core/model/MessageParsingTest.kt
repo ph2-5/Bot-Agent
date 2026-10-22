@@ -198,6 +198,20 @@ class MessageParsingTest {
     }
 
     @Test
+    fun `艾特消息带昵称时也会被采用`() {
+        // 部分场景下 @ 消息的 author 也带 username，白捡一个真名
+        val msg =
+            parseIncomingMessage(
+                EventType.GROUP_AT_MESSAGE_CREATE,
+                element(
+                    """{"id":"1","group_openid":"g",""" +
+                        """"author":{"member_openid":"u","username":"小明"},"content":"hi","timestamp":"1"}""",
+                ),
+            )!!
+        assertEquals("小明", msg.senderName)
+    }
+
+    @Test
     fun `全量与艾特消息共享同一群背景作用域`() {
         val at =
             parseIncomingMessage(

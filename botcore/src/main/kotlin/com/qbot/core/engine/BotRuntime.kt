@@ -217,6 +217,10 @@ class BotRuntime(
         // 不论这条消息最终走规则、记忆指令还是 AI，样本都不能漏。
         memoryPipeline?.noteGroupActivity(message)
 
+        // 群昵称线索：@ 消息的 mentions 里可能带着机器人自己的 username，
+        // 那往往就是群名片——这是除「叫你X」外唯一的来源。
+        learnBotName(message, botId)
+
         // 记忆/群管理指令（我的记忆 / 忘掉X / 我是谁 / 叫你X / 群里都有谁）
         // 优先于规则与 AI：副作用是本地数据库操作，不依赖 AI 开关，
         // 且比任何规则都更具体。回复分两层：人设复述 → 固定句式兜底。
@@ -288,6 +292,7 @@ class BotRuntime(
         pipeline.recordChitchat(message, text)
         pipeline.noteGroupActivity(message)
         pipeline.resolveLabel(message, text)
+        learnBotName(message, selfId)
 
         // @ 自己的消息交给 @ 链路应答，这里只记不说
         if (mentionsBot(message, selfId)) return
@@ -362,6 +367,27 @@ class BotRuntime(
         return mentions.any { el ->
             (el as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull == selfId
         }
+    }
+
+    /**
+     * 从 mentions 里学习机器人在本群的称呼。
+     *
+     * mentions 中被 @ 的用户带 username，若自己也在其中，那个名字通常就是
+     * 群名片（与官方 username 不同）。用户手动设置过则不会被覆盖。
+     */
+    private suspend fun learnBotName(
+        message: IncomingMessage,
+        selfId: String,
+    ) {
+        if (selfId.isBlank()) return
+        val groupId = message.targetId?.takeIf { it.isNotBlank() } ?: return
+        val mentions = message.raw["mentions"] as? JsonArray ?: return
+        val self =
+            mentions.firstOrNull { el ->
+                (el as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull == selfId
+            } as? JsonObject ?: return
+        val name = self["username"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+        memoryPipeline?.observeBotName(groupId, name)
     }
 
     private fun rememberMessage(id: String?) {
