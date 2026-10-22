@@ -324,6 +324,10 @@ class BotRuntime(
         val personaPrompt = personaPromptProvider?.invoke(message)
         val personaBias = PersonaBias.personaBiasFor(personaPrompt)
 
+        // 上下文：最近几条群消息——打分（话题延续/回应机器人/冷场）与
+        // AI 判断共用同一份，本条消息尚未入库所以天然不含自身
+        val recent = pipeline.recentRoomMessages(message, 8)
+
         val mentionIds = mentionIdsOf(message)
         val names =
             if (profile != null) {
@@ -352,6 +356,7 @@ class BotRuntime(
                         insulted = insulted,
                         talkingToOthers = talkingToOthers,
                         personaBias = personaBias,
+                        recent = recent,
                     )
                 }
             }
@@ -394,7 +399,6 @@ class BotRuntime(
                             pipeline.markChitchatDecision(message, "不接：AI 未配置")
                             return
                         }
-                        val recent = pipeline.recentRoomMessages(message, 8)
                         val should =
                             runCatching {
                                 responder.shouldChimeIn(

@@ -20,7 +20,7 @@ class ChitchatPolicyTest {
         baseCooldownMillis: Long = 90_000L,
         maxPerHour: Int = 20,
         maxPerDay: Int = 200,
-        minScore: Int = 25,
+        minScore: Int = 15,
     ) = ChitchatConfig(
         enabled = enabled,
         baseCooldownMillis = baseCooldownMillis,
@@ -96,8 +96,14 @@ class ChitchatPolicyTest {
     @Test
     fun `陈述句分数不足时不进入候选`() =
         runTest {
-            val gate = policy.gate("g1", "今天好热啊", names, config())
-            assertTrue("无提问信号的闲聊应跳过，实际=$gate", gate is ChitchatGate.Skip)
+            // 话题正热（有最近消息，无冷场加分）时，纯感叹没有上下文信号，不过筛
+            val recent =
+                listOf(
+                    roomMsg(senderId = "u1", content = "今晚吃什么"),
+                    roomMsg(senderId = "u2", content = "随便，都行"),
+                )
+            val gate = policy.gate("g1", "今天好热啊", names, config(), recent = recent)
+            assertTrue("无信号闲聊应跳过，实际=$gate", gate is ChitchatGate.Skip)
         }
 
     @Test
@@ -203,8 +209,8 @@ class ChitchatPolicyTest {
     @Test
     fun `话痨人设降低打分阈值`() =
         runTest {
-            // "有人吗"得 20 分：中性阈值 21 会被拦，话痨 −10 后过筛
-            val neutral = policy.gate("g1", "有人吗", names, config(minScore = 21))
+            // "有人吗"得 25 分（疑问 25 + 长度 10 − 短句 20 + 冷场 10）
+            val neutral = policy.gate("g1", "有人吗", names, config(minScore = 26))
             assertTrue("中性偏置下应被拦，实际=$neutral", neutral is ChitchatGate.Skip)
 
             val talkative =
@@ -212,7 +218,7 @@ class ChitchatPolicyTest {
                     "g2",
                     "有人吗",
                     names,
-                    config(minScore = 21),
+                    config(minScore = 26),
                     personaBias = PersonaBias.TALKATIVE,
                 )
             assertTrue("话痨偏置下应过筛，实际=$talkative", talkative is ChitchatGate.Candidate)
@@ -226,10 +232,84 @@ class ChitchatPolicyTest {
                     "g1",
                     "有人吗",
                     names,
-                    config(minScore = 11),
+                    config(minScore = 16),
                     personaBias = PersonaBias.RESERVED,
                 )
             assertTrue("高冷偏置下阈值 +10 应被拦，实际=$gate", gate is ChitchatGate.Skip)
+        }
+
+    // ---------- 上下文评分 ----------
+
+    private fun roomMsg(
+        senderId: String = "u1",
+        role: String = "user",
+        content: String,
+    ) = RoomMessage(
+        senderId = senderId,
+        senderName = senderId,
+        role = role,
+        content = content,
+        timestampMillis = 0,
+    )
+
+    @Test
+    fun `话题延续时加分`() =
+        runTest {
+            val recent =
+                listOf(
+                    roomMsg(senderId = "u1", content = "新版本这游戏太肝了"),
+                    roomMsg(senderId = "u2", content = "是啊每天任务做不完"),
+                )
+            val onTopic =
+                policy.gate("g1", "这游戏确实难", names, config(), recent = recent)
+            assertTrue("话题延续应过筛，实际=$onTopic", onTopic is ChitchatGate.Candidate)
+
+            val offTopic =
+                policy.gate(
+                    "g1",
+                    "今天天气不错",
+                    names,
+                    config(minScore = 16),
+                    recent = recent,
+                )
+            assertTrue("跑题时阈值 16 应被拦，实际=$offTopic", offTopic is ChitchatGate.Skip)
+        }
+
+    @Test
+    fun `有人在回应机器人时加分`() =
+        runTest {
+            val recent = listOf(roomMsg(role = "assistant", content = "我觉得还行吧"))
+            val gate = policy.gate("g1", "哈哈确实", names, config(), recent = recent)
+            assertTrue("有人接机器人的话应过筛，实际=$gate", gate is ChitchatGate.Candidate)
+        }
+
+    @Test
+    fun `同一人连续刷屏时扣分`() =
+        runTest {
+            val same =
+                listOf(
+                    roomMsg(senderId = "u1", content = "这游戏太肝了"),
+                    roomMsg(senderId = "u1", content = "真的肝到不行"),
+                )
+            val different =
+                listOf(
+                    roomMsg(senderId = "u1", content = "这游戏太肝了"),
+                    roomMsg(senderId = "u2", content = "真的肝到不行"),
+                )
+            val spam =
+                policy.gate("g1", "这游戏肝度如何", names, config(minScore = 16), recent = same)
+            val normal =
+                policy.gate("g2", "这游戏肝度如何", names, config(minScore = 16), recent = different)
+            assertTrue("同一人刷屏应被拦，实际=$spam", spam is ChitchatGate.Skip)
+            assertTrue("不同人聊天应过筛，实际=$normal", normal is ChitchatGate.Candidate)
+        }
+
+    @Test
+    fun `冷场时加分`() =
+        runTest {
+            // 无最近消息：中等长度无问句 10 + 冷场 10 = 20 ≥ 15
+            val gate = policy.gate("g1", "这游戏确实难", names, config())
+            assertTrue("冷场应过筛，实际=$gate", gate is ChitchatGate.Candidate)
         }
 
     @Test

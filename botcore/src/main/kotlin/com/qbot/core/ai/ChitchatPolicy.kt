@@ -26,7 +26,7 @@ data class ChitchatConfig(
     /** 有人叫机器人的名字时必须接话 */
     val answerOnName: Boolean = true,
     /** 规则打分阈值：低于它就放弃，不进入 AI 判断 */
-    val minScore: Int = 25,
+    val minScore: Int = 15,
 )
 
 /**
@@ -182,6 +182,7 @@ class ChitchatPolicy(
         insulted: Boolean = false,
         talkingToOthers: Boolean = false,
         personaBias: PersonaBias = PersonaBias.NEUTRAL,
+        recent: List<RoomMessage> = emptyList(),
     ): ChitchatGate {
         if (!config.enabled) return ChitchatGate.Skip("参与开关关闭")
         if (text.isBlank()) return ChitchatGate.Skip("空消息")
@@ -231,7 +232,7 @@ class ChitchatPolicy(
                 return ChitchatGate.Skip("冷却中（${cooldown / 1000} 秒）")
             }
 
-            val score = score(text)
+            val score = score(text, recent, state)
             // 阈值随人设性格浮动：话痨放宽、高冷收紧
             val threshold = config.minScore + personaBias.scoreDelta
             if (score < threshold) {
@@ -305,15 +306,77 @@ class ChitchatPolicy(
      * 频率控制已由冷却与配额负责，这里不再叠加"刚说过话"的惩罚——
      * 否则冷却刚结束又会被扣到阈值以下，等于冷却时间形同虚设。
      */
-    private fun score(text: String): Int {
+    /**
+     * 内容打分：本条消息本身 + 上下文信号。
+     *
+     * 上下文部分是"要不要插嘴"最真实的依据——同样的句子，
+     * 在话题延续时接话很自然，在两人对聊中插嘴很突兀：
+     * - **回应机器人**（上一条是它自己说的）+15：不接很失礼；
+     * - **话题延续**（与最近消息共享词组）+15：话题没断，接话自然；
+     * - **冷场**（最近几乎没消息）+10：该有人开口了；
+     * - **同一人连续刷屏** −10：别人在抢话筒，不缺你一个。
+     */
+    private fun score(
+        text: String,
+        recent: List<RoomMessage>,
+        state: GroupState,
+    ): Int {
         var score = 0
         if (text.length in 2..60) score += 10
-        // 疑问句是最强的"需要有人接"信号：普通提问应正好达到默认阈值
-        if (QUESTION_WORDS.any { text.contains(it) }) score += 30
+        // 疑问句是最强的"需要有人接"信号
+        if (QUESTION_WORDS.any { text.contains(it) }) score += 25
         if (text.length <= 3) score -= 20
         // @ 了别人：大概率是两个人之间的对话，强负分压到阈值以下
         if (text.contains("<@!") || text.startsWith("@")) score -= 20
+
+        // ---- 上下文信号 ----
+        val prev = recent.lastOrNull()
+        if (prev != null) {
+            // 有人在回应机器人刚才的话
+            if (prev.role == "assistant") score += 15
+            // 同一人连续发言（刷屏/抢话）：上一条与这一条来自同一个人
+            val prevPrev = recent.getOrNull(recent.lastIndex - 1)
+            if (prevPrev != null &&
+                !prev.senderId.isNullOrBlank() &&
+                prev.senderId == prevPrev.senderId
+            ) {
+                score -= 10
+            }
+        }
+        if (sharesTopic(text, recent.takeLast(6))) score += 15
+        // 冷场：本条之前群里几乎没有消息
+        if (recent.size <= 1) score += 10
         return score
+    }
+
+    /**
+     * 话题延续检测：新消息与最近消息共享 2 字词组。
+     *
+     * 中文没有分词，这里用最便宜的 bigram 重叠近似：新消息的任意
+     * 2 字连续组合出现在最近 6 条消息里就算共享。会有少量误报
+     * （"的吗呢"这类虚词），但方向正确——宁可多交给下一级判断，
+     * 也不要在话题正热时沉默。
+     */
+    private fun sharesTopic(
+        text: String,
+        recent: List<RoomMessage>,
+    ): Boolean {
+        if (text.length < 4 || recent.isEmpty()) return false
+        val recentGrams = HashSet<String>()
+        recent.forEach { msg ->
+            val content = msg.content
+            if (content.length >= 2) {
+                for (i in 0..content.length - 2) {
+                    recentGrams.add(content.substring(i, i + 2))
+                }
+            }
+        }
+        for (i in 0..text.length - 2) {
+            val gram = text.substring(i, i + 2)
+            // 跳过纯符号/空白组合
+            if (gram.any { it.isLetterOrDigit() } && gram in recentGrams) return true
+        }
+        return false
     }
 }
 
