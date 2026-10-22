@@ -1,5 +1,7 @@
 package com.qbot.app.ui.screens
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -40,6 +42,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.qbot.app.BotApplication
+import com.qbot.app.runtime.BotController
 import com.qbot.app.service.BotForegroundService
 import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.LlmClient
@@ -179,6 +182,9 @@ fun SettingsScreen(onRequestBatteryWhitelist: () -> Unit) {
             },
         )
 
+        // ---------- 备份与恢复 ----------
+        BackupSection(controller = controller)
+
         // ---------- 说明 ----------
         SettingsCard(title = "使用说明") {
             Text(
@@ -190,6 +196,91 @@ fun SettingsScreen(onRequestBatteryWhitelist: () -> Unit) {
                 · 手机锁屏后系统可能限制网络，建议将本应用加入系统「后台保护」列表。
                 """.trimIndent(),
                 style = MaterialTheme.typography.bodyMedium,
+            )
+        }
+    }
+}
+
+/**
+ * 备份与恢复：导出/导入全部用户配置（换机或备份用）。
+ *
+ * 走系统文件选择器（SAF）：导出用 CreateDocument 生成 JSON，
+ * 导入用 OpenDocument 读取后交给 [BotController.importBackup] 合并。
+ */
+@Composable
+private fun BackupSection(controller: BotController) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+    var hint by remember { mutableStateOf<String?>(null) }
+
+    val exportLauncher =
+        rememberLauncherForActivityResult(
+            ActivityResultContracts.CreateDocument("application/json"),
+        ) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            scope.launch {
+                runCatching {
+                    val json = controller.exportBackup()
+                    context.contentResolver.openOutputStream(uri)?.use { stream ->
+                        stream.write(json.toByteArray(Charsets.UTF_8))
+                    } ?: error("无法写入所选位置")
+                }.onSuccess {
+                    hint = "已导出到所选位置（含密钥，请妥善保管）"
+                }.onFailure { hint = "导出失败：${it.message}" }
+            }
+        }
+
+    val importLauncher =
+        rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocument(),
+        ) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            scope.launch {
+                runCatching {
+                    val text =
+                        context.contentResolver.openInputStream(uri)
+                            ?.bufferedReader()?.readText()
+                            ?: error("无法读取所选文件")
+                    controller.importBackup(text)
+                }.onSuccess { hint = it }
+                    .onFailure { hint = "导入失败：${it.message}" }
+            }
+        }
+
+    SettingsCard(
+        title = "备份与恢复",
+        subtitle = "换机或备份用：规则、人设、AI/记忆/参与配置、备注名、群名片",
+    ) {
+        Text(
+            "导出内容包含机器人凭证与 AI Key（明文 JSON），备份文件请妥善保管。" +
+                "导入按「合并」进行：同 id 规则覆盖、同名同绑定的人设更新、其余新增。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            OutlinedButton(
+                onClick = {
+                    val name = "qbot-config-%tF.json".format(java.util.Date())
+                    exportLauncher.launch(name)
+                },
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("导出配置")
+            }
+            OutlinedButton(
+                onClick = { importLauncher.launch(arrayOf("application/json", "text/*", "*/*")) },
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("导入配置")
+            }
+        }
+
+        hint?.let {
+            Text(
+                it,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
             )
         }
     }

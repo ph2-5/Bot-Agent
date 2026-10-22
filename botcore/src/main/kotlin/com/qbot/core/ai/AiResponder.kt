@@ -295,6 +295,11 @@ class AiResponder(
      * 决策漏斗的第三级。只在本地规则通过后调用：maxTokens 很小、
      * temperature=0，成本远低于一次完整回复，但也不适合对每条消息都跑。
      *
+     * [personaPrompt] 是当前生效的人设（按 人→群→全局 解析）。
+     * 带上它之后，"要不要接话"就由性格决定——参考 HUMA 与 Big Five 人格
+     * 调制的结论：外向人格更愿意参与，内向人格更挑剔。这正是"评分体系
+     * 与系统提示词关联"的第三级实现。
+     *
      * 判定失败（网络/配置）一律返回 false——宁可少说一句，
      * 也不要因为判断服务抖动而在群里乱插话。
      */
@@ -303,6 +308,7 @@ class AiResponder(
         config: AiConfig,
         recent: List<RoomMessage>,
         botName: String?,
+        personaPrompt: String? = null,
     ): Boolean {
         val speaker = message.senderName?.takeIf { it.isNotBlank() } ?: "群友"
         val transcript =
@@ -312,13 +318,21 @@ class AiResponder(
                         ?: if (msg.role == "assistant") (botName ?: "机器人") else "某人"
                 "[$who] ${msg.content.replace("\n", " ").take(60)}"
             }
+        val personaBlock =
+            personaPrompt?.takeIf { it.isNotBlank() }?.let { persona ->
+                "你的性格设定：「${persona.take(300)}」\n" +
+                    "结合这个性格判断：外向爱聊的性格可以更主动接话，" +
+                    "高冷话少的性格只在确有必要时才接话。\n"
+            }.orEmpty()
         val system =
             "你在一个 QQ 群里，判断最后这条消息是否需要你接话。\n" +
+                personaBlock +
                 "注意：这条消息**没有 @ 你**，你只是旁听的群友——不要因为看到了就回。\n" +
                 "只有这几种情况回答 YES：\n" +
                 "1) 有人向你提问或求助；\n" +
                 "2) 话题明显需要别人搭话（冷场、抛问题、征求意见、求推荐）；\n" +
-                "3) 有人说的话明显有误，且你有把握纠正。\n" +
+                "3) 有人说的话明显有误，且你有把握纠正；\n" +
+                "4) 按你的性格，这种场合你本来就会忍不住说一句。\n" +
                 "其余情况——两个人在互相聊、@ 了别人、与你无关的闲扯、刷屏、单纯感叹——回答 NO。\n" +
                 "插话会显得突兀时就回答 NO。只输出 YES 或 NO，不要解释。"
         val user =

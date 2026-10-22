@@ -266,6 +266,37 @@ class BotRuntimeChitchatTest {
         }
 
     @Test
+    fun `档案缺失时首条叫名字的消息也能接话`() =
+        runBlocking {
+            // 不发 GROUP_ADD_ROBOT，模拟"全量消息先于加群事件到达"
+            val runtime = buildRuntime(this)
+            runtime.onReady("sid-1", ReadyUser(id = "bot-1", username = "小白"))
+
+            runtime.onMessage(fullMessage("小白，今晚开黑不"))
+            awaitSent(1)
+            awaitDecision("今晚开黑不", "已接话")
+        }
+
+    @Test
+    fun `叫短昵称也能接话`() =
+        runBlocking {
+            // 群名片设为「过去的阿远」，群里只喊「阿远」也应命中（后缀匹配）
+            val runtime = prepareRuntime(this)
+            groups.upsert(
+                com.qbot.core.ai.GroupProfile(
+                    groupId = "group-openid",
+                    botName = "过去的阿远",
+                    joinedAt = 0,
+                    lastSeenAt = 0,
+                ),
+            )
+
+            runtime.onMessage(fullMessage("阿远，今晚开黑不"))
+            awaitSent(1)
+            awaitDecision("今晚开黑不", "已接话")
+        }
+
+    @Test
     fun `艾特机器人的全量消息交给艾特链路不重复回复`() =
         runBlocking {
             val runtime = prepareRuntime(this)

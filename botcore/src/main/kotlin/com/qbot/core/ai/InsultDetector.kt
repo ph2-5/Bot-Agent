@@ -22,9 +22,6 @@ class InsultDetector {
 
         /** 第二人称：出现它才更像在说"你" */
         private val SECOND_PERSON = listOf("你", "您")
-
-        /** 名字后缀最短长度：太短会误伤普通词 */
-        private const val MIN_NAME_SUFFIX = 2
     }
 
     /** 文本里是否带侮辱词。 */
@@ -43,18 +40,7 @@ class InsultDetector {
         text: String,
         names: Collection<String>,
     ): Boolean {
-        val hitName =
-            names.filter { it.isNotBlank() }.any { name ->
-                if (text.contains(name)) {
-                    true
-                } else {
-                    // 官方名常常带前缀（"过去的阿远"），群里只叫后两个字
-                    (name.length downTo MIN_NAME_SUFFIX).any { len ->
-                        len < name.length && text.contains(name.takeLast(len))
-                    }
-                }
-            }
-        if (!hitName) return false
+        if (!BotNameMatcher.mentioned(text, names)) return false
         return SECOND_PERSON.any { text.contains(it) } || isInsult(text)
     }
 

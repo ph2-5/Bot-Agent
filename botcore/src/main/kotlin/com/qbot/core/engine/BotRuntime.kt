@@ -10,6 +10,7 @@ import com.qbot.core.ai.CommandOutcome
 import com.qbot.core.ai.InsultContext
 import com.qbot.core.ai.InsultDetector
 import com.qbot.core.ai.MemoryPipeline
+import com.qbot.core.ai.PersonaBias
 import com.qbot.core.ai.describe
 import com.qbot.core.api.OpenApi
 import com.qbot.core.gateway.GatewayClient
@@ -93,6 +94,13 @@ class BotRuntime(
      * 非 @ 消息只会被记进群记忆，不会触发任何回复。
      */
     private val chitchatConfigProvider: (() -> ChitchatConfig)? = null,
+    /**
+     * 当前消息生效的人设提示词（按 人→群→全局 解析）。
+     *
+     * 两处消费：插话漏斗的性格偏置（话痨放宽/高冷收紧）、
+     * AI 插话判断的"按性格决定要不要接话"。
+     */
+    private val personaPromptProvider: (suspend (IncomingMessage) -> String?)? = null,
     /** 插话决策引擎；默认实例即可，测试可注入固定时钟 */
     private val chitchatPolicy: ChitchatPolicy = ChitchatPolicy(),
     /** 冒犯检测：被指名辱骂时要按人设反应，不能装没看见 */
@@ -297,12 +305,24 @@ class BotRuntime(
         val addressed = mentionsBot(message, selfId)
         val chitchatConfig =
             if (addressed) null else chitchatConfigProvider?.invoke()?.takeIf { it.enabled }
+
+        // 记忆与活跃度先记账：首次全量消息可能早于加群事件到达，
+        // 不能因为档案还没建就把这条消息（可能正在叫名字）整个丢掉。
+        pipeline.noteGroupActivity(message)
+        pipeline.resolveLabel(message, text)
+
+        // 群档案：没有就现建；群记忆整体关闭（无群仓库）时允许没有档案，
+        // 名字匹配回落到官方名——之前这里会整条跳过，是"叫名字不回"的根因之一。
         val profile =
             if (addressed || chitchatConfig == null) {
                 null
             } else {
-                pipeline.groupProfile(groupId)
+                pipeline.groupProfile(groupId) ?: pipeline.ensureGroupProfile(groupId)
             }
+
+        // 人设：性格偏置（规则层）+ AI 判断的人格注入（模型层）
+        val personaPrompt = personaPromptProvider?.invoke(message)
+        val personaBias = PersonaBias.personaBiasFor(personaPrompt)
 
         val mentionIds = mentionIdsOf(message)
         val names =
@@ -320,7 +340,7 @@ class BotRuntime(
             when {
                 addressed -> ChitchatGate.Skip("@ 了机器人，交给 @ 链路")
                 chitchatConfig == null -> ChitchatGate.Skip("群聊参与未开启")
-                profile == null || !profile.active -> ChitchatGate.Skip("群档案不可用")
+                profile?.active == false -> ChitchatGate.Skip("群档案不可用")
                 else -> {
                     // 活跃度统计对所有消息生效（热群/冷场的自适应依赖它）
                     chitchatPolicy.observe(groupId)
@@ -331,6 +351,7 @@ class BotRuntime(
                         config = chitchatConfig,
                         insulted = insulted,
                         talkingToOthers = talkingToOthers,
+                        personaBias = personaBias,
                     )
                 }
             }
@@ -341,8 +362,6 @@ class BotRuntime(
             isAt = addressed,
             decision = gate.describe(),
         )
-        pipeline.noteGroupActivity(message)
-        pipeline.resolveLabel(message, text)
         learnBotName(message, selfId)
 
         // @ 自己的消息交给 @ 链路应答，这里只记不说
@@ -360,7 +379,8 @@ class BotRuntime(
                 is ChitchatGate.Forced -> current.reason
 
                 is ChitchatGate.Candidate -> {
-                    if (random() > config.probability) {
+                    // 抽样概率随人设性格浮动：话痨 ×1.4，高冷 ×0.7
+                    if (random() > (config.probability * personaBias.probabilityFactor).coerceAtMost(1.0)) {
                         pipeline.markChitchatDecision(message, "不接：概率未命中")
                         log(LogLevel.VERBOSE, TAG, "群聊消息不接：概率未命中")
                         return
@@ -377,7 +397,13 @@ class BotRuntime(
                         val recent = pipeline.recentRoomMessages(message, 8)
                         val should =
                             runCatching {
-                                responder.shouldChimeIn(message, aiCfg, recent, profile?.botName)
+                                responder.shouldChimeIn(
+                                    message,
+                                    aiCfg,
+                                    recent,
+                                    profile?.botName,
+                                    personaPrompt,
+                                )
                             }.getOrNull() ?: false
                         if (!should) {
                             pipeline.markChitchatDecision(message, "不接：AI 判断不需要接话")

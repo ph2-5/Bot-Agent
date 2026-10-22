@@ -1,8 +1,19 @@
 package com.qbot.app.runtime
 
 import android.content.Context
+import com.qbot.app.data.backup.ConfigBackup
+import com.qbot.app.data.backup.AiBackup
+import com.qbot.app.data.backup.ChitchatBackup
+import com.qbot.app.data.backup.CredentialsBackup
+import com.qbot.app.data.backup.DisplayNameBackup
+import com.qbot.app.data.backup.GreetingBackup
+import com.qbot.app.data.backup.GroupBotNameBackup
+import com.qbot.app.data.backup.MemoryBackup
+import com.qbot.app.data.backup.PersonaBackup
+import com.qbot.app.data.backup.RuleBackup
 import com.qbot.app.data.db.AppDatabase
 import com.qbot.app.data.db.LogEntity
+import com.qbot.app.data.db.RuleEntity
 import com.qbot.app.data.repo.PersonaRepository
 import com.qbot.app.data.repo.RoomAiHistoryStore
 import com.qbot.app.data.repo.RoomFactStore
@@ -10,10 +21,19 @@ import com.qbot.app.data.repo.RoomGroupStore
 import com.qbot.app.data.repo.RoomIdentityStore
 import com.qbot.app.data.repo.RoomSharedContextStore
 import com.qbot.app.data.repo.SettingsRepository
+import com.qbot.app.data.repo.GreetingConfig
+import com.qbot.core.ai.AiConfig
+import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.AiResponder
+import com.qbot.core.ai.ChitchatConfig
+import com.qbot.core.ai.GroupProfile
 import com.qbot.core.ai.LlmClient
+import com.qbot.core.ai.MemoryConfig
 import com.qbot.core.ai.MemoryPipeline
+import com.qbot.core.ai.Persona
+import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.PersonaResolver
+import com.qbot.core.ai.ThinkingMode
 import com.qbot.core.api.OpenApi
 import com.qbot.core.auth.AccessTokenManager
 import com.qbot.core.engine.BotRuntime
@@ -386,6 +406,263 @@ class BotController(
         limit: Int = 200,
     ) = memoryPipeline.observeGroupMessages(groupId, limit)
 
+    // ---------- 配置导入导出（换机 / 备份） ----------
+
+    /**
+     * 导出全部用户配置为 JSON 文本。
+     *
+     * 包含凭证与 API Key（明文）——备份文件请妥善保管。
+     * 运行数据（日志、聊天记录、事实记忆、版本快照）不导出。
+     */
+    suspend fun exportBackup(): String {
+        val ai = settings.aiConfig.value
+        val memory = settings.memoryConfig.value
+        val greeting = settings.greetingConfig.value
+        val chitchat = settings.chitchatConfig.value
+        val creds = settings.credentials()
+
+        val backup =
+            ConfigBackup(
+                exportedAt = System.currentTimeMillis(),
+                credentials =
+                    CredentialsBackup(
+                        appId = creds.appId,
+                        clientSecret = creds.clientSecret,
+                    ).takeIf { it.appId.isNotBlank() },
+                ai =
+                    AiBackup(
+                        enabled = ai.enabled,
+                        baseUrl = ai.baseUrl,
+                        apiKey = ai.apiKey,
+                        model = ai.model,
+                        systemPrompt = ai.systemPrompt,
+                        temperature = ai.temperature,
+                        maxTokens = ai.maxTokens,
+                        mode = ai.mode.name,
+                        contextTurns = ai.contextTurns,
+                        replyOnError = ai.replyOnError,
+                        thinkingMode = ai.thinkingMode.name,
+                        contextTokenBudget = ai.contextTokenBudget,
+                    ),
+                memory =
+                    MemoryBackup(
+                        enabled = memory.enabled,
+                        factsPerPerson = memory.factsPerPerson,
+                        roomContextEnabled = memory.roomContextEnabled,
+                        roomContextSize = memory.roomContextSize,
+                        learnNames = memory.learnNames,
+                        learnFacts = memory.learnFacts,
+                        personaRewrite = memory.personaRewrite,
+                    ),
+                greeting = GreetingBackup(enabled = greeting.enabled, text = greeting.text),
+                chitchat =
+                    ChitchatBackup(
+                        enabled = chitchat.enabled,
+                        baseCooldownSeconds = (chitchat.baseCooldownMillis / 1000).toInt(),
+                        maxPerHour = chitchat.maxPerHour,
+                        aiJudge = chitchat.aiJudge,
+                        probabilityPercent = (chitchat.probability * 100).toInt().coerceIn(1, 100),
+                    ),
+                rules =
+                    database.ruleDao().all().first().map { rule ->
+                        RuleBackup(
+                            id = rule.id,
+                            name = rule.name,
+                            enabled = rule.enabled,
+                            matchType = rule.matchType,
+                            pattern = rule.pattern,
+                            reply = rule.reply,
+                            scope = rule.scope,
+                            priority = rule.priority,
+                        )
+                    },
+                personas =
+                    personaRepository.all().map { persona ->
+                        PersonaBackup(
+                            name = persona.name,
+                            senderId = persona.senderId,
+                            scopeId = persona.scopeId,
+                            prompt = persona.prompt,
+                        )
+                    },
+                displayNames =
+                    database.identityDao().recent(1000).map { entry ->
+                        DisplayNameBackup(
+                            senderId = entry.senderId,
+                            displayName = entry.displayName,
+                            source = entry.source,
+                        )
+                    },
+                groupBotNames =
+                    groupStore.all().mapNotNull { profile ->
+                        GroupBotNameBackup(
+                            groupId = profile.groupId,
+                            botName = profile.botName ?: return@mapNotNull null,
+                        )
+                    },
+            )
+        return ConfigBackup.encode(backup)
+    }
+
+    /**
+     * 导入配置备份。
+     *
+     * 合并策略：规则与群名片按 id/群 upsert（同 id 覆盖）；
+     * 人设按「名称+绑定对象」匹配，命中更新提示词、未命中新增；
+     * 备注名受优先级守护（不会覆盖手动备注为自称）；
+     * 各类配置整组覆盖。返回可读的导入摘要。
+     */
+    suspend fun importBackup(jsonText: String): String {
+        val backup =
+            runCatching { ConfigBackup.decode(jsonText) }.getOrElse { e ->
+                return "导入失败：文件不是有效的配置备份（${e.message}）"
+            }
+
+        var applied = 0
+
+        backup.credentials?.takeIf { it.appId.isNotBlank() }?.let {
+            settings.saveCredentials(it.appId, it.clientSecret)
+            applied++
+        }
+
+        backup.ai?.let { dto ->
+            val current = settings.aiConfig.value
+            val mode =
+                runCatching { AiMode.valueOf(dto.mode) }.getOrDefault(current.mode)
+            val thinking =
+                runCatching { ThinkingMode.valueOf(dto.thinkingMode) }
+                    .getOrDefault(current.thinkingMode)
+            settings.saveAiConfig(
+                current.copy(
+                    enabled = dto.enabled,
+                    baseUrl = dto.baseUrl,
+                    apiKey = dto.apiKey,
+                    model = dto.model,
+                    systemPrompt = dto.systemPrompt,
+                    temperature = dto.temperature,
+                    maxTokens = dto.maxTokens,
+                    mode = mode,
+                    contextTurns = dto.contextTurns,
+                    replyOnError = dto.replyOnError,
+                    thinkingMode = thinking,
+                    contextTokenBudget = dto.contextTokenBudget,
+                ),
+            )
+            applied++
+        }
+
+        backup.memory?.let {
+            settings.saveMemoryConfig(
+                MemoryConfig(
+                    enabled = it.enabled,
+                    factsPerPerson = it.factsPerPerson,
+                    roomContextEnabled = it.roomContextEnabled,
+                    roomContextSize = it.roomContextSize,
+                    learnNames = it.learnNames,
+                    learnFacts = it.learnFacts,
+                    personaRewrite = it.personaRewrite,
+                ),
+            )
+            applied++
+        }
+
+        backup.greeting?.let {
+            settings.saveGreetingConfig(GreetingConfig(enabled = it.enabled, text = it.text))
+            applied++
+        }
+
+        backup.chitchat?.let {
+            settings.saveChitchatConfig(
+                ChitchatConfig(
+                    enabled = it.enabled,
+                    baseCooldownMillis = it.baseCooldownSeconds.coerceAtLeast(1).toLong() * 1000,
+                    maxPerHour = it.maxPerHour,
+                    aiJudge = it.aiJudge,
+                    probability = it.probabilityPercent.coerceIn(1, 100) / 100.0,
+                ),
+            )
+            applied++
+        }
+
+        var ruleCount = 0
+        backup.rules.forEach { dto ->
+            val matchType = runCatching { MatchType.valueOf(dto.matchType) }.getOrNull() ?: return@forEach
+            val scope = runCatching { RuleScope.valueOf(dto.scope) }.getOrNull() ?: return@forEach
+            database.ruleDao().upsert(
+                RuleEntity(
+                    id = dto.id,
+                    name = dto.name,
+                    enabled = dto.enabled,
+                    matchType = matchType.name,
+                    pattern = dto.pattern,
+                    reply = dto.reply,
+                    scope = scope.name,
+                    priority = dto.priority,
+                ),
+            )
+            ruleCount++
+        }
+
+        var personaNew = 0
+        var personaUpdated = 0
+        val existing = personaRepository.all()
+        backup.personas.forEach { dto ->
+            val hit =
+                existing.find {
+                    it.name == dto.name && it.senderId == dto.senderId && it.scopeId == dto.scopeId
+                }
+            personaRepository.save(
+                Persona(
+                    id = hit?.id ?: 0,
+                    senderId = dto.senderId,
+                    scopeId = dto.scopeId,
+                    name = dto.name,
+                    prompt = dto.prompt,
+                ),
+            )
+            if (hit == null) personaNew++ else personaUpdated++
+        }
+
+        var nameCount = 0
+        backup.displayNames.forEach { dto ->
+            if (dto.senderId.isBlank() || dto.displayName.isBlank()) return@forEach
+            val source =
+                runCatching { NameSource.valueOf(dto.source) }
+                    .getOrDefault(NameSource.MANUAL)
+            runCatching {
+                identityStore.remember(dto.senderId, dto.displayName, source, System.currentTimeMillis())
+                nameCount++
+            }
+        }
+
+        var groupNameCount = 0
+        backup.groupBotNames.forEach { dto ->
+            runCatching {
+                val current = groupStore.find(dto.groupId)
+                groupStore.upsert(
+                    current?.copy(botName = dto.botName)
+                        ?: GroupProfile(
+                            groupId = dto.groupId,
+                            botName = dto.botName,
+                            joinedAt = System.currentTimeMillis(),
+                            lastSeenAt = System.currentTimeMillis(),
+                        ),
+                )
+                groupNameCount++
+            }
+        }
+
+        appendLog(
+            LogLevel.INFO,
+            TAG,
+            "配置导入完成：规则 $ruleCount 条、人设 +$personaNew/更新$personaUpdated、" +
+                "备注 $nameCount、群名片 $groupNameCount、配置项 $applied",
+        )
+        return "导入完成：规则 $ruleCount 条，人设新增 $personaNew、更新 $personaUpdated，" +
+            "备注名 $nameCount，群名片 $groupNameCount，配置组 $applied 项" +
+            (if (backup.credentials != null) "（含凭证，需重新启动机器人生效）" else "")
+    }
+
     private fun build(
         appId: String,
         clientSecret: String,
@@ -461,6 +738,9 @@ class BotController(
                 // 群聊参与：只有群主开了「接收所有消息」才会收到非 @ 消息，
                 // 收到之后要不要接话由这里的配置与 ChitchatPolicy 决定。
                 chitchatConfigProvider = { settings.chitchatConfig.value },
+                // 人设同时喂给插话漏斗（性格偏置）与 AI 插话判断（按性格决定接不接），
+                // 让"要不要说话"也由人设说了算。
+                personaPromptProvider = { message -> personaResolver.promptFor(message) },
             )
 
         // 把网关状态转发到控制器自己的流上，

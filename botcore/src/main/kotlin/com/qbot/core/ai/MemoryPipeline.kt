@@ -313,6 +313,16 @@ class MemoryPipeline(
     /** 查询群档案（运行层判断主动消息权限、维护端群管理都用它）。 */
     suspend fun groupProfile(groupId: String): GroupProfile? = groupStore?.find(groupId)
 
+    /**
+     * 确保群档案存在：没有就现建一个（首次全量消息可能早于加群事件到达，
+     * 之前会因"群档案不可用"整条跳过——连叫名字都不回）。
+     */
+    suspend fun ensureGroupProfile(groupId: String): GroupProfile? {
+        val store = groupStore ?: return null
+        store.touch(groupId, null, clock())
+        return store.find(groupId)
+    }
+
     /** 把一轮问答写进共享背景（回复后调用）。 */
     suspend fun recordExchange(        message: IncomingMessage,
         cleanText: String,

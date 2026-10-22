@@ -47,13 +47,61 @@ sealed class ChitchatGate {
 }
 
 /**
+ * 人设性格偏置——评分体系与人设（系统提示词）的关联点。
+ *
+ * 参考 HUMA（arXiv 2511.17315）的策略评分与 Big Five 人格调制：
+ * 外向/话痨的人格应该更愿意接话，高冷/寡言的人格应该更挑剔。
+ * 实现上不改人设本身，只微调漏斗参数：
+ * - [scoreDelta] 加在打分阈值上（负值 = 更容易过筛）；
+ * - [probabilityFactor] 乘在抽样概率上。
+ *
+ * 由 [Companion.personaBiasFor] 从人设提示词的关键词自动识别，
+ * 识别不出就保持中性，行为与旧版一致。
+ */
+enum class PersonaBias(
+    val scoreDelta: Int,
+    val probabilityFactor: Double,
+) {
+    /** 话痨/外向：更容易接话 */
+    TALKATIVE(-10, 1.4),
+
+    /** 中性：与旧版一致 */
+    NEUTRAL(0, 1.0),
+
+    /** 高冷/寡言：更挑剔 */
+    RESERVED(10, 0.7),
+    ;
+
+    companion object {
+        private val TALKATIVE_WORDS =
+            listOf("话痨", "话多", "健谈", "外向", "热情", "爱聊", "活泼", "自来熟")
+        private val RESERVED_WORDS =
+            listOf("高冷", "内向", "沉默", "寡言", "冷淡", "高傲", "高岭之花", "惜字如金", "不爱说话")
+
+        /** 从人设提示词推断性格偏置。 */
+        fun personaBiasFor(personaPrompt: String?): PersonaBias {
+            val prompt = personaPrompt?.takeIf { it.isNotBlank() } ?: return NEUTRAL
+            val talkative = TALKATIVE_WORDS.any { prompt.contains(it) }
+            val reserved = RESERVED_WORDS.any { prompt.contains(it) }
+            // 两种都命中时保持中性，不猜
+            return when {
+                talkative && !reserved -> TALKATIVE
+                reserved && !talkative -> RESERVED
+                else -> NEUTRAL
+            }
+        }
+    }
+}
+
+/**
  * 插话决策引擎。
  *
  * 三条规则来源：
  * 1. **频率**：基础冷却 + 每时/每日配额。热群冷却自动放大（别在大家聊得正欢时插嘴），
  *    冷场时缩小（该有人接一句的时候更主动）——这就是"看聊天频率"。
  * 2. **内容**：疑问句、长度适中加分；@别人、单字/表情、刚说过话减分——"看聊天内容"。
- * 3. **身份**：被叫名字必答（唯一能绕过冷却的路径，防止群友觉得"叫了不理"）。
+ * 3. **身份**：被叫名字必答（唯一能绕过冷却的路径，防止群友觉得"叫了不理"）；
+ *    人设性格（[PersonaBias]）微调阈值与概率，让人设真正影响"要不要说话"。
  *
  * 全部状态放内存：重启清零可以接受（宁可少说几句，也不要在数据库里堆计数）。
  */
@@ -133,6 +181,7 @@ class ChitchatPolicy(
         config: ChitchatConfig,
         insulted: Boolean = false,
         talkingToOthers: Boolean = false,
+        personaBias: PersonaBias = PersonaBias.NEUTRAL,
     ): ChitchatGate {
         if (!config.enabled) return ChitchatGate.Skip("参与开关关闭")
         if (text.isBlank()) return ChitchatGate.Skip("空消息")
@@ -143,7 +192,8 @@ class ChitchatPolicy(
 
         // 名字提及不受冷却限制，但仍有最小间隔与配额——
         // 否则群名恰好叫「小白」时会被刷屏。
-        val named = config.answerOnName && botNames.any { it.isNotBlank() && text.contains(it) }
+        // 用共享匹配器：完整名与短昵称（名字后缀）都能认出来。
+        val named = config.answerOnName && BotNameMatcher.mentioned(text, botNames)
 
         mutex.withLock {
             val state = stateOf(groupId)
@@ -182,8 +232,10 @@ class ChitchatPolicy(
             }
 
             val score = score(text)
-            if (score < config.minScore) {
-                return ChitchatGate.Skip("规则打分 $score < ${config.minScore}")
+            // 阈值随人设性格浮动：话痨放宽、高冷收紧
+            val threshold = config.minScore + personaBias.scoreDelta
+            if (score < threshold) {
+                return ChitchatGate.Skip("规则打分 $score < $threshold")
             }
             return ChitchatGate.Candidate(score)
         }

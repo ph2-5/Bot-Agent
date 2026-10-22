@@ -20,12 +20,14 @@ class ChitchatPolicyTest {
         baseCooldownMillis: Long = 90_000L,
         maxPerHour: Int = 20,
         maxPerDay: Int = 200,
+        minScore: Int = 25,
     ) = ChitchatConfig(
         enabled = enabled,
         baseCooldownMillis = baseCooldownMillis,
         maxPerHour = maxPerHour,
         maxPerDay = maxPerDay,
         aiJudge = false,
+        minScore = minScore,
     )
 
     private val names = listOf("小白")
@@ -189,4 +191,52 @@ class ChitchatPolicyTest {
                 )
             assertTrue("那是两个人的对话，不该接，实际=$gate", gate is ChitchatGate.Skip)
         }
+
+    @Test
+    fun `短昵称也能触发必答`() =
+        runTest {
+            // 设定「过去的阿远」，群里只喊「阿远」
+            val gate = policy.gate("g1", "阿远，开黑不", listOf("过去的阿远"), config())
+            assertTrue("后缀昵称应命中必答，实际=$gate", gate is ChitchatGate.Forced)
+        }
+
+    @Test
+    fun `话痨人设降低打分阈值`() =
+        runTest {
+            // "有人吗"得 20 分：中性阈值 21 会被拦，话痨 −10 后过筛
+            val neutral = policy.gate("g1", "有人吗", names, config(minScore = 21))
+            assertTrue("中性偏置下应被拦，实际=$neutral", neutral is ChitchatGate.Skip)
+
+            val talkative =
+                policy.gate(
+                    "g2",
+                    "有人吗",
+                    names,
+                    config(minScore = 21),
+                    personaBias = PersonaBias.TALKATIVE,
+                )
+            assertTrue("话痨偏置下应过筛，实际=$talkative", talkative is ChitchatGate.Candidate)
+        }
+
+    @Test
+    fun `高冷人设抬高打分阈值`() =
+        runTest {
+            val gate =
+                policy.gate(
+                    "g1",
+                    "有人吗",
+                    names,
+                    config(minScore = 11),
+                    personaBias = PersonaBias.RESERVED,
+                )
+            assertTrue("高冷偏置下阈值 +10 应被拦，实际=$gate", gate is ChitchatGate.Skip)
+        }
+
+    @Test
+    fun `人设性格从提示词关键词推断`() {
+        assertEquals(PersonaBias.TALKATIVE, PersonaBias.personaBiasFor("你是个话痨，看到话题就忍不住"))
+        assertEquals(PersonaBias.RESERVED, PersonaBias.personaBiasFor("你很高冷，惜字如金"))
+        assertEquals("两种特质都出现时不猜", PersonaBias.NEUTRAL, PersonaBias.personaBiasFor("话痨但高冷"))
+        assertEquals("空人设保持中性", PersonaBias.NEUTRAL, PersonaBias.personaBiasFor(null))
+    }
 }
