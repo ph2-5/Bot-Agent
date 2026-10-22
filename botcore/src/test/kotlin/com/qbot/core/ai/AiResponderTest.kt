@@ -127,7 +127,7 @@ class AiResponderTest {
             val reply = responder.reply(message("答案是什么"), config())
 
             assertEquals("答案是 42", reply)
-            val stored = history.load("g:group-1", 10)
+            val stored = history.load("g:group-1:user-1", 10)
             assertEquals(2, stored.size)
             assertEquals("user", stored[0].role)
             assertEquals("答案是什么", stored[0].content)
@@ -160,7 +160,7 @@ class AiResponderTest {
                 runCatching { responder.reply(message("在吗"), config()) }.exceptionOrNull()
 
             assertTrue(error is LlmException)
-            assertTrue(history.load("g:group-1", 10).isEmpty())
+            assertTrue(history.load("g:group-1:user-1", 10).isEmpty())
         }
 
     @Test
@@ -168,11 +168,11 @@ class AiResponderTest {
         runBlocking {
             enqueueAnswer("随便")
             responder.reply(message("问题"), config())
-            assertEquals(2, history.load("g:group-1", 10).size)
+            assertEquals(2, history.load("g:group-1:user-1", 10).size)
 
             val reply = responder.reply(message("/ai 清空"), config())
             assertTrue(reply.contains("已清空"))
-            assertTrue(history.load("g:group-1", 10).isEmpty())
+            assertTrue(history.load("g:group-1:user-1", 10).isEmpty())
             // 只发起了第一次真实请求，清空指令没有打网络
             assertEquals(1, server.requestCount)
         }
@@ -283,7 +283,7 @@ class AiResponderTest {
         runBlocking {
             enqueueAnswer("第一次")
             responder.reply(message("问题"), config(contextTokenBudget = 10_000))
-            history.append("g:group-1", ChatMessage("user", "塞".repeat(5000)))
+            history.append("g:group-1:user-1", ChatMessage("user", "塞".repeat(5000)))
 
             // 第一次请求服务端报上下文超限，第二次（砍半后）成功
             server.enqueue(

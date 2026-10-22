@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Dashboard
+import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Rule
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
@@ -19,6 +20,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import com.qbot.app.ui.screens.AiScreen
 import com.qbot.app.ui.screens.DashboardScreen
 import com.qbot.app.ui.screens.LogsScreen
 import com.qbot.app.ui.screens.RulesScreen
@@ -31,6 +33,7 @@ private enum class Tab(
     STATUS("状态", Icons.Default.Dashboard),
     LOGS("日志", Icons.AutoMirrored.Filled.List),
     RULES("规则", Icons.Default.Rule),
+    AI("AI", Icons.Default.Psychology),
     SETTINGS("设置", Icons.Default.Settings),
 }
 
@@ -71,11 +74,13 @@ fun MainScreen(
                         onRequestNotificationPermission = onRequestNotificationPermission,
                         onStartService = onStartService,
                         onStopService = onStopService,
+                        onRequestBatteryWhitelist = onRequestBatteryWhitelist,
                     )
 
                 1 -> LogsScreen()
                 2 -> RulesScreen()
-                3 -> SettingsScreen(onRequestBatteryWhitelist = onRequestBatteryWhitelist)
+                3 -> AiScreen()
+                4 -> SettingsScreen(onRequestBatteryWhitelist = onRequestBatteryWhitelist)
             }
         }
     }

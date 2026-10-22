@@ -67,8 +67,22 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
                 <action android:name="android.intent.action.PACKAGE_REPLACED" />
+                <!-- 厂商快启：部分 ROM 的开机广播是私有的，标准 BOOT_COMPLETED 收不到 -->
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
+
+        <!--
+          定时复活任务：进程被整体杀掉后，由 JobScheduler 到点把前台服务拉起来。
+          setPersisted 的任务跨重启存活，是"看门狗救不了进程死亡"的兜底。
+          BIND_JOB_SERVICE 权限是系统要求：只有系统能绑定 JobService。
+        -->
+        <service
+            android:name=".service.ResurrectorJobService"
+            android:enabled="true"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
 
         <!--
           注意：这里刻意没有静态注册 CONNECTIVITY_CHANGE 广播。

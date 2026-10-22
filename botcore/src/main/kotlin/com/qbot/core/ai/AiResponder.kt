@@ -1,7 +1,6 @@
 package com.qbot.core.ai
 
 import com.qbot.core.model.IncomingMessage
-import com.qbot.core.model.MessageKind
 import com.qbot.core.model.cleanText
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -155,12 +154,25 @@ class InMemoryAiHistoryStore : AiHistoryStore {
  *
  * 职责：
  * 1. 按 [AiConfig.mode] 决定一条消息是否该由 AI 回答；
- * 2. 组装 system prompt + 历史上下文 + 当前问题，调用 LLM；
+ * 2. 组装 system prompt + 记忆（事实/群聊背景）+ 历史上下文 + 当前问题，调用 LLM；
  * 3. 把本轮问答写回历史，实现多轮对话。
+ *
+ * 会话键由 [ConversationKeys] 按人隔离：群里 A 与机器人的恩怨
+ * 不会串到 B 的线程里；记忆内容（展示名/事实/背景）由 [MemoryPipeline]
+ * 准备好后经 [reply] 的 memory 参数传入，本类不直接依赖存储。
  */
 class AiResponder(
     private val client: LlmClient,
     private val history: AiHistoryStore = InMemoryAiHistoryStore(),
+    private val assembler: PromptAssembler = PromptAssembler(),
+    /**
+     * 人设解析：按 人→群→全局 优先级返回系统提示词。
+     * 返回 null 时回退到 [AiConfig.systemPrompt]。
+     *
+     * 声明为挂起函数类型：Android 侧的实现要查 Room，
+     * 不该为了拿一段提示词而 runBlocking。
+     */
+    private val personaResolver: (suspend (IncomingMessage) -> String?)? = null,
 ) {
     companion object {
         /** 触发 AI 的命令前缀 */
@@ -219,14 +231,18 @@ class AiResponder(
     /**
      * 生成回复。
      *
+     * @param memory 本条消息的记忆上下文（展示名 / 事实 / 群聊背景），
+     *   由 [MemoryPipeline.buildContext] 准备；为空时退化为纯对话模式。
      * @return 助手回复文本；失败时抛出 [LlmException]，由调用方决定兜底话术。
      */
     suspend fun reply(
         message: IncomingMessage,
         config: AiConfig,
+        memory: MemoryContext? = null,
     ): String {
-        val key = conversationKey(message)
+        val key = ConversationKeys.history(message)
         val question = extractQuestion(message)
+        val systemPrompt = personaResolver?.invoke(message) ?: config.systemPrompt
 
         lockFor(key).withLock {
             // 清空指令不调用模型，直接重置上下文
@@ -242,12 +258,12 @@ class AiResponder(
 
             val result =
                 try {
-                    callLlm(stored, question, config)
+                    callLlm(stored, question, config, memory, systemPrompt)
                 } catch (e: ContextTooLongException) {
                     // 估算偏差或历史里混进超长消息：砍掉一半历史重试一次，
                     // 仍失败就把异常抛给调用方走兜底话术。
                     val halved = stored.drop(stored.size / 2)
-                    callLlm(halved, question, config)
+                    callLlm(halved, question, config, memory, systemPrompt)
                 }
 
             // 成功后才写入历史：失败的请求不应污染上下文
@@ -267,10 +283,13 @@ class AiResponder(
         storedHistory: List<ChatMessage>,
         question: String,
         config: AiConfig,
+        memory: MemoryContext?,
+        systemPrompt: String,
     ): LlmReply {
         val messages =
-            assembleMessages(
-                systemPrompt = config.systemPrompt,
+            assembler.assemble(
+                personaPrompt = systemPrompt,
+                memory = memory,
                 history = storedHistory,
                 question = question,
                 tokenBudget = config.contextTokenBudget,
@@ -290,8 +309,9 @@ class AiResponder(
     }
 
     /**
-     * 组装消息列表——**顺序本身就是缓存策略**。
+     * 组装消息列表——兼容旧测试的薄封装，实际逻辑在 [PromptAssembler]。
      *
+     * 顺序本身就是缓存策略：
      * 1. system（人设/记忆）必须最先且内容逐字节稳定：DeepSeek 的前缀缓存要求
      *    「从第 0 个 token 起完全相同」，在 system 里插时间戳之类变化内容
      *    会让后面全部缓存失效，既费钱又慢；
@@ -304,34 +324,14 @@ class AiResponder(
         history: List<ChatMessage>,
         question: String,
         tokenBudget: Int,
-    ): List<ChatMessage> {
-        val system =
-            if (systemPrompt.isNotBlank()) {
-                listOf(ChatMessage(role = "system", content = systemPrompt))
-            } else {
-                emptyList()
-            }
-        val tail = listOf(ChatMessage(role = "user", content = question))
-        var remaining = (tokenBudget - TokenEstimator.estimate(system) - TokenEstimator.estimate(tail))
-            .coerceAtLeast(0)
-
-        val kept = ArrayDeque<ChatMessage>()
-        var i = history.size - 1
-        while (i >= 1) {
-            val cost = TokenEstimator.estimate(history[i - 1].content) +
-                TokenEstimator.estimate(history[i].content)
-            if (cost > remaining) break
-            kept.addFirst(history[i])
-            kept.addFirst(history[i - 1])
-            remaining -= cost
-            i -= 2
-        }
-        // 历史条数为奇数时最早那条落单，预算还够就带上
-        if (i == 0 && TokenEstimator.estimate(history[0].content) <= remaining) {
-            kept.addFirst(history[0])
-        }
-        return system + kept + tail
-    }
+    ): List<ChatMessage> =
+        assembler.assemble(
+            personaPrompt = systemPrompt,
+            memory = null,
+            history = history,
+            question = question,
+            tokenBudget = tokenBudget,
+        )
 
     /**
      * 是否发送 thinking 参数、发送什么值。
@@ -354,28 +354,15 @@ class AiResponder(
         }
     }
 
-    /** 清空某个会话的上下文。 */
+    /** 清空某个会话的上下文（按人隔离的线程）。 */
     suspend fun clearHistory(message: IncomingMessage) {
-        history.clear(conversationKey(message))
+        history.clear(ConversationKeys.history(message))
     }
 
     /** 启动时清理一次全局过期历史。 */
     suspend fun trimAllHistory(keep: Int) {
         history.trimAll(keep)
     }
-
-    /**
-     * 会话标识。
-     *
-     * 群聊与单聊分开，避免把 A 群的问题答案喂给 B 群。
-     */
-    private fun conversationKey(message: IncomingMessage): String =
-        when (message.kind) {
-            MessageKind.GROUP_AT -> "g:${message.targetId}"
-            MessageKind.GUILD -> "c:${message.targetId}"
-            MessageKind.C2C -> "u:${message.targetId}"
-            MessageKind.DIRECT -> "d:${message.targetId}"
-        }
 
     private fun truncate(text: String): String =
         if (text.length <= MAX_REPLY_LENGTH) {

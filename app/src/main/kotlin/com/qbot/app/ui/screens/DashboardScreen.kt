@@ -55,9 +55,12 @@ fun DashboardScreen(
     onRequestNotificationPermission: () -> Unit,
     onStartService: () -> Unit,
     onStopService: () -> Unit,
+    onRequestBatteryWhitelist: () -> Unit,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val controller = (context.applicationContext as BotApplication).controller
+    val survivalStats by (context.applicationContext as BotApplication).survivalStats.stats
+        .collectAsState()
 
     val status by controller.status.collectAsState()
     val aiConfig by controller.aiConfig.collectAsState()
@@ -90,11 +93,15 @@ fun DashboardScreen(
 
         AiStatusCard(config = aiConfig, usage = aiUsage)
 
+        SurvivalCard(stats = survivalStats)
+
         ControlButtons(
             isRunning = status.state != ConnectionState.IDLE,
             onStart = onStartService,
             onStop = onStopService,
         )
+
+        RomSurvivalGuideCard(onRequestBatteryWhitelist = onRequestBatteryWhitelist)
 
         status.lastError?.let { error ->
             Card(
@@ -293,6 +300,65 @@ private fun StatsRow(status: GatewayStatus) {
         StatCard("收到事件", status.totalEvents.toString(), Modifier.weight(1f))
         StatCard("消息", status.totalMessages.toString(), Modifier.weight(1f))
         StatCard("重连", status.reconnectCount.toString(), Modifier.weight(1f))
+    }
+}
+
+/**
+ * 存活统计卡。
+ *
+ * 回答的核心问题不是"在线了多久"，而是"上次是怎么没的"：
+ * 如果定时复活计数在涨，说明进程一直在被 ROM 杀，
+ * 这时候该去补系统级保活设置（见下方 ROM 指南），
+ * 而不是怀疑机器人本身。
+ */
+@Composable
+private fun SurvivalCard(stats: com.qbot.app.service.SurvivalStats) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                "后台存活统计",
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.titleMedium,
+            )
+
+            if (stats.totalStarts == 0) {
+                Text(
+                    "还没有启动记录。机器人每次被拉起都会在这里记账。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                Text(
+                    text = "最近一次拉起：${stats.describeSource()}",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    text =
+                        "手动 ${stats.userStarts} · 开机/升级 ${stats.bootStarts} · " +
+                            "定时复活 ${stats.jobResurrections} · 系统重建 ${stats.systemRedeliveries}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (stats.jobResurrections + stats.systemRedeliveries > 0) {
+                    Text(
+                        text =
+                            if (stats.jobResurrections > 0) {
+                                "进程被系统杀过，靠定时任务复活——建议按下方指南补齐系统设置"
+                            } else {
+                                "进程被系统回收过，靠系统重建恢复——属正常范围"
+                            },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = StatusWarning,
+                    )
+                }
+            }
+        }
     }
 }
 

@@ -12,12 +12,13 @@ class MessageParsingTest {
 
     @Test
     fun `解析群聊艾特消息`() {
+        // 官方 botpy GroupMessage：author.member_openid 为群里每个人的稳定标识
         val raw =
             """
             {
               "id": "msg-001",
               "group_openid": "group-abc",
-              "op_member_openid": "user-888",
+              "author": {"member_openid": "user-888"},
               "content": "<@!100200> 今天天气怎么样",
               "timestamp": "1700000000"
             }
@@ -29,12 +30,48 @@ class MessageParsingTest {
         assertEquals("msg-001", msg.messageId)
         assertEquals("group-abc", msg.targetId)
         assertEquals("user-888", msg.senderId)
-        assertEquals("user-888", msg.senderId)
+    }
+
+    @Test
+    fun `群聊发送者回退到旧字段 op_member_openid`() {
+        // 兼容极少数历史报文：顶层 op_member_openid
+        val raw = """{"id":"1","group_openid":"g","op_member_openid":"user-legacy","content":"hi","timestamp":"1"}"""
+        val msg = parseIncomingMessage(EventType.GROUP_AT_MESSAGE_CREATE, element(raw))!!
+        assertEquals("user-legacy", msg.senderId)
+    }
+
+    @Test
+    fun `群聊无 author 时发送者为 null 不崩溃`() {
+        val msg =
+            parseIncomingMessage(
+                EventType.GROUP_AT_MESSAGE_CREATE,
+                element("""{"id":"1","group_openid":"g","content":"hi","timestamp":"1"}"""),
+            )!!
+        assertNull(msg.senderId)
+    }
+
+    @Test
+    fun `频道消息取 author_id 与 member_nick`() {
+        val raw =
+            """
+            {
+              "id": "g-1",
+              "channel_id": "chan-1",
+              "author": {"id": "author-42", "username": "someone"},
+              "member": {"nick": "小明"},
+              "content": "大家好",
+              "timestamp": "1700000000"
+            }
+            """.trimIndent()
+        val msg = parseIncomingMessage(EventType.MESSAGE_CREATE, element(raw))!!
+        assertEquals(MessageKind.GUILD, msg.kind)
+        assertEquals("author-42", msg.senderId)
+        assertEquals("小明", msg.senderName)
     }
 
     @Test
     fun `艾特前缀被正确剥离`() {
-        val raw = """{"id":"1","group_openid":"g","op_member_openid":"u","content":"<@!100200> 你好呀","timestamp":"1700000000"}"""
+        val raw = """{"id":"1","group_openid":"g","author":{"member_openid":"u"},"content":"<@!100200> 你好呀","timestamp":"1700000000"}"""
         val msg = parseIncomingMessage(EventType.GROUP_AT_MESSAGE_CREATE, element(raw))!!
 
         assertEquals("<@!100200> 你好呀", msg.content)
@@ -68,7 +105,9 @@ class MessageParsingTest {
         assertEquals(MessageKind.C2C, msg.kind)
         assertEquals("c2c-001", msg.messageId)
         assertEquals("openid-777", msg.targetId)
-        assertEquals("author-id", msg.senderId)
+        // 官方报文：C2C 发送者取 author.user_openid（与 botpy 一致），
+        // author.id 只是兜底
+        assertEquals("openid-777", msg.senderId)
         assertEquals("在吗", msg.content)
     }
 

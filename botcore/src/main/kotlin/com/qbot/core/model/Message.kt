@@ -24,7 +24,8 @@ enum class MessageKind {
 /**
  * 归一化后的入站消息。
  *
- * 官方不同事件的字段命名并不统一（群聊用 `group_openid`，单聊用 `author.user_openid`），
+ * 官方不同事件的字段命名并不统一（群聊用 `author.member_openid`，
+ * 单聊用 `author.user_openid`，频道用 `author.id`），
  * 这里统一抽成一条结构供规则引擎消费；同时保留 [raw]，
  * 让上层能读到尚未纳入模型的字段，避免因平台新增字段而丢信息。
  */
@@ -37,7 +38,21 @@ data class IncomingMessage(
     val content: String,
     /** 回复目标：群聊为 group_openid，单聊为 user_openid */
     val targetId: String?,
+    /**
+     * 发送者的稳定标识。
+     *
+     * 群聊为 `author.member_openid`（官方 botpy SDK 的 GroupMessage.author.member_openid），
+     * 单聊为 `author.user_openid`，频道为 `author.id`。
+     * 注意群内的 member_openid 是按群分配的，同一个人在不同群里值不同。
+     */
     val senderId: String?,
+    /**
+     * 发送者展示名（若报文直接提供）。
+     *
+     * 目前仅频道消息的 `member.nick` 会带昵称；群聊与单聊官方不提供
+     * 昵称查询接口，展示名由上层身份名录（自称名/人工备注）补齐。
+     */
+    val senderName: String? = null,
     val timestampMillis: Long,
     val raw: JsonObject,
 )
@@ -88,10 +103,26 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
 
     val senderId =
         when (kind) {
-            MessageKind.C2C -> obj.nestedStringOrNull("author", "id")
-                ?: obj.nestedStringOrNull("author", "user_openid")
-            MessageKind.GUILD, MessageKind.DIRECT -> obj.nestedStringOrNull("author", "id")
-            MessageKind.GROUP_AT -> obj.stringOrNull("op_member_openid")
+            // 官方 botpy：GroupMessage.author.member_openid（群里每个人的稳定标识）
+            MessageKind.GROUP_AT ->
+                obj.nestedStringOrNull("author", "member_openid")
+                    ?: obj.stringOrNull("op_member_openid")
+                    ?: obj.nestedStringOrNull("author", "user_openid")
+                    ?: obj.nestedStringOrNull("author", "id")
+            // 官方 botpy：C2CMessage.author.user_openid
+            MessageKind.C2C ->
+                obj.nestedStringOrNull("author", "user_openid")
+                    ?: obj.nestedStringOrNull("author", "id")
+            // 频道消息 author.id + member.nick（官方 MessagePayload）
+            MessageKind.GUILD, MessageKind.DIRECT ->
+                obj.nestedStringOrNull("author", "id")
+                    ?: obj.nestedStringOrNull("author", "user_openid")
+        }
+
+    val senderName =
+        when (kind) {
+            MessageKind.GUILD, MessageKind.DIRECT -> obj.nestedStringOrNull("member", "nick")
+            else -> null
         }
 
     val timestamp =
@@ -110,6 +141,7 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
         content = content,
         targetId = targetId,
         senderId = senderId,
+        senderName = senderName,
         timestampMillis = if (timestamp > 1_000_000_000_000L) timestamp else timestamp * 1000,
         raw = obj,
     )

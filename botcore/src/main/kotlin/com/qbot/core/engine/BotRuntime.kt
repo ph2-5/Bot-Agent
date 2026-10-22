@@ -3,6 +3,7 @@ package com.qbot.core.engine
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.AiResponder
+import com.qbot.core.ai.MemoryPipeline
 import com.qbot.core.api.OpenApi
 import com.qbot.core.gateway.GatewayClient
 import com.qbot.core.gateway.SimpleGatewayListener
@@ -58,6 +59,13 @@ class BotRuntime(
      * 无需重启机器人——每条消息进来时才读取最新配置。
      */
     private val aiConfigProvider: (() -> AiConfig?)? = null,
+    /**
+     * 记忆管线（身份 → 事实 → 共享群聊背景）。
+     *
+     * 为 null 时退化为纯对话机器人：不认人、不记忆、没有人设解析，
+     * 行为与接入前完全一致（测试与「轻量模式」用）。
+     */
+    private val memoryPipeline: MemoryPipeline? = null,
 ) : SimpleGatewayListener() {
     companion object {
         private const val TAG = "Runtime"
@@ -103,7 +111,37 @@ class BotRuntime(
 
     override fun onMessage(message: IncomingMessage) {
         val text = message.cleanText(botId)
-        log(LogLevel.DEBUG, TAG, "收到[${message.kind}] $text")
+
+        // 整条处理链放进协程：身份解析与记忆装载都是挂起函数（要查库），
+        // 网关回调线程必须尽快返回，否则会堵塞后续事件读取。
+        scope.launch { processMessage(message, text) }
+    }
+
+    private suspend fun processMessage(
+        message: IncomingMessage,
+        text: String,
+    ) {
+        // 先认出是谁：群聊里每个人有独立的记忆线程与展示名。
+        // 解析失败（无记忆管线/未启用）时回退到 senderId 尾段，日志里始终能区分人。
+        val label = memoryPipeline?.resolveLabel(message, text)
+        val who = label ?: message.senderId?.takeLast(6) ?: "匿名"
+        log(LogLevel.DEBUG, TAG, "收到[${message.kind}] $who: $text")
+
+        // 记忆管理指令（我的记忆 / 忘掉X / 我是谁）优先于规则与 AI：
+        // 它们是本地数据库操作，不依赖 AI 开关，且比任何规则都更具体。
+        val pipeline = memoryPipeline
+        val memoryReply = pipeline?.handleMemoryCommand(message, text)
+        if (memoryReply != null) {
+            runCatching {
+                sendReply(message, memoryReply)
+                pipeline.recordExchange(message, text, memoryReply)
+                log(LogLevel.INFO, TAG, "记忆指令 → 已回复")
+            }.onFailure { t ->
+                logger.e(TAG, "记忆指令回复失败", t)
+                log(LogLevel.ERROR, TAG, "记忆指令回复失败：${t.message}")
+            }
+            return
+        }
 
         val aiConfig = aiConfigProvider?.invoke()
         val aiEnabled = aiConfig != null && aiConfig.enabled && aiConfig.isReady
@@ -122,14 +160,14 @@ class BotRuntime(
         val rule = if (skipRules) null else ruleEngine.match(message, botId)
 
         if (rule != null) {
-            replyWithRule(message, rule)
+            replyWithRule(message, rule, text)
             return
         }
 
         if (aiResponder != null && aiConfig != null && aiEnabled &&
             aiResponder.shouldHandle(message, aiConfig, ruleMatched = false)
         ) {
-            replyWithAi(message, aiConfig)
+            replyWithAi(message, aiConfig, text)
             return
         }
 
@@ -137,59 +175,61 @@ class BotRuntime(
         log(LogLevel.DEBUG, TAG, "无匹配规则，忽略")
     }
 
-    /** 命中本地规则，按模板回复。 */
-    private fun replyWithRule(
+    /** 命中本地规则，按模板回复。这一轮也会写进共享群聊背景。 */
+    private suspend fun replyWithRule(
         message: IncomingMessage,
         rule: Rule,
+        text: String,
     ) {
         val reply = RuleEngine.render(rule.reply, message, botId)
         if (reply.isBlank()) return
 
-        scope.launch {
-            runCatching {
-                sendReply(message, reply)
-                log(LogLevel.INFO, TAG, "命中规则「${rule.name}」→ 已回复")
-            }.onFailure { t ->
-                logger.e(TAG, "回复失败", t)
-                log(LogLevel.ERROR, TAG, "回复失败：${t.message}")
-            }
+        runCatching {
+            sendReply(message, reply)
+            memoryPipeline?.recordExchange(message, text, reply)
+            log(LogLevel.INFO, TAG, "命中规则「${rule.name}」→ 已回复")
+        }.onFailure { t ->
+            logger.e(TAG, "回复失败", t)
+            log(LogLevel.ERROR, TAG, "回复失败：${t.message}")
         }
     }
 
     /** 交给 AI 生成回复，失败时按配置的兜底话术应答。 */
-    private fun replyWithAi(
+    private suspend fun replyWithAi(
         message: IncomingMessage,
         config: AiConfig,
+        text: String,
     ) {
-        scope.launch {
-            runCatching {
-                val answer = aiResponder!!.reply(message, config)
-                sendReply(message, answer)
-                // 用量日志：缓存命中不仅省钱，首 token 延迟也大幅降低，
-                // 命中率长期为 0 说明 system 提示词不稳定，值得排查。
-                val usage = aiResponder.lastUsage.value
-                if (usage != null && usage.promptTokens > 0) {
-                    val hitPercent = (usage.cacheHitRatio ?: 0f) * 100
-                    log(
-                        LogLevel.INFO,
-                        TAG,
-                        "AI 已回复（${answer.length} 字）｜prompt ${usage.promptTokens} tokens" +
-                            "（缓存命中 ${usage.cacheHitTokens}，${hitPercent.toInt()}%）" +
-                            "｜completion ${usage.completionTokens} tokens",
-                    )
-                } else {
-                    log(LogLevel.INFO, TAG, "AI 已回复（${answer.length} 字）")
-                }
-            }.onFailure { t ->
-                logger.e(TAG, "AI 回复失败", t)
-                log(LogLevel.ERROR, TAG, "AI 回复失败：${t.message}")
+        runCatching {
+            // 组装这条消息的记忆上下文：展示名 / 关于此人的事实 / 所在范围的近期对话
+            val memory = memoryPipeline?.buildContext(message, botId, text)
+            val answer = aiResponder!!.reply(message, config, memory)
+            sendReply(message, answer)
+            memoryPipeline?.recordExchange(message, text, answer)
+            // 用量日志：缓存命中不仅省钱，首 token 延迟也大幅降低，
+            // 命中率长期为 0 说明 system 提示词不稳定，值得排查。
+            val usage = aiResponder.lastUsage.value
+            if (usage != null && usage.promptTokens > 0) {
+                val hitPercent = (usage.cacheHitRatio ?: 0f) * 100
+                log(
+                    LogLevel.INFO,
+                    TAG,
+                    "AI 已回复（${answer.length} 字）｜prompt ${usage.promptTokens} tokens" +
+                        "（缓存命中 ${usage.cacheHitTokens}，${hitPercent.toInt()}%）" +
+                        "｜completion ${usage.completionTokens} tokens",
+                )
+            } else {
+                log(LogLevel.INFO, TAG, "AI 已回复（${answer.length} 字）")
+            }
+        }.onFailure { t ->
+            logger.e(TAG, "AI 回复失败", t)
+            log(LogLevel.ERROR, TAG, "AI 回复失败：${t.message}")
 
-                val fallback = config.replyOnError.trim()
-                if (fallback.isNotEmpty()) {
-                    runCatching { sendReply(message, fallback) }
-                        .onSuccess { log(LogLevel.INFO, TAG, "已发送兜底回复") }
-                        .onFailure { e -> log(LogLevel.ERROR, TAG, "兜底回复也失败：${e.message}") }
-                }
+            val fallback = config.replyOnError.trim()
+            if (fallback.isNotEmpty()) {
+                runCatching { sendReply(message, fallback) }
+                    .onSuccess { log(LogLevel.INFO, TAG, "已发送兜底回复") }
+                    .onFailure { e -> log(LogLevel.ERROR, TAG, "兜底回复也失败：${e.message}") }
             }
         }
     }

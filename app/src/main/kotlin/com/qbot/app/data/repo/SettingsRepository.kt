@@ -13,6 +13,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
+import com.qbot.core.ai.MemoryConfig
 import com.qbot.core.ai.ThinkingMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -68,6 +69,14 @@ class SettingsRepository(private val context: Context) {
         val AI_REPLY_ON_ERROR = stringPreferencesKey("ai_reply_on_error")
         val AI_THINKING_MODE = stringPreferencesKey("ai_thinking_mode")
         val AI_CONTEXT_TOKEN_BUDGET = intPreferencesKey("ai_context_token_budget")
+
+        // ---- 记忆系统 ----
+        val MEMORY_ENABLED = booleanPreferencesKey("memory_enabled")
+        val MEMORY_FACTS_PER_PERSON = intPreferencesKey("memory_facts_per_person")
+        val MEMORY_ROOM_CONTEXT = booleanPreferencesKey("memory_room_context")
+        val MEMORY_ROOM_SIZE = intPreferencesKey("memory_room_size")
+        val MEMORY_LEARN_NAMES = booleanPreferencesKey("memory_learn_names")
+        val MEMORY_LEARN_FACTS = booleanPreferencesKey("memory_learn_facts")
     }
 
     private companion object {
@@ -126,12 +135,51 @@ class SettingsRepository(private val context: Context) {
         )
     val aiConfig: StateFlow<AiConfig> = _aiConfig.asStateFlow()
 
+    /**
+     * 记忆系统配置。
+     *
+     * 与 [aiConfig] 同一套合并机制：DataStore 出非敏感字段，
+     * 机器人在每条消息处理时 `.value` 取最新值，改设置无需重启。
+     */
+    private val _memoryConfig = MutableStateFlow(MemoryConfig())
+    val memoryConfig: StateFlow<MemoryConfig> = _memoryConfig.asStateFlow()
+
     init {
         // DataStore 的变更合并进 StateFlow；加密偏好里的 apiKey 每次重新读，
         // 保证用户在设置页改完 Key 后保存即可生效。
         scope.launch {
             context.dataStore.data.collect { prefs ->
                 _aiConfig.value = readAiConfig(prefs)
+                _memoryConfig.value = readMemoryConfig(prefs)
+            }
+        }
+    }
+
+    private fun readMemoryConfig(prefs: Preferences): MemoryConfig {
+        val defaults = MemoryConfig()
+        return MemoryConfig(
+            enabled = prefs[Keys.MEMORY_ENABLED] ?: defaults.enabled,
+            factsPerPerson =
+            prefs[Keys.MEMORY_FACTS_PER_PERSON] ?: defaults.factsPerPerson,
+            roomContextEnabled =
+            prefs[Keys.MEMORY_ROOM_CONTEXT] ?: defaults.roomContextEnabled,
+            roomContextSize = prefs[Keys.MEMORY_ROOM_SIZE] ?: defaults.roomContextSize,
+            learnNames = prefs[Keys.MEMORY_LEARN_NAMES] ?: defaults.learnNames,
+            learnFacts = prefs[Keys.MEMORY_LEARN_FACTS] ?: defaults.learnFacts,
+        )
+    }
+
+    /** 保存记忆系统配置。 */
+    fun saveMemoryConfig(config: MemoryConfig) {
+        _memoryConfig.value = config
+        scope.launch {
+            context.dataStore.edit { prefs ->
+                prefs[Keys.MEMORY_ENABLED] = config.enabled
+                prefs[Keys.MEMORY_FACTS_PER_PERSON] = config.factsPerPerson
+                prefs[Keys.MEMORY_ROOM_CONTEXT] = config.roomContextEnabled
+                prefs[Keys.MEMORY_ROOM_SIZE] = config.roomContextSize
+                prefs[Keys.MEMORY_LEARN_NAMES] = config.learnNames
+                prefs[Keys.MEMORY_LEARN_FACTS] = config.learnFacts
             }
         }
     }

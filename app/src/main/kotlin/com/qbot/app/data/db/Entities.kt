@@ -129,8 +129,16 @@ interface AiHistoryDao {
 }
 
 @Database(
-    entities = [LogEntity::class, RuleEntity::class, AiMessageEntity::class],
-    version = 2,
+    entities = [
+        LogEntity::class,
+        RuleEntity::class,
+        AiMessageEntity::class,
+        IdentityEntity::class,
+        FactEntity::class,
+        RoomMessageEntity::class,
+        PersonaEntity::class,
+    ],
+    version = 3,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -139,4 +147,79 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun ruleDao(): RuleDao
 
     abstract fun aiHistoryDao(): AiHistoryDao
+
+    abstract fun identityDao(): IdentityDao
+
+    abstract fun factDao(): FactDao
+
+    abstract fun roomMessageDao(): RoomMessageDao
+
+    abstract fun personaDao(): PersonaDao
+
+    companion object {
+        /**
+         * v2 → v3：记忆系统与人设表。
+         *
+         * 纯增量迁移（只建新表，不动 logs / rules / ai_messages），
+         * 老用户的日志、规则、AI 历史全部保留。
+         * 注意 ai_messages 里旧格式的会话键（按群不按人）会自然失效：
+         * 新键按人隔离，旧桶不会再被读到，由 trimAll 定期收敛。
+         */
+        val MIGRATION_2_3 =
+            object : androidx.room.migration.Migration(2, 3) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS identities (
+                            senderId TEXT NOT NULL PRIMARY KEY,
+                            displayName TEXT NOT NULL,
+                            source TEXT NOT NULL,
+                            updatedAt INTEGER NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS facts (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            senderId TEXT NOT NULL,
+                            text TEXT NOT NULL,
+                            kind TEXT NOT NULL,
+                            source TEXT NOT NULL,
+                            updatedAt INTEGER NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    db.execSQL("CREATE INDEX IF NOT EXISTS index_facts_senderId ON facts(senderId)")
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS room_messages (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            scopeKey TEXT NOT NULL,
+                            senderId TEXT,
+                            senderName TEXT,
+                            role TEXT NOT NULL,
+                            content TEXT NOT NULL,
+                            timestampMillis INTEGER NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS index_room_messages_scopeKey ON room_messages(scopeKey)",
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS personas (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            senderId TEXT,
+                            scopeId TEXT,
+                            name TEXT NOT NULL,
+                            prompt TEXT NOT NULL,
+                            updatedAt INTEGER NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                }
+            }
+    }
 }

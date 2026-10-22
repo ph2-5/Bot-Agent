@@ -143,6 +143,9 @@ fun SettingsScreen(onRequestBatteryWhitelist: () -> Unit) {
         // ---------- AI 接入 ----------
         AiSettingsSection()
 
+        // ---------- 记忆系统快捷开关 ----------
+        MemoryQuickSection()
+
         // ---------- 运行策略 ----------
         SettingsCard(title = "运行策略") {
             SwitchRow(
@@ -242,6 +245,60 @@ private fun SwitchRow(
             )
         }
         Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
+}
+
+/**
+ * 记忆系统快捷开关。
+ *
+ * 完整的记忆管理（查看/改名/删除每个人的事实、人设绑定）在「AI」Tab，
+ * 这里只放一个总开关和存量概览，方便从设置页直接发现该能力。
+ */
+@Composable
+private fun MemoryQuickSection() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val app = context.applicationContext as BotApplication
+    val settings = remember { app.settings }
+    val scope = rememberCoroutineScope()
+
+    var enabled by remember { mutableStateOf(settings.memoryConfig.value.enabled) }
+    var peopleCount by remember { mutableStateOf(0) }
+    var factCount by remember { mutableStateOf(0) }
+
+    // 每次进入页面刷新一次存量统计（记忆是运行时持续写入的，够用即可）
+    LaunchedEffect(Unit) {
+        peopleCount = app.database.identityDao().count()
+        factCount = app.database.factDao().count()
+    }
+
+    SettingsCard(
+        title = "记忆系统",
+        subtitle = "机器人会记住每个人是谁、说过什么，并按人隔离会话",
+    ) {
+        SwitchRow(
+            title = "启用记忆",
+            desc = "关闭后退化为纯对话机器人，已存数据保留不会删除",
+            checked = enabled,
+            onCheckedChange = { value ->
+                enabled = value
+                scope.launch {
+                    settings.saveMemoryConfig(settings.memoryConfig.value.copy(enabled = value))
+                }
+            },
+        )
+
+        Text(
+            "已认识 $peopleCount 人 · 记住 $factCount 条事实",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        Text(
+            "群聊里对机器人说「叫我 XX」即可改名；说「我的记忆」「忘掉 XX」可查看/删除。" +
+                "到「AI」Tab 可以管理每个人的记忆、给不同群和人配置专属人设。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

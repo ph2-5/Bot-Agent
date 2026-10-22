@@ -3,10 +3,16 @@ package com.qbot.app.runtime
 import android.content.Context
 import com.qbot.app.data.db.AppDatabase
 import com.qbot.app.data.db.LogEntity
+import com.qbot.app.data.repo.PersonaRepository
 import com.qbot.app.data.repo.RoomAiHistoryStore
+import com.qbot.app.data.repo.RoomFactStore
+import com.qbot.app.data.repo.RoomIdentityStore
+import com.qbot.app.data.repo.RoomSharedContextStore
 import com.qbot.app.data.repo.SettingsRepository
 import com.qbot.core.ai.AiResponder
 import com.qbot.core.ai.LlmClient
+import com.qbot.core.ai.MemoryPipeline
+import com.qbot.core.ai.PersonaResolver
 import com.qbot.core.api.OpenApi
 import com.qbot.core.auth.AccessTokenManager
 import com.qbot.core.engine.BotRuntime
@@ -87,8 +93,47 @@ class BotController(
     /** AI 会话历史（落库，跨重启保留）。 */
     private val aiHistoryStore = RoomAiHistoryStore(database.aiHistoryDao())
 
+    /** 人设仓库：维护端管理 + AiResponder 的人设解析。 */
+    val personaRepository =
+        PersonaRepository(
+            personaDao = database.personaDao(),
+            identityDao = database.identityDao(),
+        )
+
+    /** 身份存储，供维护端「备注名 / 忘掉某人」与管线共用。 */
+    private val identityStore = RoomIdentityStore(database.identityDao())
+
+    /** 事实存储，供维护端「删除某条记忆」与管线共用。 */
+    private val factStore = RoomFactStore(database.factDao())
+
+    /** 共享背景存储，与管线共用。 */
+    private val roomContextStore = RoomSharedContextStore(database.roomMessageDao())
+
+    /**
+     * 记忆管线：身份 → 事实 → 共享群聊背景。
+     *
+     * 存储全部走 Room，跨重启保留；配置由 [SettingsRepository.memoryConfig]
+     * 在每条消息处理时现取，改设置无需重启。
+     */
+    private val memoryPipeline =
+        MemoryPipeline(
+            identities = identityStore,
+            facts = factStore,
+            roomContext = roomContextStore,
+            configProvider = { settings.memoryConfig.value },
+        )
+
+    /** 身份存储（公开给维护端 UI 做备注名 / 忘掉某人）。 */
+    fun identityStore(): RoomIdentityStore = identityStore
+
+    /** 事实存储（公开给维护端 UI 做删除某条记忆）。 */
+    fun factStore(): RoomFactStore = factStore
+
     /** AI 配置快照，供 UI 展示机器人是否具备 AI 能力。 */
     val aiConfig = settings.aiConfig
+
+    /** 记忆系统配置快照，供 UI 展示与编辑。 */
+    val memoryConfig = settings.memoryConfig
 
     /**
      * 最近一次 AI 调用的 token 用量（含缓存命中拆分）。
@@ -124,6 +169,11 @@ class BotController(
         scope.launch {
             val keep = (settings.aiConfig.value.contextTurns * 2).coerceIn(2, 40)
             runCatching { aiHistoryStore.trimAll(keep) }
+        }
+
+        // 启动时收敛记忆系统：每个人事实总量与各范围共享背景条数
+        scope.launch {
+            runCatching { memoryPipeline.trimAll() }
         }
     }
 
@@ -255,10 +305,17 @@ class BotController(
 
         // AI 链路：OpenAI 兼容客户端 + 落库历史 + 应答器。
         // AiConfig 通过 provider 在每条消息处理时现取，改设置无需重启。
+        // 人设解析按 人→群→全局 查库，查不到回退到设置里的系统提示词。
+        val personaResolver =
+            PersonaResolver(
+                store = personaRepository,
+                fallbackProvider = { settings.aiConfig.value.systemPrompt },
+            )
         val aiResponder =
             AiResponder(
                 client = LlmClient(http = http, logger = logger),
                 history = aiHistoryStore,
+                personaResolver = { message -> personaResolver.promptFor(message) },
             )
 
         // 把应答器的最近用量转发到控制器流上，重建机器人时 UI 无需重新订阅
@@ -288,6 +345,7 @@ class BotController(
                 logger = logger,
                 aiResponder = aiResponder,
                 aiConfigProvider = { settings.aiConfig.value },
+                memoryPipeline = memoryPipeline,
             )
 
         // 把网关状态转发到控制器自己的流上，

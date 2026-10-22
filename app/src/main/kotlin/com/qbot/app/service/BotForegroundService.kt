@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
@@ -32,10 +33,13 @@ import kotlinx.coroutines.launch
  * 普通后台服务在 Android 8+ 几分钟内就会被系统停止，
  * 只有前台服务配合常驻通知才能长期存活（用户随时可以在通知栏一键停止）。
  *
- * 三层保险：
+ * 四层保险：
  * 1. **前台服务本身**：[START_STICKY] 让进程被回收后系统会尝试重建；
- * 2. **网络监听**：断网恢复后立刻重连，不必等心跳超时；
- * 3. **看门狗**：定期校验连接是否真的活着，发现异常主动拉起。
+ * 2. **定时复活任务**：进程被整体杀掉后，由 [ResurrectorJobService]
+ *    （JobScheduler 托管）到点把服务重新拉起来；
+ * 3. **网络监听 + 看门狗**：断网恢复 / 连接假死时立刻重连；
+ * 4. **WifiLock + 重连 WakeLock**：防止 WiFi 休眠掐断长连接、
+ *    防止重连窗口期 CPU 休眠把重试拖死。
  */
 class BotForegroundService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -47,8 +51,22 @@ class BotForegroundService : Service() {
     @Volatile
     private var stoppedByUser = false
 
+    /** 本实例是否已记录过启动统计（onStartCommand 可能被多次调用）。 */
+    private var statsRecorded = false
+
+    /** WiFi 锁：部分 ROM 的 WiFi 省电策略会静默断开长连接。 */
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    /** 重连期间的短暂 WakeLock：给握手与鉴权争取 CPU 时间。 */
+    private var reconnectWakeLock: PowerManager.WakeLock? = null
+
+    /** 上一次观察到的连接状态，用于只在状态跃迁时点 WakeLock。 */
+    private var lastObservedState: ConnectionState? = null
+
     override fun onCreate() {
         super.onCreate()
+
+        isAlive = true
 
         controller = (application as BotApplication).controller
         createNotificationChannel()
@@ -62,6 +80,8 @@ class BotForegroundService : Service() {
             android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
         )
 
+        acquireWifiLock()
+
         controller.start()
 
         networkMonitor =
@@ -74,9 +94,12 @@ class BotForegroundService : Service() {
             )
         networkMonitor.start()
 
-        // 状态变化 → 更新常驻通知
+        // 状态变化 → 更新常驻通知；跃迁到连接中时点一下 WakeLock
         scope.launch {
-            controller.status.collect { updateNotification(it) }
+            controller.status.collect { status ->
+                updateNotification(status)
+                onStatusChanged(status)
+            }
         }
 
         startWatchdog()
@@ -91,6 +114,8 @@ class BotForegroundService : Service() {
             ACTION_STOP -> {
                 stoppedByUser = true
                 controller.stop()
+                // 用户显式停止：连定时复活任务一起取消，不然 15 分钟后又被拉起来
+                ResurrectorJobService.cancel(applicationContext)
                 stopForegroundCompat()
                 stopSelf()
                 return START_NOT_STICKY
@@ -99,6 +124,16 @@ class BotForegroundService : Service() {
             ACTION_RESTART -> {
                 controller.restart()
             }
+        }
+
+        // 记录存活统计：同一个服务实例只记第一次，
+        // 之后重复的 start（含定时任务的空唤醒）不再计数。
+        if (!statsRecorded) {
+            statsRecorded = true
+            val source =
+                intent?.getStringExtra(EXTRA_SOURCE)
+                    ?: if (intent == null) SurvivalSource.SYSTEM else SurvivalSource.USER
+            (application as BotApplication).survivalStats.recordStart(source)
         }
 
         // 进程被系统回收后，系统会用 null intent 重建服务：
@@ -123,6 +158,62 @@ class BotForegroundService : Service() {
                 }
             }
         }
+    }
+
+    /**
+     * 状态跃迁到连接类状态时点 WakeLock。
+     *
+     * 重连退避可能把尝试时间推到锁屏后的 Doze 窗口，
+     * 没有 WakeLock 的话定时器与 TCP 握手都会被拖延，
+     * 表现为"锁屏十几分钟后消息才恢复"。
+     * 锁带 15 秒超时自动释放，不会忘释放。
+     */
+    private fun onStatusChanged(status: GatewayStatus) {
+        val state = status.state
+        if (state == lastObservedState) return
+        lastObservedState = state
+
+        val connecting =
+            state == ConnectionState.CONNECTING ||
+                state == ConnectionState.IDENTIFYING ||
+                state == ConnectionState.RECONNECTING
+        if (connecting) {
+            pokeReconnectWakeLock()
+        }
+    }
+
+    private fun acquireWifiLock() {
+        val wifiManager = applicationContext.getSystemService(WifiManager::class.java) ?: return
+        // WIFI_MODE_FULL_HIGH_PERF 在 API 29 起被标记废弃，但国产 ROM 上
+        // 仍然是对抗"WiFi 省电断流"最直接的手段，这里显式压制弃用告警。
+        @Suppress("DEPRECATION")
+        wifiLock =
+            wifiManager
+                .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, WIFI_LOCK_TAG)
+                .also { lock ->
+                    lock.setReferenceCounted(false)
+                    runCatching { lock.acquire() }
+                }
+    }
+
+    private fun pokeReconnectWakeLock() {
+        val powerManager = getSystemService(PowerManager::class.java) ?: return
+        val lock =
+            reconnectWakeLock
+                ?: powerManager
+                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+                    .also { reconnectWakeLock = it }
+        if (!lock.isHeld) {
+            // 超时自动释放：即使回调丢了也不会把 WakeLock 漏到天荒地老
+            lock.acquire(RECONNECT_WAKELOCK_TIMEOUT_MILLIS)
+        }
+    }
+
+    private fun releaseLocks() {
+        runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
+        wifiLock = null
+        runCatching { reconnectWakeLock?.takeIf { it.isHeld }?.release() }
+        reconnectWakeLock = null
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -151,7 +242,9 @@ class BotForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        isAlive = false
         networkMonitor.stop()
+        releaseLocks()
         scope.cancel()
     }
 
@@ -264,11 +357,37 @@ class BotForegroundService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val WATCHDOG_INTERVAL_MILLIS = 60_000L
 
+        /** WakeLock 标签，`adb shell dumpsys power` 里按名字排查 */
+        private const val WIFI_LOCK_TAG = "QBot:websocket"
+        private const val WAKE_LOCK_TAG = "QBot:reconnect"
+
+        /** 重连 WakeLock 的自动释放超时：够完成一次握手+鉴权，又不至于忘释放 */
+        private const val RECONNECT_WAKELOCK_TIMEOUT_MILLIS = 15_000L
+
         private const val ACTION_STOP = "com.qbot.app.action.STOP"
         private const val ACTION_RESTART = "com.qbot.app.action.RESTART"
 
-        fun start(context: Context) {
-            val intent = Intent(context, BotForegroundService::class.java)
+        /** 启动来源的 intent extra，供存活统计使用 */
+        const val EXTRA_SOURCE = "com.qbot.app.extra.SOURCE"
+
+        /**
+         * 服务实例是否活着。
+         *
+         * 供 [ResurrectorJobService] 判断"要不要复活"：
+         * 进程被杀死时这个静态标志随进程一起消失，天然回到 false。
+         */
+        @Volatile
+        var isAlive: Boolean = false
+            private set
+
+        fun start(
+            context: Context,
+            source: String = SurvivalSource.USER,
+        ) {
+            val intent =
+                Intent(context, BotForegroundService::class.java).apply {
+                    putExtra(EXTRA_SOURCE, source)
+                }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
             } else {
