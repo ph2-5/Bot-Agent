@@ -35,6 +35,7 @@ import com.qbot.app.BotApplication
 import com.qbot.app.data.repo.GreetingConfig
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.ScoreWeights
+import kotlin.math.roundToInt
 
 /**
  * 插话与应答：机器人自己决定什么时候说话的参数都在这里。
@@ -296,6 +297,48 @@ fun ChitchatPage(onBack: () -> Unit) {
             HintText(
                 "语言的黑话与谐音层出不穷，内置表不可能穷尽。把群里实际出现的词加进来，" +
                     "「叫名字 + 这些词」才会触发反应。已添加 ${config.insultExtraWords.size}/50 个。",
+            )
+        }
+
+        SectionHeader(
+            "训练与经验",
+            "你标错一次它就学一条；经验按场景归档，同类自动合并",
+        )
+        SettingsCard {
+            var maxLessons by remember(config.maxLessons) {
+                mutableFloatStateOf(config.maxLessons.toFloat())
+            }
+            Text("经验库容量 ${maxLessons.toInt()} 条", style = MaterialTheme.typography.labelMedium)
+            Slider(
+                value = maxLessons,
+                onValueChange = { maxLessons = (it / 10f).roundToInt() * 10f },
+                valueRange = 20f..200f,
+                steps = 17,
+                onValueChangeFinished = {
+                    update(config.copy(maxLessons = maxLessons.toInt().coerceIn(20, 200)))
+                },
+            )
+            HintText("容量只决定能存多少条，不改变每次判断的提示词长度；超出时先淘汰支撑少、最久没用的。")
+
+            var injected by remember(config.maxInjectedLessons) {
+                mutableFloatStateOf(config.maxInjectedLessons.toFloat())
+            }
+            Text("每次判断参考 ${injected.toInt()} 条", style = MaterialTheme.typography.labelMedium)
+            Slider(
+                value = injected,
+                onValueChange = { injected = it },
+                valueRange = 3f..12f,
+                steps = 8,
+                onValueChangeFinished = {
+                    update(
+                        config.copy(maxInjectedLessons = injected.toInt().coerceIn(3, 12)),
+                    )
+                },
+            )
+            HintText(
+                "这一项才影响提示词成本与稳定性。同一类别最多占 " +
+                    "${com.qbot.core.ai.ChimeLesson.MAX_PER_CATEGORY_INJECTED} 条，" +
+                    "避免八条经验全是「别插话」。",
             )
         }
 

@@ -132,7 +132,8 @@ class ChimeReflectionTest {
     fun `反思系统提示词限定字数与格式`() {
         val system = ChimeReflection.buildSystemPrompt()
         assertTrue(system.contains("${ChimeLesson.MAX_TEXT_CHARS} 字"))
-        assertTrue(system.contains("只输出经验文本"))
+        assertTrue("应要求输出 JSON", system.contains("JSON"))
+        assertTrue("应列出固定类别", system.contains("PRIVATE_CHAT"))
     }
 
     // ---------- 内存训练器 ----------
@@ -182,4 +183,92 @@ class ChimeReflectionTest {
         assertNull(ChimeStats(total = 10, reviewed = 0).accuracyPercent)
         assertEquals(50, ChimeStats(total = 10, reviewed = 4, correct = 2).accuracyPercent)
     }
+
+    // ---------- 目录分类 ----------
+
+    @Test
+    fun `按 JSON 解析类别与文本`() {
+        val parsed = ChimeReflection.parse("""{"category":"PRIVATE_CHAT","text":"两人私聊时不要插话"}""")
+        assertNotNull(parsed)
+        assertEquals(LessonCategories.PRIVATE_CHAT, parsed!!.category)
+        assertEquals("两人私聊时不要插话", parsed.text)
+    }
+
+    @Test
+    fun `代码块包裹的 JSON 也能解析`() {
+        val raw = "```json\n{\"category\":\"TIME\",\"text\":\"凌晨两点后不要接话\"}\n```"
+        val parsed = ChimeReflection.parse(raw)
+        assertNotNull(parsed)
+        assertEquals(LessonCategories.TIME, parsed!!.category)
+        assertEquals("凌晨两点后不要接话", parsed.text)
+    }
+
+    @Test
+    fun `纯文本按关键词归类`() {
+        val parsed = ChimeReflection.parse("凌晨两点后不要接话")
+        assertNotNull(parsed)
+        assertEquals(LessonCategories.TIME, parsed!!.category)
+    }
+
+    @Test
+    fun `未知类别归入其他`() {
+        val parsed = ChimeReflection.parse("""{"category":"WHATEVER","text":"有人求助时要接话"}""")
+        assertNotNull(parsed)
+        assertEquals(LessonCategories.OTHER, parsed!!.category)
+    }
+
+    @Test
+    fun `类别归一化忽略大小写与下划线变体`() {
+        assertEquals(LessonCategories.PRIVATE_CHAT, LessonCategories.normalize("private_chat"))
+        assertEquals(LessonCategories.PRIVATE_CHAT, LessonCategories.normalize("Private-Chat"))
+        assertEquals(LessonCategories.OTHER, LessonCategories.normalize(null))
+    }
+
+    @Test
+    fun `归并结果解析 JSON 数组`() {
+        val merged =
+            ChimeReflection.parseMerged(
+                """["两人私聊时不要插话","别人互道晚安时保持安静"]""",
+            )
+        assertEquals(2, merged.size)
+        assertEquals("两人私聊时不要插话", merged.first())
+    }
+
+    @Test
+    fun `同类经验按配额注入`() =
+        runBlocking {
+            val trainer = InMemoryChimeTrainer()
+            repeat(5) {
+                trainer.addLesson(
+                    "私聊场景经验$it",
+                    category = LessonCategories.PRIVATE_CHAT,
+                    supportCount = 10 - it,
+                )
+            }
+            repeat(3) {
+                trainer.addLesson(
+                    "求助场景经验$it",
+                    category = LessonCategories.HELP,
+                    supportCount = 5 - it,
+                )
+            }
+
+            val picked = trainer.lessonsForPrompt("g1", limit = 6)
+            assertEquals(6, picked.size)
+            assertEquals(
+                "同一类最多占 3 条",
+                3,
+                picked.count { it.category == LessonCategories.PRIVATE_CHAT },
+            )
+            assertEquals(3, picked.count { it.category == LessonCategories.HELP })
+        }
+
+    @Test
+    fun `支撑数高的经验排在前面`() =
+        runBlocking {
+            val trainer = InMemoryChimeTrainer()
+            trainer.addLesson("低支撑", category = LessonCategories.HELP, supportCount = 1, updatedAt = 100)
+            trainer.addLesson("高支撑", category = LessonCategories.HELP, supportCount = 9, updatedAt = 1)
+            assertEquals("高支撑", trainer.lessonsForPrompt("g1").first().text)
+        }
 }

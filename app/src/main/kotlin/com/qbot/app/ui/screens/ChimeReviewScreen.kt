@@ -48,6 +48,7 @@ import com.qbot.core.ai.ChimeDecision
 import com.qbot.core.ai.ChimeDecisionRecord
 import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChimeStats
+import com.qbot.core.ai.LessonCategories
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -89,6 +90,7 @@ fun ChimeReviewScreen() {
     val decisions by controller.observeChimeDecisions(groupFilter, 100)
         .collectAsState(initial = emptyList())
     val lessons by controller.observeChimeLessons().collectAsState(initial = emptyList())
+    val chitchat by controller.chitchatConfig.collectAsState()
 
     // 反馈落库后 Flow 会重发，统计随之刷新
     LaunchedEffect(decisions, lessons) {
@@ -204,13 +206,14 @@ fun ChimeReviewScreen() {
         item(key = "lessons-header") {
             Column(modifier = Modifier.padding(top = 12.dp)) {
                 Text(
-                    "经验库（${lessons.size}/${ChimeLesson.MAX_LESSONS}）",
+                    "经验库（${lessons.size}/${chitchat.maxLessons}）",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
                 )
                 Text(
-                    "从你的反馈里学到的判断偏好，每次判断会参考最多 " +
-                        "${ChimeLesson.MAX_INJECTED} 条（本群优先）。可以随时改或删。",
+                    "按场景归档，同类会合并。每次判断参考最多 " +
+                        "${chitchat.maxInjectedLessons} 条（本群优先，同一类不超过 " +
+                        "${ChimeLesson.MAX_PER_CATEGORY_INJECTED} 条）。",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -227,24 +230,37 @@ fun ChimeReviewScreen() {
             }
         }
 
-        items(lessons, key = { "lesson-${it.id}" }) { lesson ->
-            LessonRow(
-                lesson = lesson,
-                groupName = lesson.scopeGroupId?.let { groupNames[it] },
-                onToggle = { enabled ->
-                    scope.launch { controller.setChimeLessonEnabled(lesson.id, enabled) }
-                },
-                onEdit = {
-                    editingText = lesson.text
-                    editingLesson = lesson
-                },
-                onDelete = {
-                    scope.launch {
-                        controller.deleteChimeLesson(lesson.id)
-                        hint = "已删除这条经验"
-                    }
-                },
-            )
+        // 目录式展示：固定类别顺序，每类显示条数与总支撑次数
+        val groupedLessons = lessons.groupBy { it.category }
+        LessonCategories.ALL.forEach { (category, label) ->
+            val catLessons = groupedLessons[category] ?: return@forEach
+            item(key = "cat-$category") {
+                Text(
+                    "$label · ${catLessons.size} 条 · 支撑 ${catLessons.sumOf { it.supportCount }} 次",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+            items(catLessons, key = { "lesson-${it.id}" }) { lesson ->
+                LessonRow(
+                    lesson = lesson,
+                    groupName = lesson.scopeGroupId?.let { groupNames[it] },
+                    onToggle = { enabled ->
+                        scope.launch { controller.setChimeLessonEnabled(lesson.id, enabled) }
+                    },
+                    onEdit = {
+                        editingText = lesson.text
+                        editingLesson = lesson
+                    },
+                    onDelete = {
+                        scope.launch {
+                            controller.deleteChimeLesson(lesson.id)
+                            hint = "已删除这条经验"
+                        }
+                    },
+                )
+            }
         }
     }
 
@@ -500,6 +516,7 @@ private fun LessonRow(
                 Text(
                     buildString {
                         append(groupName ?: "全局")
+                        append(" · 支撑 ${lesson.supportCount} 次")
                         append(" · 命中 ${lesson.hits} 次")
                     },
                     style = MaterialTheme.typography.labelSmall,

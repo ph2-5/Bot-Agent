@@ -73,6 +73,10 @@ class RoomChimeLessonStore(
         dao.updateText(id, text, updatedAt)
     }
 
+    override suspend fun mergeInto(id: Long, text: String, supportDelta: Int, updatedAt: Long) {
+        dao.mergeInto(id, text, supportDelta, updatedAt)
+    }
+
     override suspend fun setEnabled(id: Long, enabled: Boolean) {
         dao.setEnabled(id, enabled)
     }
@@ -80,6 +84,14 @@ class RoomChimeLessonStore(
     override suspend fun delete(id: Long) {
         dao.delete(id)
     }
+
+    override suspend fun deleteMany(ids: Collection<Long>) {
+        if (ids.isEmpty()) return
+        dao.deleteMany(ids.toList())
+    }
+
+    override suspend fun sameCategory(groupId: String?, category: String): List<ChimeLesson> =
+        dao.sameCategory(groupId, category).map { it.toModel() }
 
     override suspend fun bumpHits(ids: Collection<Long>) {
         if (ids.isEmpty()) return
@@ -175,6 +187,8 @@ private fun ChimeLesson.toEntity() =
         enabled = enabled,
         createdAt = createdAt,
         updatedAt = updatedAt,
+        category = category,
+        supportCount = supportCount,
     )
 
 private fun ChimeLessonEntity.toModel() =
@@ -188,4 +202,6 @@ private fun ChimeLessonEntity.toModel() =
         enabled = enabled,
         createdAt = createdAt,
         updatedAt = updatedAt,
+        category = category,
+        supportCount = supportCount,
     )

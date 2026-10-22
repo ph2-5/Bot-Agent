@@ -178,17 +178,22 @@ class LlmClient(
                 .post(payload.toString().toRequestBody("application/json".toMediaType()))
                 .build()
 
+        // OkHttp 的 execute() 是阻塞调用，必须在 IO 线程上跑。
+        // 不能依赖调用方：UI 的协程作用域（测试连接、复盘反馈）就在主线程，
+        // 少了这层 withContext 会直接抛 NetworkOnMainThreadException。
         val body =
-            try {
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        val text = response.body?.string().orEmpty()
-                        throw httpError(response.code, text)
+            withContext(Dispatchers.IO) {
+                try {
+                    client.newCall(request).execute().use { response ->
+                        if (!response.isSuccessful) {
+                            val text = response.body?.string().orEmpty()
+                            throw httpError(response.code, text)
+                        }
+                        response.body?.string() ?: throw LlmException("响应体为空")
                     }
-                    response.body?.string() ?: throw LlmException("响应体为空")
+                } catch (e: IOException) {
+                    throw LlmException("网络异常：${e.message}", cause = e)
                 }
-            } catch (e: IOException) {
-                throw LlmException("网络异常：${e.message}", cause = e)
             }
 
         return parseReply(body)

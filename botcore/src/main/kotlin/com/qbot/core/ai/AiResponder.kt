@@ -209,8 +209,8 @@ class AiResponder(
         /** 插话判断提示词里最多注入多少条用户规则，防止把 system 撑爆 */
         const val MAX_USER_RULES = 10
 
-        /** 每次判断最多注入几条「学到的经验」 */
-        const val MAX_LESSONS = 8
+        /** 每次判断注入经验的硬上限（用户可在设置里调到 3~12） */
+        const val MAX_LESSONS = 12
 
         /** 单条用户规则的字符上限 */
         const val MAX_RULE_CHARS = 100

@@ -35,6 +35,7 @@ import com.qbot.core.ai.ChimeDecisionRecord
 import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChimeReflection
 import com.qbot.core.ai.ChimeStats
+import com.qbot.core.ai.LessonCategories
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.GroupProfile
 import com.qbot.core.ai.LlmClient
@@ -257,7 +258,7 @@ class BotController(
                 return@withLock "已记录，但 AI 未启用，暂时无法生成经验"
             }
 
-            val existing = chimeLessonStore.all()
+            val scope = decision.record.groupId
             val updated =
                 decision.copy(
                     feedback = false,
@@ -275,39 +276,110 @@ class BotController(
                                 ChatMessage("system", ChimeReflection.buildSystemPrompt()),
                                 ChatMessage(
                                     "user",
-                                    ChimeReflection.buildUserPrompt(updated, existing),
+                                    ChimeReflection.buildUserPrompt(updated, chimeLessonStore.all()),
                                 ),
                             ),
                         temperature = 0.3,
-                        maxTokens = 120,
+                        maxTokens = 150,
                     )
                 }.getOrElse {
                     return@withLock "已记录，但经验生成失败：${it.message ?: it::class.simpleName ?: "未知错误"}"
                 }
 
-            val text =
-                ChimeReflection.parseLesson(reply.content)
+            val parsed =
+                ChimeReflection.parse(reply.content)
                     ?: return@withLock "已记录，但模型没给出可用的经验"
 
-            val similar = ChimeReflection.findSimilar(text, existing)
-            if (similar != null && similar.scopeGroupId == decision.record.groupId) {
-                chimeLessonStore.updateText(similar.id, text, now)
-                "已记录，并修正了原来的经验：$text"
+            // 归档到固定类别后，只在该类别里查重：
+            // 同一件事的另一种说法会被改写并累加支撑数，而不是新增一条。
+            val sameCategory = chimeLessonStore.sameCategory(scope, parsed.category)
+            val similar = ChimeReflection.findSimilar(parsed.text, sameCategory)
+            val outcome =
+                if (similar != null) {
+                    chimeLessonStore.mergeInto(similar.id, parsed.text, 1, now)
+                    "已记录，并入「${LessonCategories.label(parsed.category)}」的经验：${parsed.text}"
+                } else {
+                    chimeLessonStore.insert(
+                        ChimeLesson(
+                            text = parsed.text,
+                            source = ChimeLesson.SOURCE_REFLECTION,
+                            scopeGroupId = scope,
+                            fromDecisionId = id,
+                            createdAt = now,
+                            updatedAt = now,
+                            category = parsed.category,
+                            supportCount = 1,
+                        ),
+                    )
+                    "已记录，学到一条「${LessonCategories.label(parsed.category)}」经验：${parsed.text}"
+                }
+
+            // 同类过长就归并（偶发、成本可控），顺便按容量淘汰
+            val merged =
+                runCatching { mergeCategoryIfNeeded(scope, parsed.category, cfg) }.getOrNull()
+            if (merged.isNullOrBlank()) {
+                chimeLessonStore.trim(settings.chitchatConfig.value.maxLessons)
+                outcome
             } else {
-                chimeLessonStore.insert(
-                    ChimeLesson(
-                        text = text,
-                        source = ChimeLesson.SOURCE_REFLECTION,
-                        scopeGroupId = decision.record.groupId,
-                        fromDecisionId = id,
-                        createdAt = now,
-                        updatedAt = now,
-                    ),
-                )
-                chimeLessonStore.trim(ChimeLesson.MAX_LESSONS)
-                "已记录，学到一条新经验：$text"
+                "$outcome\n$merged"
             }
         }
+
+    /**
+     * 同类归并：某类别条数超过上限时，让模型把近义条目压成 ≤3 条。
+     *
+     * 只在「超限」时触发，成本可控；失败保持原样，下次再试。
+     * 合并后支撑数按比例摊到新条目上，保留"这条经验有多可靠"的信息。
+     */
+    private suspend fun mergeCategoryIfNeeded(
+        scopeGroupId: String?,
+        category: String,
+        cfg: AiConfig,
+    ): String? {
+        val maxLessons = settings.chitchatConfig.value.maxLessons
+        val lessons = chimeLessonStore.sameCategory(scopeGroupId, category)
+        if (lessons.size <= ChimeLesson.MAX_PER_CATEGORY) {
+            chimeLessonStore.trim(maxLessons)
+            return null
+        }
+
+        val (system, user) = ChimeReflection.buildMergePrompt(category, lessons)
+        val reply =
+            runCatching {
+                reflectionClient.chat(
+                    baseUrl = cfg.baseUrl,
+                    apiKey = cfg.apiKey,
+                    model = cfg.model,
+                    messages = listOf(ChatMessage("system", system), ChatMessage("user", user)),
+                    temperature = 0.2,
+                    maxTokens = 200,
+                )
+            }.getOrNull() ?: return null
+
+        val merged = ChimeReflection.parseMerged(reply.content)
+        if (merged.isEmpty()) return null
+
+        val now = System.currentTimeMillis()
+        val support = lessons.sumOf { it.supportCount }
+        val hits = lessons.sumOf { it.hits }
+        chimeLessonStore.deleteMany(lessons.map { it.id })
+        merged.forEach { text ->
+            chimeLessonStore.insert(
+                ChimeLesson(
+                    text = text,
+                    source = ChimeLesson.SOURCE_REFLECTION,
+                    scopeGroupId = scopeGroupId,
+                    createdAt = now,
+                    updatedAt = now,
+                    category = category,
+                    supportCount = (support / merged.size).coerceAtLeast(1),
+                    hits = (hits / merged.size).coerceAtLeast(0),
+                ),
+            )
+        }
+        chimeLessonStore.trim(maxLessons)
+        return "并把「${LessonCategories.label(category)}」的 ${lessons.size} 条经验归并成 ${merged.size} 条"
+    }
 
     suspend fun setChimeLessonEnabled(id: Long, enabled: Boolean) {
         chimeLessonStore.setEnabled(id, enabled)
@@ -380,7 +452,9 @@ class BotController(
         scope.launch {
             val before = System.currentTimeMillis() - CHIME_RETENTION_DAYS * 24 * 3600 * 1000
             runCatching { chimeDecisionStore.trim(before, CHIME_MAX_DECISIONS) }
-            runCatching { chimeLessonStore.trim(ChimeLesson.MAX_LESSONS) }
+            runCatching {
+                chimeLessonStore.trim(settings.chitchatConfig.value.maxLessons)
+            }
         }
     }
 
@@ -682,6 +756,8 @@ class BotController(
                             hits = lesson.hits,
                             createdAt = lesson.createdAt,
                             updatedAt = lesson.updatedAt,
+                            category = lesson.category,
+                            supportCount = lesson.supportCount,
                         )
                     },
             )
@@ -805,6 +881,8 @@ class BotController(
                             hits = dto.hits.coerceAtLeast(0),
                             createdAt = created,
                             updatedAt = updated,
+                            category = LessonCategories.normalize(dto.category),
+                            supportCount = dto.supportCount.coerceAtLeast(1),
                         ),
                     )
                 merged +=
@@ -816,10 +894,14 @@ class BotController(
                         hits = dto.hits,
                         createdAt = created,
                         updatedAt = updated,
+                        category = LessonCategories.normalize(dto.category),
+                        supportCount = dto.supportCount.coerceAtLeast(1),
                     )
                 lessonCount++
             }
-            if (lessonCount > 0) chimeLessonStore.trim(ChimeLesson.MAX_LESSONS)
+            if (lessonCount > 0) {
+                chimeLessonStore.trim(settings.chitchatConfig.value.maxLessons)
+            }
             applied++
         }
 

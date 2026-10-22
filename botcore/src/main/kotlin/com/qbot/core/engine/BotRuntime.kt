@@ -6,6 +6,7 @@ import com.qbot.core.ai.AiResponder
 import com.qbot.core.ai.BehaviorContext
 import com.qbot.core.ai.ChimeDecisionRecord
 import com.qbot.core.ai.ChimeTrainer
+import com.qbot.core.ai.LessonCategories
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.ChitchatGate
 import com.qbot.core.ai.ChitchatPolicy
@@ -433,7 +434,10 @@ class BotRuntime(
                             // 经验注入：群级优先、全局兜底；失败不影响判断
                             val lessons =
                                 runCatching {
-                                    chimeTrainer?.lessonsForPrompt(groupId) ?: emptyList()
+                                    chimeTrainer?.lessonsForPrompt(
+                                        groupId,
+                                        config.maxInjectedLessons,
+                                    ) ?: emptyList()
                                 }.getOrDefault(emptyList())
                             val verdict =
                                 runCatching {
@@ -446,7 +450,11 @@ class BotRuntime(
                                         behavior =
                                             BehaviorContext(
                                                 userRules = config.chimeRules,
-                                                lessons = lessons.map { it.text },
+                                                // 带上类别标签，模型能看出这几条各自管什么场景
+                                                lessons =
+                                                    lessons.map {
+                                                        "【${LessonCategories.label(it.category)}】${it.text}"
+                                                    },
                                             ),
                                     )
                                 }.getOrNull()

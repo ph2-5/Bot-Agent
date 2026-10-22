@@ -75,6 +75,10 @@ data class ChimeLessonEntity(
     @ColumnInfo(defaultValue = "1") val enabled: Boolean = true,
     val createdAt: Long,
     val updatedAt: Long,
+    /** 目录类别（固定枚举，见 LessonCategories） */
+    @ColumnInfo(defaultValue = "OTHER") val category: String = "OTHER",
+    /** 被多少条反馈支撑：同类相似反馈累加，用于排序与淘汰 */
+    @ColumnInfo(defaultValue = "1") val supportCount: Int = 1,
 )
 
 @Dao
@@ -151,9 +155,18 @@ interface ChimeLessonDao {
     @Query(
         "SELECT * FROM chime_lessons WHERE enabled = 1 " +
             "AND (scopeGroupId IS NULL OR scopeGroupId = :groupId) " +
-            "ORDER BY (scopeGroupId IS NOT NULL) DESC, updatedAt DESC LIMIT :limit",
+            "ORDER BY (scopeGroupId IS NOT NULL) DESC, supportCount DESC, updatedAt DESC " +
+            "LIMIT :limit",
     )
     suspend fun promptLessons(groupId: String, limit: Int): List<ChimeLessonEntity>
+
+    /** 同一作用域 + 同一类别：入库前用它做合并判断 */
+    @Query(
+        "SELECT * FROM chime_lessons WHERE category = :category AND " +
+            "((:groupId IS NULL AND scopeGroupId IS NULL) OR scopeGroupId = :groupId) " +
+            "ORDER BY supportCount DESC, updatedAt DESC",
+    )
+    suspend fun sameCategory(groupId: String?, category: String): List<ChimeLessonEntity>
 
     @Query("SELECT * FROM chime_lessons WHERE id = :id")
     suspend fun find(id: Long): ChimeLessonEntity?
@@ -167,18 +180,28 @@ interface ChimeLessonDao {
     @Query("UPDATE chime_lessons SET text = :text, updatedAt = :updatedAt WHERE id = :id")
     suspend fun updateText(id: Long, text: String, updatedAt: Long)
 
+    @Query(
+        "UPDATE chime_lessons SET text = :text, " +
+            "supportCount = supportCount + :delta, updatedAt = :updatedAt WHERE id = :id",
+    )
+    suspend fun mergeInto(id: Long, text: String, delta: Int, updatedAt: Long)
+
     @Query("UPDATE chime_lessons SET enabled = :enabled WHERE id = :id")
     suspend fun setEnabled(id: Long, enabled: Boolean)
 
     @Query("DELETE FROM chime_lessons WHERE id = :id")
     suspend fun delete(id: Long)
 
+    @Query("DELETE FROM chime_lessons WHERE id IN (:ids)")
+    suspend fun deleteMany(ids: List<Long>)
+
     @Query("UPDATE chime_lessons SET hits = hits + 1 WHERE id IN (:ids)")
     suspend fun bumpHits(ids: List<Long>)
 
+    /** 容量淘汰：先丢支撑少、最久没更新的，把高价值经验留住 */
     @Query(
         "DELETE FROM chime_lessons WHERE id NOT IN " +
-            "(SELECT id FROM chime_lessons ORDER BY updatedAt DESC LIMIT :keep)",
+            "(SELECT id FROM chime_lessons ORDER BY supportCount DESC, updatedAt DESC LIMIT :keep)",
     )
     suspend fun trimTo(keep: Int)
 }

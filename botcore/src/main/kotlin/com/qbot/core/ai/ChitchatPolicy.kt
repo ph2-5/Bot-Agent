@@ -75,6 +75,15 @@ data class ChitchatConfig(
      * 用户把自己群里实际出现的词加进来，被指名冒犯时的反应才准。
      */
     val insultExtraWords: List<String> = emptyList(),
+    /**
+     * 经验库容量（条）。
+     *
+     * 只影响存储与相似去重池，不改变每次注入的条数——长期使用的群
+     * 会不断积累经验，40 条很快不够；上限 200 防止无限膨胀。
+     */
+    val maxLessons: Int = 80,
+    /** 每次判断注入几条经验（本群优先）。这一项才是提示词成本。 */
+    val maxInjectedLessons: Int = 8,
 )
 
 /**

@@ -13,6 +13,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
+import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.MemoryConfig
 import com.qbot.core.ai.ScoreWeights
@@ -116,6 +117,9 @@ class SettingsRepository(private val context: Context) {
         // 自然语言列表（JSON 数组字符串）
         val CHITCHAT_CHIME_RULES = stringPreferencesKey("chitchat_chime_rules")
         val CHITCHAT_INSULT_WORDS = stringPreferencesKey("chitchat_insult_words")
+        // 训练闭环：经验库容量与每次注入条数
+        val CHITCHAT_MAX_LESSONS = intPreferencesKey("chitchat_max_lessons")
+        val CHITCHAT_MAX_INJECTED = intPreferencesKey("chitchat_max_injected")
     }
 
     private companion object {
@@ -306,6 +310,12 @@ class SettingsRepository(private val context: Context) {
                 ),
             chimeRules = decodeStringList(prefs[Keys.CHITCHAT_CHIME_RULES]),
             insultExtraWords = decodeStringList(prefs[Keys.CHITCHAT_INSULT_WORDS]),
+            maxLessons =
+                (prefs[Keys.CHITCHAT_MAX_LESSONS] ?: defaults.maxLessons)
+                    .coerceIn(ChimeLesson.MIN_LESSONS, ChimeLesson.MAX_LESSONS),
+            maxInjectedLessons =
+                (prefs[Keys.CHITCHAT_MAX_INJECTED] ?: defaults.maxInjectedLessons)
+                    .coerceIn(ChimeLesson.MIN_INJECTED, ChimeLesson.MAX_INJECTED),
         )
     }
 
@@ -336,6 +346,13 @@ class SettingsRepository(private val context: Context) {
                     encodeStringList(config.chimeRules, maxItems = 10, maxLength = 100)
                 prefs[Keys.CHITCHAT_INSULT_WORDS] =
                     encodeStringList(config.insultExtraWords, maxItems = 50, maxLength = 10)
+                prefs[Keys.CHITCHAT_MAX_LESSONS] =
+                    config.maxLessons.coerceIn(ChimeLesson.MIN_LESSONS, ChimeLesson.MAX_LESSONS)
+                prefs[Keys.CHITCHAT_MAX_INJECTED] =
+                    config.maxInjectedLessons.coerceIn(
+                        ChimeLesson.MIN_INJECTED,
+                        ChimeLesson.MAX_INJECTED,
+                    )
             }
         }
     }

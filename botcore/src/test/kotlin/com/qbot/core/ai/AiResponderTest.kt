@@ -462,10 +462,10 @@ class AiResponderTest {
         }
 
     @Test
-    fun `经验注入提示词且最多八条`() =
+    fun `经验注入提示词且最多十二条`() =
         runBlocking {
             enqueueAnswer("YES")
-            val lessons = (1..12).map { "经验编号$it" }
+            val lessons = (1..15).map { "经验编号$it" }
             responder.shouldChimeIn(
                 message("在吗"),
                 config(),
@@ -476,8 +476,8 @@ class AiResponderTest {
 
             val body = server.takeRequest().body.readUtf8()
             assertTrue("应出现经验块", body.contains("从主人反馈中学到的经验"))
-            assertTrue("应注入第 8 条", body.contains("经验编号8"))
-            assertFalse("第 9 条起应被截掉，实际=$body", body.contains("经验编号9"))
+            assertTrue("应注入第 12 条", body.contains("经验编号12"))
+            assertFalse("第 13 条起应被截掉，实际=$body", body.contains("经验编号13"))
         }
 
     @Test

@@ -18,7 +18,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.qbot.app.BotApplication
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun BackupPage(onBack: () -> Unit) {
@@ -36,9 +38,12 @@ fun BackupPage(onBack: () -> Unit) {
             scope.launch {
                 runCatching {
                     val json = controller.exportBackup()
-                    context.contentResolver.openOutputStream(uri)?.use { stream ->
-                        stream.write(json.toByteArray(Charsets.UTF_8))
-                    } ?: error("无法写入所选位置")
+                    // 备份文件可能上百 KB，读写放 IO 线程，别卡 UI
+                    withContext(Dispatchers.IO) {
+                        context.contentResolver.openOutputStream(uri)?.use { stream ->
+                            stream.write(json.toByteArray(Charsets.UTF_8))
+                        } ?: error("无法写入所选位置")
+                    }
                 }.onSuccess {
                     hint = "已导出到所选位置（含密钥，请妥善保管）"
                 }.onFailure { hint = "导出失败：${it.message}" }
@@ -53,9 +58,11 @@ fun BackupPage(onBack: () -> Unit) {
             scope.launch {
                 runCatching {
                     val text =
-                        context.contentResolver.openInputStream(uri)
-                            ?.bufferedReader()?.readText()
-                            ?: error("无法读取所选文件")
+                        withContext(Dispatchers.IO) {
+                            context.contentResolver.openInputStream(uri)
+                                ?.bufferedReader()?.readText()
+                                ?: error("无法读取所选文件")
+                        }
                     controller.importBackup(text)
                 }.onSuccess { hint = it }
                     .onFailure { hint = "导入失败：${it.message}" }

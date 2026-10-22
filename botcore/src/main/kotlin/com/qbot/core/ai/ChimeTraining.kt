@@ -1,8 +1,12 @@
 package com.qbot.core.ai
 
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.map
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * 接话判断的可训练闭环。
@@ -11,6 +15,9 @@ import kotlinx.coroutines.flow.map
  * 每次判断留一条结构化快照 → 主人标记对错 → 把错例反思成一条经验 →
  * 下次判断时把经验注入提示词。效果上等同于「后天训练」，
  * 而且每一条经验都能被查看、编辑、删除，不会变成黑箱。
+ *
+ * 2.1 起经验库从「扁平淡句列表」升级为**带目录的结构**：
+ * 固定类别 + 同类合并 + 每类上限 + 支撑计数，解决「同一类判断散成多条」。
  *
  * 这个文件只定义数据结构与接口，落库在 app 模块（Room），
  * botcore 保持纯 JVM。
@@ -69,8 +76,6 @@ data class ChimeDecision(
         const val SHOULD_SPEAK = "SHOULD_SPEAK"
         const val SHOULD_SILENT = "SHOULD_SILENT"
     }
-
-    val wasCorrect: Boolean? get() = feedback
 }
 
 /** 近 N 天的判断质量统计。 */
@@ -88,6 +93,63 @@ data class ChimeStats(
         get() = if (reviewed == 0) null else correct * 100 / reviewed
 }
 
+/**
+ * 经验目录：固定类别，不让模型自由发挥。
+ *
+ * 自由生成类别很快会漂移成几十个近义词（"私聊"/"两人对话"/"一对一"），
+ * 目录就失去意义了。这里给一组稳定、互斥的类别，模型只能从中选。
+ */
+object LessonCategories {
+    const val PRIVATE_CHAT = "PRIVATE_CHAT"
+    const val COLD_START = "COLD_START"
+    const val WORK = "WORK"
+    const val TIME = "TIME"
+    const val HELP = "HELP"
+    const val HUMOR = "HUMOR"
+    const val CONFLICT = "CONFLICT"
+    const val OTHER = "OTHER"
+
+    /** 顺序即展示顺序：从最常见的场景到兜底。 */
+    val ALL: List<Pair<String, String>> =
+        listOf(
+            PRIVATE_CHAT to "两人对话",
+            COLD_START to "冷场搭话",
+            HELP to "求助提问",
+            WORK to "工作正经",
+            TIME to "时段禁忌",
+            HUMOR to "玩笑边界",
+            CONFLICT to "争执情绪",
+            OTHER to "其他",
+        )
+
+    fun label(id: String?): String =
+        ALL.firstOrNull { it.first == id }?.second ?: "其他"
+
+    /** 模型给的类别可能大小写不一或带解释，归一化到已知值，否则归入其他。 */
+    fun normalize(raw: String?): String {
+        val key = raw?.trim()?.uppercase()?.replace('-', '_')?.replace(' ', '_') ?: return OTHER
+        return if (ALL.any { it.first == key }) key else OTHER
+    }
+
+    /**
+     * 关键词兜底分类。
+     *
+     * 模型输出不合法时（纯文本或类别瞎写）用它猜一个，比一律归入"其他"有用得多。
+     */
+    fun classify(text: String): String =
+        when {
+            listOf("私聊", "两人", "两个人", "一对一", "互相", "对话时").any { text.contains(it) } ->
+                PRIVATE_CHAT
+            listOf("冷场", "没人说话", "没人接", "气氛", "抛话题").any { text.contains(it) } -> COLD_START
+            listOf("工作", "开会", "正经", "业务", "加班").any { text.contains(it) } -> WORK
+            listOf("凌晨", "深夜", "半夜", "早上", "晚上", "时段", "点后").any { text.contains(it) } -> TIME
+            listOf("求助", "提问", "问题", "帮忙", "求解").any { text.contains(it) } -> HELP
+            listOf("玩笑", "梗", "调侃", "幽默", "逗").any { text.contains(it) } -> HUMOR
+            listOf("争", "吵", "骂", "生气", "情绪", "冲突").any { text.contains(it) } -> CONFLICT
+            else -> OTHER
+        }
+}
+
 /** 从反馈里学到的一条经验。 */
 data class ChimeLesson(
     val id: Long = 0,
@@ -101,19 +163,47 @@ data class ChimeLesson(
     val enabled: Boolean = true,
     val createdAt: Long = 0,
     val updatedAt: Long = 0,
+    /** 目录类别（[LessonCategories] 里的常量）。 */
+    val category: String = LessonCategories.OTHER,
+    /** 被多少条反馈支撑：同类相似反馈会累加，用于排序与淘汰。 */
+    val supportCount: Int = 1,
 ) {
     companion object {
         const val SOURCE_REFLECTION = "REFLECTION"
         const val SOURCE_MANUAL = "MANUAL"
 
-        /** 经验库上限：太多了反而互相冲突，也会撑大每次判断的提示词。 */
-        const val MAX_LESSONS = 40
+        /**
+         * 经验库容量：可选范围与默认值。
+         *
+         * 容量只影响存储与相似去重池，不影响每次判断的提示词长度——
+         * 长期使用的群会不断积累，所以默认给到 80，允许调到 200。
+         */
+        const val MIN_LESSONS = 20
+        const val MAX_LESSONS = 200
+        const val DEFAULT_MAX_LESSONS = 80
 
         /** 单条经验字数上限（和反思提示词的要求一致）。 */
         const val MAX_TEXT_CHARS = 40
 
-        /** 每次判断最多注入几条经验。 */
-        const val MAX_INJECTED = 8
+        /**
+         * 每次判断注入几条经验：范围与默认值。
+         *
+         * 这才是真正影响提示词成本与稳定性的参数，默认 8 条。
+         */
+        const val MIN_INJECTED = 3
+        const val MAX_INJECTED = 12
+        const val DEFAULT_INJECTED = 8
+
+        /**
+         * 同一类别的条数上限。
+         *
+         * 超过就触发一次「该类归并」：让模型把同类的多条压成更概括的几条，
+         * 避免「两人私聊」这一个场景散出十几条近义经验。
+         */
+        const val MAX_PER_CATEGORY = 6
+
+        /** 注入时同一类别最多占几条，防止八条经验全是同一件事。 */
+        const val MAX_PER_CATEGORY_INJECTED = 3
     }
 }
 
@@ -153,18 +243,28 @@ interface ChimeLessonStore {
 
     suspend fun all(): List<ChimeLesson>
 
-    /** 注入用：该群专属优先，其次全局；各按更新时间倒序。 */
+    /** 注入用：该群专属优先，其次全局。类别配额在 [ChimeTrainer] 里做。 */
     suspend fun promptLessons(groupId: String, limit: Int): List<ChimeLesson>
 
     suspend fun insert(lesson: ChimeLesson): Long
 
     suspend fun updateText(id: Long, text: String, updatedAt: Long)
 
+    /** 同类命中：改写文本并累加支撑数。 */
+    suspend fun mergeInto(id: Long, text: String, supportDelta: Int, updatedAt: Long)
+
     suspend fun setEnabled(id: Long, enabled: Boolean)
 
     suspend fun delete(id: Long)
 
+    suspend fun deleteMany(ids: Collection<Long>)
+
     suspend fun bumpHits(ids: Collection<Long>)
+
+    suspend fun sameCategory(
+        groupId: String?,
+        category: String,
+    ): List<ChimeLesson>
 
     suspend fun trim(keep: Int)
 }
@@ -175,7 +275,10 @@ interface ChimeLessonStore {
  * Android 侧由两个 Room 仓储组合实现；测试用 [InMemoryChimeTrainer]。
  */
 interface ChimeTrainer : ChimeDecisionSink {
-    suspend fun lessonsForPrompt(groupId: String, limit: Int = ChimeLesson.MAX_INJECTED): List<ChimeLesson>
+    suspend fun lessonsForPrompt(
+        groupId: String,
+        limit: Int = ChimeLesson.DEFAULT_INJECTED,
+    ): List<ChimeLesson>
 
     suspend fun bumpHits(ids: Collection<Long>)
 }
@@ -193,13 +296,27 @@ class InMemoryChimeTrainer : ChimeTrainer {
         records += record
     }
 
-    override suspend fun lessonsForPrompt(groupId: String, limit: Int): List<ChimeLesson> =
-        stored
-            .filter { it.enabled && (it.scopeGroupId == null || it.scopeGroupId == groupId) }
-            .sortedWith(
-                compareByDescending<ChimeLesson> { it.scopeGroupId != null }
-                    .thenByDescending { it.updatedAt },
-            ).take(limit)
+    override suspend fun lessonsForPrompt(groupId: String, limit: Int): List<ChimeLesson> {
+        val sorted =
+            stored
+                .filter { it.enabled && (it.scopeGroupId == null || it.scopeGroupId == groupId) }
+                .sortedWith(
+                    compareByDescending<ChimeLesson> { it.scopeGroupId != null }
+                        .thenByDescending { it.supportCount }
+                        .thenByDescending { it.updatedAt },
+                )
+        // 类别配额：同一类最多占 3 条，避免经验被单一场景占满
+        val perCategory = mutableMapOf<String, Int>()
+        val picked = mutableListOf<ChimeLesson>()
+        for (lesson in sorted) {
+            if (picked.size >= limit) break
+            val used = perCategory[lesson.category] ?: 0
+            if (used >= ChimeLesson.MAX_PER_CATEGORY_INJECTED) continue
+            perCategory[lesson.category] = used + 1
+            picked += lesson
+        }
+        return picked
+    }
 
     override suspend fun bumpHits(ids: Collection<Long>) {
         if (ids.isEmpty()) return
@@ -215,6 +332,8 @@ class InMemoryChimeTrainer : ChimeTrainer {
         scopeGroupId: String? = null,
         enabled: Boolean = true,
         updatedAt: Long = 0,
+        category: String = LessonCategories.OTHER,
+        supportCount: Int = 1,
     ): ChimeLesson {
         val lesson =
             ChimeLesson(
@@ -224,11 +343,19 @@ class InMemoryChimeTrainer : ChimeTrainer {
                 enabled = enabled,
                 createdAt = updatedAt,
                 updatedAt = updatedAt,
+                category = category,
+                supportCount = supportCount,
             )
         stored += lesson
         return lesson
     }
 }
+
+/** 反思解析结果：经验文本 + 目录类别。 */
+data class ParsedLesson(
+    val category: String,
+    val text: String,
+)
 
 /**
  * 反思：把「一次错判 + 主人的纠正」浓缩成一条可复用经验。
@@ -239,14 +366,19 @@ class InMemoryChimeTrainer : ChimeTrainer {
 object ChimeReflection {
     const val MIN_TEXT_CHARS = 4
 
+    private val json = Json { ignoreUnknownKeys = true }
+
     fun buildSystemPrompt(): String =
         "你在帮一个群聊机器人总结经验。用户会给你一次「是否该接话」的判断记录，" +
-            "以及主人对这个判断的纠正。请把它总结成一条以后可以直接照着做的经验。\n" +
-            "要求：\n" +
+            "以及主人对这个判断的纠正。请把它归入一个固定类别，并总结成一条以后可以直接照着做的经验。\n" +
+            "类别只能从下面选一个：\n" +
+            LessonCategories.ALL.joinToString("\n") { "- ${it.first}：${it.second}" } +
+            "\n\n要求：\n" +
             "- 一条经验不超过 ${ChimeLesson.MAX_TEXT_CHARS} 字；\n" +
             "- 用第二人称祈使句，写清「什么场景下该/不该做什么」；\n" +
             "- 只依据这次反馈，不要编造；\n" +
-            "- 只输出经验文本，不要编号、解释、引号或前后缀。"
+            "- 只输出一个 JSON 对象，格式：{\"category\":\"类别\",\"text\":\"经验\"}，" +
+            "不要输出代码块、解释或其它文字。"
 
     fun buildUserPrompt(decision: ChimeDecision, lessons: List<ChimeLesson>): String {
         val r = decision.record
@@ -271,7 +403,9 @@ object ChimeReflection {
         val existing =
             lessons
                 .takeIf { it.isNotEmpty() }
-                ?.joinToString("\n") { "- ${it.text}" }
+                ?.joinToString("\n") {
+                    "- [${LessonCategories.label(it.category)}] ${it.text}"
+                }
                 .orEmpty()
 
         return buildString {
@@ -291,11 +425,30 @@ object ChimeReflection {
                 append("【主人备注】").append(it.take(100)).append("\n")
             }
             if (existing.isNotBlank()) {
-                append("\n【已有经验】（避免重复；如与某条说的是同一件事，直接给出更准确的版本）\n")
+                append("\n【已有经验】（同一类别的会在入库时合并，避免重复；")
+                append("如果这次说的是已有经验的一部分，直接给出更准确的版本即可）\n")
                 append(existing).append("\n")
             }
-            append("\n请输出一条经验。")
+            append("\n请输出 JSON。")
         }
+    }
+
+    /**
+     * 解析模型输出：优先按 JSON 取类别与文本；失败则退回纯文本 + 关键词分类。
+     *
+     * 模型经常不听话（加代码块、加解释、只给一句话），两种路径都要能兜住。
+     */
+    fun parse(raw: String): ParsedLesson? {
+        val cleaned = stripCodeFence(raw).trim()
+        val obj = runCatching { json.parseToJsonElement(cleaned).jsonObject }.getOrNull()
+        val text =
+            obj?.get("text")?.jsonPrimitive?.contentOrNull?.let { normalizeText(it) }
+                ?: parseLesson(cleaned)
+                ?: return null
+        val category =
+            obj?.get("category")?.jsonPrimitive?.contentOrNull?.let { LessonCategories.normalize(it) }
+                ?: LessonCategories.classify(text)
+        return ParsedLesson(category = category, text = text)
     }
 
     /**
@@ -305,13 +458,16 @@ object ChimeReflection {
      */
     fun parseLesson(raw: String): String? {
         val firstLine =
-            raw.lineSequence()
+            stripCodeFence(raw).lineSequence()
                 .map { it.trim() }
                 .firstOrNull { it.isNotBlank() }
                 ?: return null
+        return normalizeText(firstLine)
+    }
 
+    private fun normalizeText(raw: String): String? {
         var text =
-            firstLine
+            raw.trim()
                 .removePrefix("- ")
                 .removePrefix("* ")
                 .removePrefix("· ")
@@ -330,18 +486,33 @@ object ChimeReflection {
         return text.takeIf { it.length >= MIN_TEXT_CHARS }
     }
 
+    private fun stripCodeFence(raw: String): String =
+        raw.trim()
+            .removePrefix("```json")
+            .removePrefix("```JSON")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+
     /**
      * 找一条「说的是同一件事」的旧经验。
      *
      * 用中文 bigram 的重叠系数而不是编辑距离：改几个字的同义表述
      * 重叠度仍然很高，而换一件完全不同的场景几乎不重叠。
+     *
+     * 阈值 0.45 比 1.0 时代宽：调用方已先按类别过滤，同类内再卡 0.6
+     * 会把「两人私聊别插话 / 别人对话时保持安静」这类同义改写漏过去。
      */
-    fun findSimilar(text: String, lessons: List<ChimeLesson>): ChimeLesson? {
+    fun findSimilar(
+        text: String,
+        lessons: List<ChimeLesson>,
+        threshold: Double = 0.45,
+    ): ChimeLesson? {
         val target = bigrams(text)
         if (target.isEmpty()) return null
         return lessons
             .map { it to similarity(target, bigrams(it.text)) }
-            .filter { (_, score) -> score >= 0.6 }
+            .filter { (_, score) -> score >= threshold }
             .maxByOrNull { (_, score) -> score }
             ?.first
     }
@@ -358,4 +529,51 @@ object ChimeReflection {
         if (clean.length < 2) return emptySet()
         return (0 until clean.length - 1).map { clean.substring(it, it + 2) }.toSet()
     }
+
+    // ---------- 同类归并 ----------
+
+    /** 归并提示词：把同一类别的多条经验压成更概括的几条。 */
+    fun buildMergePrompt(
+        category: String,
+        lessons: List<ChimeLesson>,
+    ): Pair<String, String> {
+        val system =
+            "你在整理一个群聊机器人的经验库。下面同一类别（${LessonCategories.label(category)}）" +
+                "有多条经验，其中不少是同一件事的不同说法。请合并去重，保留所有不同场景的信息。\n" +
+                "要求：\n" +
+                "- 输出 1~3 条经验，每条不超过 ${ChimeLesson.MAX_TEXT_CHARS} 字；\n" +
+                "- 第二人称祈使句，写清场景与做法；\n" +
+                "- 只输出 JSON 数组，元素是字符串，例如 [\"经验一\",\"经验二\"]；\n" +
+                "- 不要输出代码块或解释。"
+        val user =
+            lessons.joinToString("\n") { "- ${it.text}（被 ${it.supportCount} 次反馈支撑）" }
+        return system to user
+    }
+
+    /** 解析归并结果：兼容 JSON 数组与逐行文本。 */
+    fun parseMerged(raw: String): List<String> {
+        val cleaned = stripCodeFence(raw).trim()
+        val array = runCatching { json.parseToJsonElement(cleaned).jsonArray }.getOrNull()
+        val texts =
+            if (array != null) {
+                array.mapNotNull { el ->
+                    val prim = runCatching { el.jsonPrimitive.contentOrNull }.getOrNull()
+                    val obj =
+                        runCatching { el.jsonObject.get("text")?.jsonPrimitive?.contentOrNull }
+                            .getOrNull()
+                    (prim ?: obj)?.let { normalizeText(it) }
+                }
+            } else {
+                cleaned.lineSequence()
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .mapNotNull { parseLesson(it) }
+                    .toList()
+            }
+        return texts.distinct().take(3)
+    }
+
+    /** 从未知结构里尽量抠出可用文本（给 app 侧兜底用）。 */
+    fun extractText(element: JsonObject, key: String): String? =
+        runCatching { element[key]?.jsonPrimitive?.contentOrNull }.getOrNull()
 }

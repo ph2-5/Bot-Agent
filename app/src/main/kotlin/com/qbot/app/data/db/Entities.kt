@@ -143,7 +143,7 @@ interface AiHistoryDao {
         ChimeDecisionEntity::class,
         ChimeLessonEntity::class,
     ],
-    version = 7,
+    version = 8,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -394,6 +394,26 @@ abstract class AppDatabase : RoomDatabase() {
                     db.execSQL(
                         "CREATE INDEX IF NOT EXISTS index_chime_lessons_updatedAt" +
                             " ON chime_lessons(updatedAt)",
+                    )
+                }
+            }
+
+        /**
+         * v7 → v8：经验库从扁平淡句升级为带目录（类别 + 支撑计数）。
+         *
+         * 老经验一律归入「其他」，支撑数按 1 计——不影响使用，
+         * 用户可以在复盘页手动改类别或直接删掉重学。
+         */
+        val MIGRATION_7_8 =
+            object : androidx.room.migration.Migration(7, 8) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        "ALTER TABLE chime_lessons ADD COLUMN category TEXT NOT NULL" +
+                            " DEFAULT 'OTHER'",
+                    )
+                    db.execSQL(
+                        "ALTER TABLE chime_lessons ADD COLUMN supportCount INTEGER NOT NULL" +
+                            " DEFAULT 1",
                     )
                 }
             }

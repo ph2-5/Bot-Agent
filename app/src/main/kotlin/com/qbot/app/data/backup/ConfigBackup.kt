@@ -158,4 +158,7 @@ data class LessonBackup(
     val hits: Int = 0,
     @SerialName("created_at") val createdAt: Long = 0,
     @SerialName("updated_at") val updatedAt: Long = 0,
+    /** 2.1 新增：目录类别与支撑次数；旧备份缺字段按「其他 / 1」导入 */
+    val category: String = "OTHER",
+    @SerialName("support_count") val supportCount: Int = 1,
 )
