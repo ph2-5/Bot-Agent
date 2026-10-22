@@ -290,6 +290,57 @@ class AiResponder(
     }
 
     /**
+     * 插话判断：这条消息需要机器人接一句吗？
+     *
+     * 决策漏斗的第三级。只在本地规则通过后调用：maxTokens 很小、
+     * temperature=0，成本远低于一次完整回复，但也不适合对每条消息都跑。
+     *
+     * 判定失败（网络/配置）一律返回 false——宁可少说一句，
+     * 也不要因为判断服务抖动而在群里乱插话。
+     */
+    suspend fun shouldChimeIn(
+        message: IncomingMessage,
+        config: AiConfig,
+        recent: List<RoomMessage>,
+        botName: String?,
+    ): Boolean {
+        val speaker = message.senderName?.takeIf { it.isNotBlank() } ?: "群友"
+        val transcript =
+            recent.takeLast(8).joinToString("\n") { msg ->
+                val who =
+                    msg.senderName?.takeIf { it.isNotBlank() }
+                        ?: if (msg.role == "assistant") (botName ?: "机器人") else "某人"
+                "[$who] ${msg.content.replace("\n", " ").take(60)}"
+            }
+        val system =
+            "你在一个 QQ 群里，判断最后这条消息是否需要你接话。\n" +
+                "只有这几种情况回答 YES：\n" +
+                "1) 有人向你提问或求助；\n" +
+                "2) 话题明显需要别人搭话（冷场、抛问题、征求意见、求推荐）；\n" +
+                "3) 有人说的话明显有误，且你有把握纠正。\n" +
+                "其余情况——两个人在互相聊、与你无关的闲扯、刷屏、单纯感叹——回答 NO。\n" +
+                "插话会显得突兀时就回答 NO。只输出 YES 或 NO，不要解释。"
+        val user =
+            buildString {
+                if (transcript.isNotBlank()) append("最近消息：\n").append(transcript).append("\n\n")
+                append("现在 [").append(speaker).append("] 说：「")
+                    .append(message.content.take(120)).append("」")
+            }
+        val reply =
+            client.chat(
+                baseUrl = config.baseUrl,
+                apiKey = config.apiKey,
+                model = config.model,
+                messages = listOf(ChatMessage("system", system), ChatMessage("user", user)),
+                temperature = 0.0,
+                maxTokens = 8,
+                thinkingType = thinkingParam(config),
+            )
+        val answer = reply.content.trim().uppercase()
+        return answer.startsWith("YES") || answer.startsWith("是")
+    }
+
+    /**
      * 把指令执行结果包装成「人设复述任务」。
      *
      * 指令的执行在本地完成（改名片、删记忆都是数据库操作），

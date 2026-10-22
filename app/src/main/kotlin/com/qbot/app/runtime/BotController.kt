@@ -159,6 +159,9 @@ class BotController(
     /** 加群问候语配置快照，供 UI 展示与编辑。 */
     val greetingConfig = settings.greetingConfig
 
+    /** 群聊参与（插话）配置快照。 */
+    val chitchatConfig = settings.chitchatConfig
+
     /**
      * 最近一次 AI 调用的 token 用量（含缓存命中拆分）。
      *
@@ -377,6 +380,9 @@ class BotController(
                         if (greeting.enabled) greeting.text.trim().takeIf { it.isNotEmpty() } else null
                     }
                 },
+                // 群聊参与：只有群主开了「接收所有消息」才会收到非 @ 消息，
+                // 收到之后要不要接话由这里的配置与 ChitchatPolicy 决定。
+                chitchatConfigProvider = { settings.chitchatConfig.value },
             )
 
         // 把网关状态转发到控制器自己的流上，

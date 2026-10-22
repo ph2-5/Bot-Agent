@@ -157,4 +157,62 @@ class MessageParsingTest {
         assertEquals("", msg.content)
         assertEquals("", msg.cleanText())
     }
+
+    @Test
+    fun `解析群内全量消息并取真实昵称`() {
+        // 官方 GROUP_MESSAGE_CREATE（群主开启「接收所有消息」后推送）
+        val raw =
+            """
+            {
+              "id": "msg-full-1",
+              "group_openid": "group-abc",
+              "author": {
+                "id": "u1",
+                "member_openid": "user-888",
+                "username": "小明",
+                "member_role": "member"
+              },
+              "content": "今晚有人开黑吗",
+              "timestamp": "1700000000",
+              "mentions": []
+            }
+            """.trimIndent()
+
+        val msg = parseIncomingMessage(EventType.GROUP_MESSAGE_CREATE, element(raw))
+
+        assertEquals(MessageKind.GROUP_MESSAGE, msg!!.kind)
+        assertEquals("group-abc", msg.targetId)
+        assertEquals("user-888", msg.senderId)
+        assertEquals("真实昵称应来自 author.username", "小明", msg.senderName)
+        assertEquals("今晚有人开黑吗", msg.content)
+    }
+
+    @Test
+    fun `全量消息缺少昵称时回退为 null`() {
+        val msg =
+            parseIncomingMessage(
+                EventType.GROUP_MESSAGE_CREATE,
+                element("""{"id":"1","group_openid":"g","author":{"member_openid":"u"},"content":"hi","timestamp":"1"}"""),
+            )!!
+        assertNull(msg.senderName)
+    }
+
+    @Test
+    fun `全量与艾特消息共享同一群背景作用域`() {
+        val at =
+            parseIncomingMessage(
+                EventType.GROUP_AT_MESSAGE_CREATE,
+                element("""{"id":"1","group_openid":"g","author":{"member_openid":"u"},"content":"hi","timestamp":"1"}"""),
+            )!!
+        val full =
+            parseIncomingMessage(
+                EventType.GROUP_MESSAGE_CREATE,
+                element("""{"id":"2","group_openid":"g","author":{"member_openid":"u"},"content":"yo","timestamp":"1"}"""),
+            )!!
+        assertEquals(
+            "同一条群背景应同时容纳 @ 消息与普通消息",
+            com.qbot.core.ai.ConversationKeys.room(at),
+            com.qbot.core.ai.ConversationKeys.room(full),
+        )
+    }
 }

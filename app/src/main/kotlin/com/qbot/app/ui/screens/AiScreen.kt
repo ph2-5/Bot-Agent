@@ -48,6 +48,7 @@ import com.qbot.app.BotApplication
 import com.qbot.app.data.repo.GreetingConfig
 import com.qbot.app.data.repo.GroupSummary
 import com.qbot.app.data.repo.observeSummaries
+import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.KnownPerson
 import com.qbot.core.ai.MemoryConfig
 import com.qbot.core.ai.NameSource
@@ -702,6 +703,7 @@ private fun GroupTab() {
     val scope = rememberCoroutineScope()
 
     val greeting by controller.greetingConfig.collectAsState()
+    val chitchat by controller.chitchatConfig.collectAsState()
     val summaries by groupStore.observeSummaries().collectAsState(initial = emptyList())
 
     var expandedGroup by remember { mutableStateOf<String?>(null) }
@@ -716,6 +718,11 @@ private fun GroupTab() {
                 .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        ChitchatCard(
+            config = chitchat,
+            onChange = { app.settings.saveChitchatConfig(it) },
+        )
+
         GreetingCard(
             config = greeting,
             onChange = { app.settings.saveGreetingConfig(it) },
@@ -794,6 +801,105 @@ private fun GroupTab() {
                 }
             },
         )
+    }
+}
+
+/**
+ * 群聊参与卡片。
+ *
+ * 门槛在群主那边：只有群主把机器人的「消息范围」改成获取群内全部消息，
+ * 非 @ 消息才会推过来。所以卡片第一块是授权指引，而不是参数。
+ */
+@Composable
+private fun ChitchatCard(
+    config: ChitchatConfig,
+    onChange: (ChitchatConfig) -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("群聊参与", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+            Text(
+                "授权后机器人能看见群里所有消息，并在合适的时候自己接话；" +
+                    "没授权时它仍然只回复 @ 它的消息。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                ),
+            ) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("群主怎么授权", fontWeight = FontWeight.Medium)
+                    Text(
+                        "QQ 群设置 → 群机器人 → 本机器人资料页 → 把「机器人可获取的群聊消息范围」" +
+                            "改成「获取群内全部消息」。每个群要单独开一次，" +
+                            "关掉时机器人会收到通知并自动停止接话。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            SwitchRow(
+                title = "允许自己接话",
+                desc = "关闭后仍会把群消息记进记忆，但绝不主动发言",
+                checked = config.enabled,
+                onCheckedChange = { onChange(config.copy(enabled = it)) },
+            )
+
+            SwitchRow(
+                title = "插话前让 AI 判断",
+                desc = "更自然，但每条候选消息多一次很小的模型调用",
+                checked = config.aiJudge,
+                onCheckedChange = { onChange(config.copy(aiJudge = it)) },
+                enabled = config.enabled,
+            )
+
+            Text(
+                "冷却 ${config.baseCooldownMillis / 1000} 秒（群里聊得热闹时自动放慢，冷场时加快）",
+                style = MaterialTheme.typography.labelMedium,
+            )
+            Slider(
+                value = (config.baseCooldownMillis / 1000).toFloat(),
+                onValueChange = {
+                    onChange(config.copy(baseCooldownMillis = it.toInt().coerceIn(30, 300) * 1000L))
+                },
+                valueRange = 30f..300f,
+                enabled = config.enabled,
+            )
+
+            Text(
+                "每小时最多接话 ${config.maxPerHour} 次",
+                style = MaterialTheme.typography.labelMedium,
+            )
+            Slider(
+                value = config.maxPerHour.toFloat(),
+                onValueChange = { onChange(config.copy(maxPerHour = it.toInt().coerceIn(1, 60))) },
+                valueRange = 1f..60f,
+                enabled = config.enabled,
+            )
+
+            Text(
+                "候选消息参与概率 ${(config.probability * 100).toInt()}%",
+                style = MaterialTheme.typography.labelMedium,
+            )
+            Slider(
+                value = (config.probability * 100).toFloat(),
+                onValueChange = {
+                    onChange(config.copy(probability = it.toInt().coerceIn(5, 100) / 100.0))
+                },
+                valueRange = 5f..100f,
+                enabled = config.enabled,
+            )
+        }
     }
 }
 

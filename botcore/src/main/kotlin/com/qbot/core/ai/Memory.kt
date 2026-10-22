@@ -255,7 +255,9 @@ object ConversationKeys {
     fun history(message: IncomingMessage): String {
         val sender = message.senderId ?: "anon"
         return when (message.kind) {
-            com.qbot.core.model.MessageKind.GROUP_AT -> "g:${message.targetId}:$sender"
+            com.qbot.core.model.MessageKind.GROUP_AT,
+            com.qbot.core.model.MessageKind.GROUP_MESSAGE,
+            -> "g:${message.targetId}:$sender"
             com.qbot.core.model.MessageKind.C2C -> "u:${message.targetId}"
             com.qbot.core.model.MessageKind.GUILD -> "c:${message.targetId}:$sender"
             com.qbot.core.model.MessageKind.DIRECT -> "d:${message.targetId}:$sender"
@@ -265,7 +267,9 @@ object ConversationKeys {
     /** 共享背景的作用域（不含人）：整个群 / 整个频道 / 单聊会话。 */
     fun room(message: IncomingMessage): String =
         when (message.kind) {
-            com.qbot.core.model.MessageKind.GROUP_AT -> "g:${message.targetId}"
+            com.qbot.core.model.MessageKind.GROUP_AT,
+            com.qbot.core.model.MessageKind.GROUP_MESSAGE,
+            -> "g:${message.targetId}"
             com.qbot.core.model.MessageKind.GUILD -> "c:${message.targetId}"
             com.qbot.core.model.MessageKind.DIRECT -> "d:${message.targetId}"
             com.qbot.core.model.MessageKind.C2C -> "u:${message.targetId}"

@@ -11,6 +11,15 @@ enum class MessageKind {
     /** QQ 群内 @机器人 的消息 */
     GROUP_AT,
 
+    /**
+     * QQ 群内的普通消息（非 @机器人）。
+     *
+     * 只有群主在 QQ 客户端打开机器人的「接收所有消息」后才会推送；
+     * 事件名为 GROUP_MESSAGE_CREATE，与 @ 消息共用订阅位 1<<25。
+     * 它让机器人第一次能"听见"整个群在聊什么。
+     */
+    GROUP_MESSAGE,
+
     /** QQ 消息列表里的单聊消息 */
     C2C,
 
@@ -62,6 +71,15 @@ object EventType {
     const val READY = "READY"
     const val RESUMED = "RESUMED"
     const val GROUP_AT_MESSAGE_CREATE = "GROUP_AT_MESSAGE_CREATE"
+
+    /**
+     * 群内全量消息（含未 @ 机器人的）。
+     *
+     * 官方 wiki：https://bot.qq.com/wiki/develop/api-v2/autogen/event/group_message_create.html
+     * Intent 同为 GROUP_AND_C2C_EVENT (1<<25)；但需要群主在群设置里
+     * 打开「接收所有消息」才会推送，按群独立授权（回调 GROUP_MSG_RECEIVE）。
+     */
+    const val GROUP_MESSAGE_CREATE = "GROUP_MESSAGE_CREATE"
     const val C2C_MESSAGE_CREATE = "C2C_MESSAGE_CREATE"
     const val AT_MESSAGE_CREATE = "AT_MESSAGE_CREATE"
     const val MESSAGE_CREATE = "MESSAGE_CREATE"
@@ -138,6 +156,7 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
     val kind =
         when (eventType) {
             EventType.GROUP_AT_MESSAGE_CREATE -> MessageKind.GROUP_AT
+            EventType.GROUP_MESSAGE_CREATE -> MessageKind.GROUP_MESSAGE
             EventType.C2C_MESSAGE_CREATE -> MessageKind.C2C
             EventType.AT_MESSAGE_CREATE, EventType.MESSAGE_CREATE -> MessageKind.GUILD
             EventType.DIRECT_MESSAGE_CREATE -> MessageKind.DIRECT
@@ -146,7 +165,7 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
 
     val targetId =
         when (kind) {
-            MessageKind.GROUP_AT -> obj.stringOrNull("group_openid")
+            MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE -> obj.stringOrNull("group_openid")
             MessageKind.GUILD -> obj.stringOrNull("channel_id") ?: obj.stringOrNull("guild_id")
             MessageKind.DIRECT -> obj.stringOrNull("guild_id")
             MessageKind.C2C -> obj.nestedStringOrNull("author", "user_openid")
@@ -155,7 +174,7 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
     val senderId =
         when (kind) {
             // 官方 botpy：GroupMessage.author.member_openid（群里每个人的稳定标识）
-            MessageKind.GROUP_AT ->
+            MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE ->
                 obj.nestedStringOrNull("author", "member_openid")
                     ?: obj.stringOrNull("op_member_openid")
                     ?: obj.nestedStringOrNull("author", "user_openid")
@@ -173,6 +192,9 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
     val senderName =
         when (kind) {
             MessageKind.GUILD, MessageKind.DIRECT -> obj.nestedStringOrNull("member", "nick")
+            // 全量群消息的 author.username 是真实 QQ 昵称——
+            // 这是平台唯一主动提供昵称的场景，值得记进身份名录。
+            MessageKind.GROUP_MESSAGE -> obj.nestedStringOrNull("author", "username")
             else -> null
         }
 

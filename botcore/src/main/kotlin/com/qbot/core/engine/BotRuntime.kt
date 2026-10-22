@@ -3,6 +3,9 @@ package com.qbot.core.engine
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.AiResponder
+import com.qbot.core.ai.ChitchatConfig
+import com.qbot.core.ai.ChitchatGate
+import com.qbot.core.ai.ChitchatPolicy
 import com.qbot.core.ai.CommandOutcome
 import com.qbot.core.ai.MemoryPipeline
 import com.qbot.core.api.OpenApi
@@ -17,7 +20,10 @@ import com.qbot.core.util.Logger
 import com.qbot.core.util.NoopLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -77,6 +83,17 @@ class BotRuntime(
      * 因此默认关闭，由用户在维护端显式打开）。
      */
     private val greetingTextProvider: (() -> String?)? = null,
+    /**
+     * 群聊参与（插话）配置提供者。
+     *
+     * 为 null 或 [ChitchatConfig.enabled] 为 false 时，
+     * 非 @ 消息只会被记进群记忆，不会触发任何回复。
+     */
+    private val chitchatConfigProvider: (() -> ChitchatConfig)? = null,
+    /** 插话决策引擎；默认实例即可，测试可注入固定时钟 */
+    private val chitchatPolicy: ChitchatPolicy = ChitchatPolicy(),
+    /** 概率源，测试里可注入固定值 */
+    private val random: () -> Double = { kotlin.random.Random.nextDouble() },
 ) : SimpleGatewayListener() {
     companion object {
         private const val TAG = "Runtime"
@@ -93,6 +110,16 @@ class BotRuntime(
         private set
 
     private var started = false
+
+    /**
+     * 最近处理过的消息 id。
+     *
+     * @ 消息可能同时以 GROUP_AT_MESSAGE_CREATE 与 GROUP_MESSAGE_CREATE 推送，
+     * 用一个小 LRU 去重，避免同一条消息被回复两次。
+     */
+    private val seenMessageIds = ArrayDeque<String>()
+    private val seenMessageIdSet = HashSet<String>()
+    private val seenLock = Any()
 
     /** 启动运行时。会同时拉起网关连接。 */
     fun start() {
@@ -122,6 +149,8 @@ class BotRuntime(
 
     override fun onMessage(message: IncomingMessage) {
         val text = message.cleanText(botId)
+        // @ 消息优先记账：随后到达的同 id 全量事件会被去重挡掉
+        if (message.kind == MessageKind.GROUP_AT) rememberMessage(message.messageId)
 
         // 整条处理链放进协程：身份解析与记忆装载都是挂起函数（要查库），
         // 网关回调线程必须尽快返回，否则会堵塞后续事件读取。
@@ -170,6 +199,14 @@ class BotRuntime(
         message: IncomingMessage,
         text: String,
     ) {
+        // 群内普通消息（非 @）走单独的"旁听"链路：
+        // 先记进群记忆，再由插话策略决定要不要接一句。
+        // 它不进入指令、规则、默认 AI 回复路径——否则群里每句话都会被回。
+        if (message.kind == MessageKind.GROUP_MESSAGE) {
+            handleChitchat(message, text)
+            return
+        }
+
         // 先认出是谁：群聊里每个人有独立的记忆线程与展示名。
         // 解析失败（无记忆管线/未启用）时回退到 senderId 尾段，日志里始终能区分人。
         val label = memoryPipeline?.resolveLabel(message, text)
@@ -220,6 +257,127 @@ class BotRuntime(
 
         // 规则未命中且 AI 未启用/不处理时静默丢弃，避免对每条消息都回一句
         log(LogLevel.DEBUG, TAG, "无匹配规则，忽略")
+    }
+
+    /**
+     * 群内普通消息的"旁听"处理。
+     *
+     * 与 @ 消息链路的区别：
+     * 1. 每条消息都记进群记忆（默认留 200 条）并学习昵称/事实，无论是否回复；
+     * 2. 回复是可选的，由三级漏斗决定：本地规则 → 概率 → AI 判断；
+     * 3. 不进入指令与规则引擎——群里有人随口说「你叫什么」不该触发改名逻辑。
+     */
+    private suspend fun handleChitchat(
+        message: IncomingMessage,
+        text: String,
+    ) {
+        val pipeline = memoryPipeline ?: return
+        val groupId = message.targetId?.takeIf { it.isNotBlank() } ?: return
+        val selfId = botId
+        if (selfId.isBlank()) return
+
+        // 自己的消息不处理
+        if (message.senderId == selfId) return
+        if (text.isBlank()) return
+        if (isMessageSeen(message.messageId)) return
+        rememberMessage(message.messageId)
+
+        // 1) 记忆与画像：不做判断，先记下来。
+        //    @ 机器人的消息也先记——它随后会走 GROUP_AT 链路回复，
+        //    若平台只推全量事件，这一笔就是它唯一的记忆来源。
+        pipeline.recordChitchat(message, text)
+        pipeline.noteGroupActivity(message)
+        pipeline.resolveLabel(message, text)
+
+        // @ 自己的消息交给 @ 链路应答，这里只记不说
+        if (mentionsBot(message, selfId)) return
+
+        val config = chitchatConfigProvider?.invoke() ?: return
+        if (!config.enabled) return
+
+        chitchatPolicy.observe(groupId)
+        val profile = pipeline.groupProfile(groupId) ?: return
+        if (!profile.active) return
+
+        val names = listOfNotNull(profile.botName, botName.takeIf { it.isNotBlank() })
+        val why =
+            when (val gate = chitchatPolicy.gate(groupId, text, names, config)) {
+                is ChitchatGate.Skip -> {
+                    log(LogLevel.VERBOSE, TAG, "群聊消息不接：${gate.reason}")
+                    return
+                }
+
+                is ChitchatGate.Forced -> gate.reason
+
+                is ChitchatGate.Candidate -> {
+                    // 概率过滤：先随机筛掉大部分候选，再问模型，进一步压成本
+                    if (random() > config.probability) {
+                        log(LogLevel.VERBOSE, TAG, "群聊消息不接：概率未命中")
+                        return
+                    }
+                    if (config.aiJudge) {
+                        val aiCfg = aiConfigProvider?.invoke() ?: return
+                        val responder = aiResponder ?: return
+                        if (!aiCfg.enabled || !aiCfg.isReady) return
+                        val recent = pipeline.recentRoomMessages(message, 8)
+                        val should =
+                            runCatching {
+                                responder.shouldChimeIn(message, aiCfg, recent, profile.botName)
+                            }.getOrNull() ?: false
+                        if (!should) {
+                            log(LogLevel.VERBOSE, TAG, "群聊消息不接：AI 判断不需要接话")
+                            return
+                        }
+                    }
+                    "规则 ${gate.score} 分"
+                }
+            }
+
+        // 2) 回复：人设 + 关于此人的事实 + 整个群最近的聊天
+        val aiConfig = aiConfigProvider?.invoke() ?: return
+        val responder = aiResponder ?: return
+        if (!aiConfig.enabled || !aiConfig.isReady) return
+
+        runCatching {
+            val memory = pipeline.buildContext(message, selfId, text)
+            val answer = responder.reply(message, aiConfig, memory)
+            if (answer.isBlank()) return@runCatching
+            sendReply(message, answer)
+            chitchatPolicy.markSpoke(groupId)
+            pipeline.recordExchange(message, text, answer)
+            log(LogLevel.INFO, TAG, "群聊插话（$why，${answer.length} 字）")
+        }.onFailure { t ->
+            logger.e(TAG, "群聊插话失败", t)
+            log(LogLevel.WARN, TAG, "群聊插话失败：${t.message}")
+        }
+    }
+
+    /** 消息里是否 @ 了机器人（全量模式下 @ 消息也可能从这里进来）。 */
+    private fun mentionsBot(
+        message: IncomingMessage,
+        selfId: String,
+    ): Boolean {
+        if (message.content.contains("<@!$selfId>")) return true
+        val mentions = message.raw["mentions"] as? JsonArray ?: return false
+        return mentions.any { el ->
+            (el as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull == selfId
+        }
+    }
+
+    private fun rememberMessage(id: String?) {
+        if (id.isNullOrBlank()) return
+        synchronized(seenLock) {
+            if (!seenMessageIdSet.add(id)) return
+            seenMessageIds.addLast(id)
+            while (seenMessageIds.size > 128) {
+                seenMessageIdSet.remove(seenMessageIds.removeFirst())
+            }
+        }
+    }
+
+    private fun isMessageSeen(id: String?): Boolean {
+        if (id.isNullOrBlank()) return false
+        return synchronized(seenLock) { id in seenMessageIdSet }
     }
 
     /**
@@ -354,7 +512,8 @@ class BotRuntime(
         }
 
         when (message.kind) {
-            MessageKind.GROUP_AT -> api.sendGroupMessage(target, reply, replyMessageId = message.messageId)
+            MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE ->
+                api.sendGroupMessage(target, reply, replyMessageId = message.messageId)
             MessageKind.C2C -> api.sendUserMessage(target, reply, replyMessageId = message.messageId)
             MessageKind.GUILD ->
                 // 频道消息沿用频道 openid 发送，此处退化为按 group 通道处理
@@ -372,7 +531,8 @@ class BotRuntime(
     ) {
         runCatching {
             when (kind) {
-                MessageKind.GROUP_AT, MessageKind.GUILD -> api.sendGroupMessage(targetId, content)
+                MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE, MessageKind.GUILD ->
+                    api.sendGroupMessage(targetId, content)
                 MessageKind.C2C, MessageKind.DIRECT -> api.sendUserMessage(targetId, content)
             }
             log(LogLevel.INFO, TAG, "手动发送成功 → $targetId")

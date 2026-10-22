@@ -128,6 +128,7 @@ class RuleEngineTest {
 
     @Test
     fun `消息类型覆盖全部场景`() {
-        assertEquals(4, MessageKind.entries.size)
+        // 群 @、群普通消息、单聊、频道、频道私信
+        assertEquals(5, MessageKind.entries.size)
     }
 }

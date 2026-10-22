@@ -218,10 +218,13 @@ class MemoryPipelineTest {
     @Test
     fun `共享背景条数被收敛`() =
         runTest {
-            repeat(30) { i ->
+            // 存储按 chitchatRetention（默认 200）保留，注入仍按 roomContextSize（20）
+            repeat(150) { i ->
                 pipeline.recordExchange(message("问$i"), "问$i", "答$i")
             }
-            assertTrue(room.recent("g:group-1", 100).size <= 20)
+            assertTrue("存储不应超过 200 条", room.recent("g:group-1", 500).size <= 200)
+            val ctx = pipeline.buildContext(message("在吗"), "bot", "在吗")
+            assertEquals("注入仍只取 20 条", 20, ctx.roomDigest.size)
         }
 
     @Test
@@ -232,6 +235,50 @@ class MemoryPipelineTest {
             val ctx = p.buildContext(message("在吗"), "bot", "在吗")
             assertTrue(room.recent("g:group-1", 10).isEmpty())
             assertTrue(ctx.roomDigest.isEmpty())
+        }
+
+    // ---------- 全量群消息 ----------
+
+    @Test
+    fun `全量群消息写入群背景并按保留上限截断`() =
+        runTest {
+            val p = newPipeline(MemoryConfig(chitchatRetention = 50))
+            repeat(80) { i ->
+                p.recordChitchat(message("消息$i"), "消息$i")
+            }
+            val digest = room.recent("g:group-1", 200)
+            assertTrue("应只保留 50 条，实际=${digest.size}", digest.size <= 50)
+            assertEquals("应保留最新的", "消息79", digest.last().content)
+        }
+
+    @Test
+    fun `注入时仍按 roomContextSize 截取`() =
+        runTest {
+            val p = newPipeline(MemoryConfig(roomContextSize = 5, chitchatRetention = 50))
+            repeat(20) { i ->
+                clock.tick()
+                p.recordChitchat(message("消息$i"), "消息$i")
+            }
+            val ctx = p.buildContext(message("在吗"), "bot", "在吗")
+            assertEquals("提示词只注入 5 条", 5, ctx.roomDigest.size)
+            assertEquals("存储保留 20 条以上", 20, room.recent("g:group-1", 200).size)
+        }
+
+    @Test
+    fun `全量群消息也会沉淀事实`() =
+        runTest {
+            pipeline.recordChitchat(message("我在备考研究生"), "我在备考研究生")
+            assertTrue(
+                "群里的普通发言也应成为记忆来源",
+                facts.facts("sender-1").any { it.text.contains("备考") },
+            )
+        }
+
+    @Test
+    fun `全量群消息带真实昵称`() =
+        runTest {
+            pipeline.recordChitchat(message("大家好", senderName = "小明"), "大家好")
+            assertEquals("小明", room.recent("g:group-1", 10).last().senderName)
         }
 
     // ---------- 记忆指令 ----------

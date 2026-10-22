@@ -27,6 +27,15 @@ data class MemoryConfig(
      * 但不消耗 API、不依赖 AI 配置，适合只把机器人当工具用的场景。
      */
     val personaRewrite: Boolean = true,
+    /**
+     * 群背景存储上限（条）。
+     *
+     * 与 [roomContextSize] 分工：这个管**存多少**，那个管**注入多少**。
+     * 开启「接收所有消息」后，群里每条消息都会进来，只留 20 条的话
+     * 机器人对"刚才在聊什么"几乎没有记忆，因此默认保留 200 条，
+     * 注入提示词时仍按 [roomContextSize] 截取，不撑爆预算。
+     */
+    val chitchatRetention: Int = 200,
 )
 
 /**
@@ -205,7 +214,7 @@ class MemoryPipeline(
         val config = configProvider()
         if (!config.enabled) return
         val store = groupStore ?: return
-        if (message.kind != MessageKind.GROUP_AT) return
+        if (message.kind != MessageKind.GROUP_AT && message.kind != MessageKind.GROUP_MESSAGE) return
         val groupId = message.targetId?.takeIf { it.isNotBlank() } ?: return
         store.touch(groupId, message.senderId, clock())
     }
@@ -311,7 +320,85 @@ class MemoryPipeline(
                 timestampMillis = now,
             ),
         )
-        roomContext.trim(key, config.roomContextSize)
+        roomContext.trim(key, retention(config))
+    }
+
+    /**
+     * 记录一条群内普通消息（非 @机器人）。
+     *
+     * 只有群主开启「接收所有消息」后才会走这里。它与 [recordExchange] 的区别：
+     * 这是"别人在聊天"，不是"机器人在对话"——只进群背景，不进按人隔离的历史。
+     *
+     * 展示名优先用报文里的真实昵称（全量消息才带 `author.username`），
+     * 没有再查身份名录。
+     */
+    suspend fun recordChitchat(
+        message: IncomingMessage,
+        cleanText: String,
+    ) {
+        val config = configProvider()
+        if (!config.enabled || !config.roomContextEnabled) return
+        if (message.targetId.isNullOrBlank()) return
+        if (cleanText.isBlank()) return
+
+        val key = ConversationKeys.room(message)
+        val senderId = message.senderId
+        roomContext.append(
+            key,
+            RoomMessage(
+                senderId = senderId,
+                senderName =
+                    message.senderName?.takeIf { it.isNotBlank() }
+                        ?: senderId?.let { identities.find(it)?.displayName },
+                role = "user",
+                content = cleanText,
+                timestampMillis = clock(),
+            ),
+        )
+        roomContext.trim(key, retention(config))
+
+        // 顺带学习事实：群里其他人说的「我在考研」「我不吃香菜」同样是记忆来源。
+        // 先跑纯正则抽取，抽不到就直接返回——绝大多数闲聊天不会触发下面的数据库读写。
+        if (config.learnFacts && senderId != null) {
+            val drafts = extractor.extractFacts(cleanText)
+            if (drafts.isNotEmpty()) {
+                val existing = facts.facts(senderId).map { it.text }.toSet()
+                val now = clock()
+                drafts.filter { it.text !in existing }.forEach { draft ->
+                    facts.add(
+                        UserFact(
+                            senderId = senderId,
+                            text = draft.text,
+                            kind = draft.kind,
+                            source = FactSource.EXTRACTED,
+                            updatedAt = now,
+                        ),
+                    )
+                }
+                facts.trimTo(senderId, config.factsPerPerson)
+            }
+        }
+    }
+
+    /** 群背景存储上限：取「注入条数」与「保留条数」的较大者。 */
+    private fun retention(config: MemoryConfig): Int =
+        maxOf(config.roomContextSize, config.chitchatRetention)
+
+    /**
+     * 读取某个范围最近的对话，供插话判断使用。
+     *
+     * 与 [buildContext] 里的 roomDigest 是同一份数据：
+     * 这里单独暴露是因为「该不该接话」的判断发生在组装回复之前，
+     * 又不该为了一次判断把完整上下文（事实/群画像）都装一遍。
+     */
+    suspend fun recentRoomMessages(
+        message: IncomingMessage,
+        limit: Int,
+    ): List<RoomMessage> {
+        val config = configProvider()
+        if (!config.enabled || !config.roomContextEnabled) return emptyList()
+        if (message.targetId.isNullOrBlank()) return emptyList()
+        return roomContext.recent(ConversationKeys.room(message), limit)
     }
 
     /**
@@ -546,7 +633,7 @@ class MemoryPipeline(
     /** 装载群画像摘要（群聊 + 有群档时才非空）。 */
     private suspend fun loadGroupDigest(message: IncomingMessage): GroupDigest? {
         val store = groupStore ?: return null
-        if (message.kind != MessageKind.GROUP_AT) return null
+        if (message.kind != MessageKind.GROUP_AT && message.kind != MessageKind.GROUP_MESSAGE) return null
         val groupId = message.targetId?.takeIf { it.isNotBlank() } ?: return null
         val profile = store.find(groupId) ?: return null
         return GroupDigest(

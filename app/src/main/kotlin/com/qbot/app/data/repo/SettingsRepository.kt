@@ -13,6 +13,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
+import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.MemoryConfig
 import com.qbot.core.ai.ThinkingMode
 import kotlinx.coroutines.CoroutineScope
@@ -90,6 +91,13 @@ class SettingsRepository(private val context: Context) {
         // ---- 群感知 ----
         val GREETING_ENABLED = booleanPreferencesKey("greeting_enabled")
         val GREETING_TEXT = stringPreferencesKey("greeting_text")
+
+        // ---- 群聊参与（插话） ----
+        val CHITCHAT_ENABLED = booleanPreferencesKey("chitchat_enabled")
+        val CHITCHAT_AI_JUDGE = booleanPreferencesKey("chitchat_ai_judge")
+        val CHITCHAT_COOLDOWN_SECONDS = intPreferencesKey("chitchat_cooldown_seconds")
+        val CHITCHAT_MAX_PER_HOUR = intPreferencesKey("chitchat_max_per_hour")
+        val CHITCHAT_PROBABILITY_PERCENT = intPreferencesKey("chitchat_probability_percent")
     }
 
     private companion object {
@@ -167,6 +175,15 @@ class SettingsRepository(private val context: Context) {
     private val _greetingConfig = MutableStateFlow(GreetingConfig())
     val greetingConfig: StateFlow<GreetingConfig> = _greetingConfig.asStateFlow()
 
+    /**
+     * 群聊参与（插话）配置。
+     *
+     * 只有群主在群里给机器人打开「接收所有消息」后才会收到非 @ 消息；
+     * 这个开关决定收到之后要不要接话。
+     */
+    private val _chitchatConfig = MutableStateFlow(ChitchatConfig())
+    val chitchatConfig: StateFlow<ChitchatConfig> = _chitchatConfig.asStateFlow()
+
     init {
         // DataStore 的变更合并进 StateFlow；加密偏好里的 apiKey 每次重新读，
         // 保证用户在设置页改完 Key 后保存即可生效。
@@ -175,6 +192,7 @@ class SettingsRepository(private val context: Context) {
                 _aiConfig.value = readAiConfig(prefs)
                 _memoryConfig.value = readMemoryConfig(prefs)
                 _greetingConfig.value = readGreetingConfig(prefs)
+                _chitchatConfig.value = readChitchatConfig(prefs)
             }
         }
     }
@@ -226,6 +244,36 @@ class SettingsRepository(private val context: Context) {
             context.dataStore.edit { prefs ->
                 prefs[Keys.GREETING_ENABLED] = config.enabled
                 prefs[Keys.GREETING_TEXT] = config.text
+            }
+        }
+    }
+
+    private fun readChitchatConfig(prefs: Preferences): ChitchatConfig {
+        val defaults = ChitchatConfig()
+        return ChitchatConfig(
+            enabled = prefs[Keys.CHITCHAT_ENABLED] ?: defaults.enabled,
+            aiJudge = prefs[Keys.CHITCHAT_AI_JUDGE] ?: defaults.aiJudge,
+            baseCooldownMillis =
+                (prefs[Keys.CHITCHAT_COOLDOWN_SECONDS] ?: (defaults.baseCooldownMillis / 1000).toInt())
+                    .toLong() * 1000,
+            maxPerHour = prefs[Keys.CHITCHAT_MAX_PER_HOUR] ?: defaults.maxPerHour,
+            probability =
+                (prefs[Keys.CHITCHAT_PROBABILITY_PERCENT] ?: (defaults.probability * 100).toInt())
+                    .coerceIn(1, 100) / 100.0,
+        )
+    }
+
+    /** 保存群聊参与（插话）配置。 */
+    fun saveChitchatConfig(config: ChitchatConfig) {
+        _chitchatConfig.value = config
+        scope.launch {
+            context.dataStore.edit { prefs ->
+                prefs[Keys.CHITCHAT_ENABLED] = config.enabled
+                prefs[Keys.CHITCHAT_AI_JUDGE] = config.aiJudge
+                prefs[Keys.CHITCHAT_COOLDOWN_SECONDS] = (config.baseCooldownMillis / 1000).toInt()
+                prefs[Keys.CHITCHAT_MAX_PER_HOUR] = config.maxPerHour
+                prefs[Keys.CHITCHAT_PROBABILITY_PERCENT] =
+                    (config.probability * 100).toInt().coerceIn(1, 100)
             }
         }
     }
