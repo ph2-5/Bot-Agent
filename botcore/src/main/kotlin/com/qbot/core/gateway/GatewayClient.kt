@@ -461,11 +461,11 @@ class GatewayClient(
 
         val sid = sessionId
         if (sid != null) {
-            updateStatus { copy(state = ConnectionState.RESUMING) }
+            updateStatus { copy(state = ConnectionState.RESUMING, intents = currentIntents) }
             send(buildResume("QQBot $token", sid, lastSeq ?: 0))
             logger.i(TAG, "已发送 Resume（session=$sid, seq=$lastSeq）")
         } else {
-            updateStatus { copy(state = ConnectionState.IDENTIFYING) }
+            updateStatus { copy(state = ConnectionState.IDENTIFYING, intents = currentIntents) }
             send(buildIdentify("QQBot $token", currentIntents, listOf(0, 1), properties))
             logger.i(TAG, "已发送 Identify（intents=$currentIntents）")
         }

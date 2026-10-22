@@ -205,11 +205,24 @@ class MemoryPipeline(
         // 群画像：只有群聊且装了这个群的档案才注入
         val groupDigest = loadGroupDigest(message)
 
+        // 引用关系：把它回复的那条原文找出来（在 200 条群背景里按 id 查）
+        val quoted =
+            if (config.roomContextEnabled) {
+                message.quotedMessageId?.let { id ->
+                    roomContext.recent(ConversationKeys.room(message), 200)
+                        .lastOrNull { it.externalId == id }
+                        ?.let { QuotedMessage(senderName = it.senderName, content = it.content) }
+                }
+            } else {
+                null
+            }
+
         return MemoryContext(
             senderLabel = label,
             facts = personFacts,
             roomDigest = digest,
             group = groupDigest,
+            quoted = quoted,
         )
     }
 

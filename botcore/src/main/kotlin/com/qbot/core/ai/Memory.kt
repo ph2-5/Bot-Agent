@@ -250,18 +250,31 @@ class InMemoryRoomContextStore : RoomContextStore {
 }
 
 /**
+ * 被引用的消息（群里的「回复某条」）。
+ *
+ * 指代不明的头号解药：「这个人是傻B」单看无从判断，
+ * 但如果它是在回复某条具体消息，把那条原文一起给模型就清楚了。
+ */
+data class QuotedMessage(
+    val senderName: String?,
+    val content: String,
+)
+
+/**
  * 一条消息的记忆上下文（每次回复前组装）。
  *
  * @param senderLabel 已解析的展示名（回退值保证非空）
  * @param facts 关于这个人的持久事实（注入提示词）
  * @param roomDigest 所在范围的近期对话（注入提示词，群聊才非空）
  * @param group 所在群的画像（机器人群名片、见过多少成员；群聊才非空）
+ * @param quoted 本条消息回复的那条原文（有引用关系时才非空）
  */
 data class MemoryContext(
     val senderLabel: String,
     val facts: List<UserFact> = emptyList(),
     val roomDigest: List<RoomMessage> = emptyList(),
     val group: GroupDigest? = null,
+    val quoted: QuotedMessage? = null,
 )
 
 /**

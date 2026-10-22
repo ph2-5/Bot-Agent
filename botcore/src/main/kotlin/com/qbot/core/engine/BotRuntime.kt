@@ -399,8 +399,11 @@ class BotRuntime(
     ): Boolean {
         if (message.content.contains("<@!$selfId>")) return true
         val mentions = message.raw["mentions"] as? JsonArray ?: return false
+        // 不同事件版本把 id 放在不同字段里，逐个比对
         return mentions.any { el ->
-            (el as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull == selfId
+            val obj = el as? JsonObject ?: return@any false
+            listOf("id", "member_openid", "user_openid", "union_openid")
+                .any { key -> obj[key]?.jsonPrimitive?.contentOrNull == selfId }
         }
     }
 

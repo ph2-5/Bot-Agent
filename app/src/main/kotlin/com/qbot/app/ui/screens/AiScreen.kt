@@ -1010,6 +1010,7 @@ private fun GroupTab() {
         GatewayEventsCard(
             state = gatewayStatus.state.name,
             counts = gatewayStatus.eventCounts,
+            intents = gatewayStatus.intents,
         )
 
         ChitchatCard(
@@ -1121,6 +1122,7 @@ private fun GroupTab() {
 private fun GatewayEventsCard(
     state: String,
     counts: Map<String, Long>,
+    intents: Int,
 ) {
     val atCount = counts["GROUP_AT_MESSAGE_CREATE"] ?: 0L
     val fullCount = counts["GROUP_MESSAGE_CREATE"] ?: 0L
@@ -1134,7 +1136,10 @@ private fun GatewayEventsCard(
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Text("接收诊断", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
-            Text("网关：$state", style = MaterialTheme.typography.labelMedium)
+            Text(
+                "网关：$state · 订阅位：0x${Integer.toHexString(intents).uppercase()}",
+                style = MaterialTheme.typography.labelMedium,
+            )
             Text(
                 "@我消息：$atCount 条 · 普通群消息：$fullCount 条",
                 style = MaterialTheme.typography.labelMedium,

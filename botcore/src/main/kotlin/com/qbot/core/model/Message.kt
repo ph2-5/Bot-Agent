@@ -63,6 +63,14 @@ data class IncomingMessage(
      */
     val senderName: String? = null,
     val timestampMillis: Long,
+    /**
+     * 被引用（回复）的消息 id。
+     *
+     * QQ 群里「回复某条消息」时平台会带 reference_message_id；
+     * 有了它，就能把被引用的原文找出来一起喂给模型——
+     * 这是"指代不明"最有效的解药（「这个人是傻B」+ 被引用的原话）。
+     */
+    val quotedMessageId: String? = null,
     val raw: JsonObject,
 )
 
@@ -208,6 +216,15 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
 
     val content = obj.stringOrNull("content")?.trim().orEmpty()
 
+    // 引用/回复关系：不同事件版本字段名不一致，逐层兜底。
+    val quotedId =
+        obj.stringOrNull("reference_message_id")
+            ?: obj.stringOrNull("ref_msg_id")
+            ?: (obj["message_scene"] as? JsonObject)
+                ?.get("ext")
+                ?.let { it as? JsonObject }
+                ?.stringOrNull("ref_msg_id")
+
     return IncomingMessage(
         kind = kind,
         eventType = eventType,
@@ -217,6 +234,7 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
         senderId = senderId,
         senderName = senderName,
         timestampMillis = if (timestamp > 1_000_000_000_000L) timestamp else timestamp * 1000,
+        quotedMessageId = quotedId,
         raw = obj,
     )
 }
@@ -286,5 +304,7 @@ fun IncomingMessage.cleanText(botId: String = ""): String {
     if (botId.isNotBlank()) {
         text = text.replace("<@!$botId>", "").replace("@$botId", "")
     }
-    return text.replace(Regex("<@!?\\d+>"), "").trim()
+    // 群里的 @ 既可能是纯数字，也可能是 openid 形态，
+    // 因此不限定字符集：任何 <@...> 都剥掉。
+    return text.replace(Regex("<@!?[^>\\s]+>"), "").trim()
 }

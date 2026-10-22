@@ -22,7 +22,14 @@ class PromptAssemblerTest {
         facts: List<UserFact> = emptyList(),
         digest: List<RoomMessage> = emptyList(),
         group: GroupDigest? = null,
-    ) = MemoryContext(senderLabel = label, facts = facts, roomDigest = digest, group = group)
+        quoted: QuotedMessage? = null,
+    ) = MemoryContext(
+        senderLabel = label,
+        facts = facts,
+        roomDigest = digest,
+        group = group,
+        quoted = quoted,
+    )
 
     private fun fact(text: String) = UserFact(senderId = "s", text = text)
 
@@ -358,5 +365,67 @@ class PromptAssemblerTest {
             factsBlock.content.contains("对方现在的名字是「小红」"),
         )
         assertTrue("旧称呼应作废", factsBlock.content.contains("旧称呼一律作废"))
+    }
+
+    @Test
+    fun `群聊常识声明第三方指代规则`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "你是一个脾气不好的群友",
+                memory =
+                    memory(
+                        label = "潮水",
+                        group =
+                            GroupDigest(
+                                groupId = "g",
+                                botName = "潮水啊，我已归来",
+                                seenCount = 10,
+                            ),
+                    ),
+                history = emptyList(),
+                question = "这个人是傻B",
+                tokenBudget = 10_000,
+            )
+
+        val groupBlock = messages.first { it.content.contains("QQ 群里聊天") }
+        assertTrue(
+            "必须写明「你」才指自己",
+            groupBlock.content.contains("「你」才指你"),
+        )
+        assertTrue(
+            "必须要求指代不明时先问",
+            groupBlock.content.contains("先问清楚"),
+        )
+        assertTrue(
+            "必须声明看不到的部分不要编造",
+            groupBlock.content.contains("不要编造"),
+        )
+    }
+
+    @Test
+    fun `被引用的原文会注入并提示指代`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "你是群友",
+                memory =
+                    memory(
+                        label = "潮水",
+                        quoted = QuotedMessage(senderName = "阿远", content = "我刚刚说什么了"),
+                        group =
+                            GroupDigest(
+                                groupId = "g",
+                                botName = "潮水啊，我已归来",
+                                seenCount = 10,
+                            ),
+                    ),
+                history = emptyList(),
+                question = "他刚才说了啥",
+                tokenBudget = 10_000,
+            )
+
+        val quotedBlock = messages.first { it.content.contains("对方正在回复") }
+        assertTrue("应带上被引用的人", quotedBlock.content.contains("「阿远」"))
+        assertTrue("应带上被引用的原文", quotedBlock.content.contains("我刚刚说什么了"))
+        assertTrue("应提示据此判断指代", quotedBlock.content.contains("优先看这条原文"))
     }
 }

@@ -53,6 +53,8 @@ data class GatewayStatus(
      * 而不是接话策略把它过滤掉了。
      */
     val eventCounts: Map<String, Long> = emptyMap(),
+    /** 本次连接实际使用的 intents 位（降级后会变，排障时看它） */
+    val intents: Int = 0,
 ) {
     val isConnected: Boolean
         get() = state == ConnectionState.READY

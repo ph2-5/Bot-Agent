@@ -132,7 +132,27 @@ class PromptAssembler {
             if (!group.proactiveAllowed) {
                 lines += "本群管理员关闭了主动消息，不要发送与当前对话无关的内容。"
             }
+            // 群聊常识：这是"把不是骂自己的话当成骂自己"的直接解药。
+            // 人设自由发挥，但指代规则必须写死，否则模型会把自己代入第三方。
+            lines += "群聊常识：消息里的「你」才指你；「他/她/这个人/那人/楼上/某人」通常指第三方，不要往自己身上套。"
+            lines += "你只能看到 @ 你的消息（以及群主授权后的普通消息），看不到的部分不要编造；" +
+                "对方指代不明时先问清楚，例如「说的是谁啊」。"
             val block = lines.joinToString("\n")
+            result += ChatMessage(role = "system", content = block)
+            remaining -= TokenEstimator.estimate(block)
+        }
+
+        // 2.7) 被引用的原文：指代不明时最有效的一条线索
+        memory?.quoted?.let { quoted ->
+            val who = quoted.senderName?.takeIf { it.isNotBlank() }
+            val block =
+                buildString {
+                    append("对方正在回复")
+                    if (who != null) append("「$who」")
+                    append("的这条消息：")
+                    append(quoted.content.replace("\n", " ").take(120))
+                    append("\n判断「他/这个人/楼上」指的是谁时，优先看这条原文。")
+                }
             result += ChatMessage(role = "system", content = block)
             remaining -= TokenEstimator.estimate(block)
         }

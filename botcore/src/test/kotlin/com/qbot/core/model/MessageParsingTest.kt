@@ -229,4 +229,27 @@ class MessageParsingTest {
             com.qbot.core.ai.ConversationKeys.room(full),
         )
     }
+
+    @Test
+    fun `解析引用消息 id`() {
+        val msg =
+            parseIncomingMessage(
+                EventType.GROUP_MESSAGE_CREATE,
+                element(
+                    """{"id":"m2","group_openid":"g","author":{"member_openid":"u"},""" +
+                        """"content":"他刚才说了啥","timestamp":"1","reference_message_id":"m1"}""",
+                ),
+            )!!
+        assertEquals("m1", msg.quotedMessageId)
+    }
+
+    @Test
+    fun `非数字的 at 标记也会被剥离`() {
+        val msg =
+            parseIncomingMessage(
+                EventType.GROUP_AT_MESSAGE_CREATE,
+                element("""{"id":"1","group_openid":"g","content":"<@!abcDEF123> 你好","timestamp":"1"}"""),
+            )!!
+        assertEquals("你好", msg.cleanText())
+    }
 }
