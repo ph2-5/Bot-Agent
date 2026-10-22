@@ -210,6 +210,21 @@ class BotRuntimeChitchatTest {
         }
     }
 
+    private suspend fun awaitDecision(
+        content: String,
+        contains: String,
+    ) {
+        withTimeout(15_000) {
+            while (
+                room
+                    .recent("g:group-openid", 50)
+                    .none { it.content.contains(content) && it.decision?.contains(contains) == true }
+            ) {
+                delay(50)
+            }
+        }
+    }
+
     @Test
     fun `全量消息写入群背景`() =
         runBlocking {
@@ -234,6 +249,7 @@ class BotRuntimeChitchatTest {
 
             assertTrue("关闭参与后不应发消息，实际：$sentMessages", sentMessages.isEmpty())
             assertTrue("也不该调用模型", llmBodies.isEmpty())
+            awaitDecision("小白你在吗", "未开启")
         }
 
     @Test
@@ -243,6 +259,7 @@ class BotRuntimeChitchatTest {
 
             runtime.onMessage(fullMessage("小白，今晚开黑不"))
             awaitSent(1)
+            awaitDecision("今晚开黑不", "已接话")
 
             assertEquals("应只回一条", 1, sentMessages.size)
             assertTrue("回复应带上模型输出", sentMessages.first().contains("行啊"))

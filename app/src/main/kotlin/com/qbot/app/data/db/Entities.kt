@@ -141,7 +141,7 @@ interface AiHistoryDao {
         GroupEntity::class,
         GroupMemberEntity::class,
     ],
-    version = 5,
+    version = 6,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -299,6 +299,23 @@ abstract class AppDatabase : RoomDatabase() {
                         "CREATE INDEX IF NOT EXISTS index_persona_snapshots_personaId" +
                             " ON persona_snapshots(personaId)",
                     )
+                }
+            }
+
+        /**
+         * v5 → v6：群消息区分「@ 我」与「普通消息」，并回填处理结论。
+         *
+         * room_messages 是纯缓存性质的历史，但老用户已经积累了几百条，
+         * 直接清表不如加列——默认值让老消息一律视为"非 @ 普通消息"。
+         */
+        val MIGRATION_5_6 =
+            object : androidx.room.migration.Migration(5, 6) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        "ALTER TABLE room_messages ADD COLUMN isAt INTEGER NOT NULL DEFAULT 0",
+                    )
+                    db.execSQL("ALTER TABLE room_messages ADD COLUMN externalId TEXT")
+                    db.execSQL("ALTER TABLE room_messages ADD COLUMN decision TEXT")
                 }
             }
     }

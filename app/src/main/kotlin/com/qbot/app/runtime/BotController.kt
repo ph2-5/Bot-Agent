@@ -380,6 +380,12 @@ class BotController(
     suspend fun personaSnapshots(personaId: Long?) =
         personaRepository.snapshots(personaId)
 
+    /** 实时观察某个群收到的消息（维护端「群消息」查看器）。 */
+    fun observeGroupMessages(
+        groupId: String,
+        limit: Int = 200,
+    ) = memoryPipeline.observeGroupMessages(groupId, limit)
+
     private fun build(
         appId: String,
         clientSecret: String,

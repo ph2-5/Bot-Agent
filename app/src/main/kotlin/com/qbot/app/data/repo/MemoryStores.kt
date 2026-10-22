@@ -17,6 +17,7 @@ import com.qbot.core.ai.RoomContextStore
 import com.qbot.core.ai.RoomMessage
 import com.qbot.core.ai.UserFact
 import com.qbot.core.ai.priority
+import kotlinx.coroutines.flow.map
 
 /**
  * 基于 Room 的身份名录实现。
@@ -152,15 +153,7 @@ class RoomSharedContextStore(
         dao
             .recent(scopeKey, limit)
             .asReversed()
-            .map { entity ->
-                RoomMessage(
-                    senderId = entity.senderId,
-                    senderName = entity.senderName,
-                    role = entity.role,
-                    content = entity.content,
-                    timestampMillis = entity.timestampMillis,
-                )
-            }
+            .map { it.toRoomMessage() }
 
     override suspend fun append(
         scopeKey: String,
@@ -174,6 +167,9 @@ class RoomSharedContextStore(
                 role = message.role,
                 content = message.content,
                 timestampMillis = message.timestampMillis,
+                isAt = message.isAt,
+                externalId = message.externalId,
+                decision = message.decision,
             ),
         )
     }
@@ -184,4 +180,33 @@ class RoomSharedContextStore(
     ) {
         dao.trim(scopeKey, keep)
     }
+
+    override suspend fun updateDecision(
+        scopeKey: String,
+        externalId: String,
+        decision: String,
+    ) {
+        dao.updateDecision(scopeKey, externalId, decision)
+    }
+
+    override fun observeRecent(
+        scopeKey: String,
+        limit: Int,
+    ): kotlinx.coroutines.flow.Flow<List<RoomMessage>> =
+        dao.observeRecent(scopeKey, limit).map { list ->
+            // 查询是倒序，转回正序展示
+            list.asReversed().map { it.toRoomMessage() }
+        }
+
+    private fun RoomMessageEntity.toRoomMessage(): RoomMessage =
+        RoomMessage(
+            senderId = senderId,
+            senderName = senderName,
+            role = role,
+            content = content,
+            timestampMillis = timestampMillis,
+            isAt = isAt,
+            externalId = externalId,
+            decision = decision,
+        )
 }

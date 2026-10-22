@@ -106,6 +106,17 @@ data class RoomMessage(
     val role: String,
     val content: String,
     val timestampMillis: Long,
+    /**
+     * 这条消息是否 @ 了机器人。
+     *
+     * 群聊参与的全部判断都只针对非 @ 消息；@ 消息永远走回复链路。
+     * 维护端查看器用它区分两类消息。
+     */
+    val isAt: Boolean = false,
+    /** 平台消息 id，用于回填「这条为什么没回」 */
+    val externalId: String? = null,
+    /** 处理结论：已回复 / 冷却中 / AI 判断不接…… */
+    val decision: String? = null,
 )
 
 /** 共享背景存储。scopeKey 形如 g:群openid / u:用户openid / c:频道id。 */
@@ -117,6 +128,29 @@ interface RoomContextStore {
 
     /** 只保留最近 keep 条 */
     suspend fun trim(scopeKey: String, keep: Int)
+
+    /**
+     * 回填某条消息的处理结论（按平台消息 id 定位）。
+     *
+     * 判断发生在入库之后（冷却、概率、AI 判断都要时间），
+     * 因此先用占位结论入库，出结果后再回填，避免查看器里全是"待定"。
+     */
+    suspend fun updateDecision(
+        scopeKey: String,
+        externalId: String,
+        decision: String,
+    ) = Unit
+
+    /**
+     * 实时观察某个范围的消息（维护端查看群消息用）。
+     *
+     * 默认实现不支持推送，返回空流；数据库实现应返回可随写入更新的 Flow。
+     */
+    fun observeRecent(
+        scopeKey: String,
+        limit: Int,
+    ): kotlinx.coroutines.flow.Flow<List<RoomMessage>> =
+        kotlinx.coroutines.flow.flowOf(emptyList())
 }
 
 /**
@@ -194,6 +228,23 @@ class InMemoryRoomContextStore : RoomContextStore {
         mutex.withLock {
             val list = store[scopeKey] ?: return@withLock
             while (list.size > keep) list.removeAt(0)
+        }
+    }
+
+    override suspend fun updateDecision(
+        scopeKey: String,
+        externalId: String,
+        decision: String,
+    ) {
+        mutex.withLock {
+            val list = store[scopeKey] ?: return@withLock
+            // 从后往前找：同一条消息重复推送时以最后一次为准
+            for (i in list.indices.reversed()) {
+                if (list[i].externalId == externalId) {
+                    list[i] = list[i].copy(decision = decision)
+                    return@withLock
+                }
+            }
         }
     }
 }

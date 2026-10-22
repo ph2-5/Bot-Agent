@@ -127,6 +127,12 @@ data class RoomMessageEntity(
     val role: String,
     val content: String,
     val timestampMillis: Long,
+    /** 是否 @ 了机器人 */
+    val isAt: Boolean = false,
+    /** 平台消息 id（回填结论用） */
+    val externalId: String? = null,
+    /** 处理结论：已回复 / 冷却中 / 概率未命中 / AI 判断不接 */
+    val decision: String? = null,
 )
 
 @Dao
@@ -136,6 +142,17 @@ interface RoomMessageDao {
         scopeKey: String,
         limit: Int,
     ): List<RoomMessageEntity>
+
+    /**
+     * 实时观察某个范围的消息流（维护端「群消息」查看器用）。
+     *
+     * 倒序取最近 N 条，UI 再反转成正序——这样 limit 限制的是"最近"而不是"最早"。
+     */
+    @Query("SELECT * FROM room_messages WHERE scopeKey = :scopeKey ORDER BY id DESC LIMIT :limit")
+    fun observeRecent(
+        scopeKey: String,
+        limit: Int,
+    ): kotlinx.coroutines.flow.Flow<List<RoomMessageEntity>>
 
     @Insert
     suspend fun insert(message: RoomMessageEntity)
@@ -157,6 +174,17 @@ interface RoomMessageDao {
 
     @Query("SELECT DISTINCT scopeKey FROM room_messages")
     suspend fun allScopes(): List<String>
+
+    /** 回填处理结论：判断耗时较长，先入库再更新，查看器才能显示"为什么没回" */
+    @Query(
+        "UPDATE room_messages SET decision = :decision " +
+            "WHERE scopeKey = :scopeKey AND externalId = :externalId",
+    )
+    suspend fun updateDecision(
+        scopeKey: String,
+        externalId: String,
+        decision: String,
+    )
 }
 
 /**

@@ -249,3 +249,11 @@ class ChitchatPolicy(
         return score
     }
 }
+
+/** 供维护端消息查看器展示的一句话结论。 */
+fun ChitchatGate.describe(): String =
+    when (this) {
+        is ChitchatGate.Forced -> "接话：$reason"
+        is ChitchatGate.Candidate -> "候选（规则 $score 分）"
+        is ChitchatGate.Skip -> "不接：$reason"
+    }

@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -56,6 +57,7 @@ import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.Persona
 import com.qbot.core.ai.PersonaSnapshot
 import com.qbot.core.ai.PersonaSnapshotKind
+import com.qbot.core.ai.RoomMessage
 import com.qbot.core.ai.UserFact
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -994,6 +996,7 @@ private fun GroupTab() {
     var expandedGroup by remember { mutableStateOf<String?>(null) }
     var members by remember { mutableStateOf<List<MemberSample>>(emptyList()) }
     var renameTarget by remember { mutableStateOf<GroupSummary?>(null) }
+    var messagesGroup by remember { mutableStateOf<GroupSummary?>(null) }
 
     Column(
         modifier =
@@ -1068,10 +1071,23 @@ private fun GroupTab() {
                 onDelete = {
                     scope.launch { groupStore.delete(group.groupId) }
                 },
+                onShowMessages = { messagesGroup = group },
             )
         }
 
         Spacer(Modifier.height(32.dp))
+    }
+
+    messagesGroup?.let { target ->
+        val messages by
+            controller
+                .observeGroupMessages(target.groupId, limit = 200)
+                .collectAsState(initial = emptyList())
+        GroupMessagesDialog(
+            groupName = target.botName ?: "群 ${target.groupId.take(10)}…",
+            messages = messages,
+            onDismiss = { messagesGroup = null },
+        )
     }
 
     renameTarget?.let { target ->
@@ -1238,6 +1254,114 @@ private fun GreetingCard(
     }
 }
 
+/**
+ * 群消息查看器。
+ *
+ * 展示的就是机器人"听到"的内容（同一条群背景数据），
+ * 用来确认「接收所有消息」是否真的生效，以及它到底看到了哪些话。
+ */
+@Composable
+private fun GroupMessagesDialog(
+    groupName: String,
+    messages: List<RoomMessage>,
+    onDismiss: () -> Unit,
+) {
+    val timeFormat = remember { SimpleDateFormat("HH:mm", Locale.CHINA) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("群消息 · $groupName") },
+        text = {
+            if (messages.isEmpty()) {
+                Text(
+                    "还没有收到这个群的消息。\n\n" +
+                        "1. 确认群主在 QQ 群设置 → 群机器人 → 本机器人资料页，" +
+                        "把「机器人可获取的群聊消息范围」改成「获取群内全部消息」；\n" +
+                        "2. 让群里发几条不带 @ 的消息；\n" +
+                        "3. 回到这里下拉刷新（或重开本页）。\n\n" +
+                        "没有授权时，平台只推送 @ 机器人的消息，这里就只会出现那些。\n" +
+                        "另外「记忆 → 共享群聊背景」需要保持开启，否则消息不会入库。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else {
+                Column(
+                    modifier =
+                        Modifier
+                            .heightIn(max = 460.dp)
+                            .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        "已记录 ${messages.size} 条（@我 ${messages.count { it.role == "user" && it.isAt }} 条 · " +
+                            "普通 ${messages.count { it.role == "user" && !it.isAt }} 条，最新的在最后）",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    messages.forEach { message ->
+                        val fromBot = message.role == "assistant"
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (!fromBot) {
+                                    Text(
+                                        text = if (message.isAt) "＠我" else "普通",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color =
+                                            if (message.isAt) {
+                                                MaterialTheme.colorScheme.error
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            },
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                }
+                                Text(
+                                    text =
+                                        if (fromBot) {
+                                            "机器人"
+                                        } else {
+                                            message.senderName?.takeIf { it.isNotBlank() }
+                                                ?: "群友${message.senderId?.takeLast(4).orEmpty()}"
+                                        },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color =
+                                        if (fromBot) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurface
+                                        },
+                                )
+                                Spacer(Modifier.weight(1f))
+                                Text(
+                                    timeFormat.format(Date(message.timestampMillis)),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Text(
+                                message.content,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            message.decision?.takeIf { it.isNotBlank() }?.let { decision ->
+                                Text(
+                                    "→ $decision",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color =
+                                        if (decision.startsWith("已接话")) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+    )
+}
+
 @Composable
 private fun GroupCard(
     group: GroupSummary,
@@ -1246,6 +1370,7 @@ private fun GroupCard(
     onToggle: () -> Unit,
     onRename: () -> Unit,
     onDelete: () -> Unit,
+    onShowMessages: () -> Unit = {},
 ) {
     val timeFormat = remember { SimpleDateFormat("MM-dd HH:mm", Locale.CHINA) }
     Card(
@@ -1282,6 +1407,7 @@ private fun GroupCard(
                             },
                     )
                 }
+                TextButton(onClick = onShowMessages) { Text("消息") }
                 IconButton(onClick = onRename) {
                     Icon(Icons.Default.Edit, contentDescription = "改群名片")
                 }

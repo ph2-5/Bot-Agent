@@ -8,6 +8,7 @@ import com.qbot.core.ai.ChitchatGate
 import com.qbot.core.ai.ChitchatPolicy
 import com.qbot.core.ai.CommandOutcome
 import com.qbot.core.ai.MemoryPipeline
+import com.qbot.core.ai.describe
 import com.qbot.core.api.OpenApi
 import com.qbot.core.gateway.GatewayClient
 import com.qbot.core.gateway.SimpleGatewayListener
@@ -286,62 +287,93 @@ class BotRuntime(
         if (isMessageSeen(message.messageId)) return
         rememberMessage(message.messageId)
 
-        // 1) 记忆与画像：不做判断，先记下来。
-        //    @ 机器人的消息也先记——它随后会走 GROUP_AT 链路回复，
-        //    若平台只推全量事件，这一笔就是它唯一的记忆来源。
-        pipeline.recordChitchat(message, text)
+        // 1) 先判断，再带着结论入库。
+        //    这样维护端的群消息查看器能直接看到"这条为什么没回"，
+        //    而不是只有一句"收到了"。
+        val addressed = mentionsBot(message, selfId)
+        val chitchatConfig =
+            if (addressed) null else chitchatConfigProvider?.invoke()?.takeIf { it.enabled }
+        val profile =
+            if (addressed || chitchatConfig == null) {
+                null
+            } else {
+                pipeline.groupProfile(groupId)
+            }
+
+        val gate =
+            when {
+                addressed -> ChitchatGate.Skip("@ 了机器人，交给 @ 链路")
+                chitchatConfig == null -> ChitchatGate.Skip("群聊参与未开启")
+                profile == null || !profile.active -> ChitchatGate.Skip("群档案不可用")
+                else -> {
+                    // 活跃度统计对所有消息生效（热群/冷场的自适应依赖它）
+                    chitchatPolicy.observe(groupId)
+                    val names = listOfNotNull(profile.botName, botName.takeIf { it.isNotBlank() })
+                    chitchatPolicy.gate(groupId, text, names, chitchatConfig)
+                }
+            }
+
+        pipeline.recordChitchat(
+            message = message,
+            cleanText = text,
+            isAt = addressed,
+            decision = gate.describe(),
+        )
         pipeline.noteGroupActivity(message)
         pipeline.resolveLabel(message, text)
         learnBotName(message, selfId)
 
         // @ 自己的消息交给 @ 链路应答，这里只记不说
-        if (mentionsBot(message, selfId)) return
+        if (addressed) return
 
-        val config = chitchatConfigProvider?.invoke() ?: return
-        if (!config.enabled) return
-
-        chitchatPolicy.observe(groupId)
-        val profile = pipeline.groupProfile(groupId) ?: return
-        if (!profile.active) return
-
-        val names = listOfNotNull(profile.botName, botName.takeIf { it.isNotBlank() })
+        // 2) 三级漏斗的后两级
+        val config = chitchatConfig ?: return
         val why =
-            when (val gate = chitchatPolicy.gate(groupId, text, names, config)) {
+            when (val current = gate) {
                 is ChitchatGate.Skip -> {
-                    log(LogLevel.VERBOSE, TAG, "群聊消息不接：${gate.reason}")
+                    log(LogLevel.VERBOSE, TAG, "群聊消息不接：${current.reason}")
                     return
                 }
 
-                is ChitchatGate.Forced -> gate.reason
+                is ChitchatGate.Forced -> current.reason
 
                 is ChitchatGate.Candidate -> {
-                    // 概率过滤：先随机筛掉大部分候选，再问模型，进一步压成本
                     if (random() > config.probability) {
+                        pipeline.markChitchatDecision(message, "不接：概率未命中")
                         log(LogLevel.VERBOSE, TAG, "群聊消息不接：概率未命中")
                         return
                     }
                     if (config.aiJudge) {
-                        val aiCfg = aiConfigProvider?.invoke() ?: return
-                        val responder = aiResponder ?: return
-                        if (!aiCfg.enabled || !aiCfg.isReady) return
+                        val aiCfg = aiConfigProvider?.invoke()
+                        val responder = aiResponder
+                        if (aiCfg == null || responder == null ||
+                            !aiCfg.enabled || !aiCfg.isReady
+                        ) {
+                            pipeline.markChitchatDecision(message, "不接：AI 未配置")
+                            return
+                        }
                         val recent = pipeline.recentRoomMessages(message, 8)
                         val should =
                             runCatching {
-                                responder.shouldChimeIn(message, aiCfg, recent, profile.botName)
+                                responder.shouldChimeIn(message, aiCfg, recent, profile?.botName)
                             }.getOrNull() ?: false
                         if (!should) {
+                            pipeline.markChitchatDecision(message, "不接：AI 判断不需要接话")
                             log(LogLevel.VERBOSE, TAG, "群聊消息不接：AI 判断不需要接话")
                             return
                         }
                     }
-                    "规则 ${gate.score} 分"
+                    "规则 ${current.score} 分"
                 }
             }
 
-        // 2) 回复：人设 + 关于此人的事实 + 整个群最近的聊天
+        // 3) 回复：人设 + 关于此人的事实 + 整个群最近的聊天
         val aiConfig = aiConfigProvider?.invoke() ?: return
         val responder = aiResponder ?: return
-        if (!aiConfig.enabled || !aiConfig.isReady) return
+        if (!aiConfig.enabled || !aiConfig.isReady) {
+            pipeline.markChitchatDecision(message, "不接：AI 未配置")
+            return
+        }
 
         runCatching {
             val memory = pipeline.buildContext(message, selfId, text)
@@ -349,9 +381,12 @@ class BotRuntime(
             if (answer.isBlank()) return@runCatching
             sendReply(message, answer)
             chitchatPolicy.markSpoke(groupId)
-            pipeline.recordExchange(message, text, answer)
+            // 用户那条已经由 recordChitchat 写过，这里只补机器人这一条
+            pipeline.recordChitchatAnswer(message, answer)
+            pipeline.markChitchatDecision(message, "已接话（$why）")
             log(LogLevel.INFO, TAG, "群聊插话（$why，${answer.length} 字）")
         }.onFailure { t ->
+            pipeline.markChitchatDecision(message, "不接：回复失败")
             logger.e(TAG, "群聊插话失败", t)
             log(LogLevel.WARN, TAG, "群聊插话失败：${t.message}")
         }

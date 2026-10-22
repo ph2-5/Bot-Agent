@@ -317,6 +317,9 @@ class MemoryPipeline(
                 role = "user",
                 content = cleanText,
                 timestampMillis = now,
+                isAt = message.kind == MessageKind.GROUP_AT,
+                externalId = message.messageId,
+                decision = "已回复",
             ),
         )
         roomContext.append(
@@ -344,6 +347,8 @@ class MemoryPipeline(
     suspend fun recordChitchat(
         message: IncomingMessage,
         cleanText: String,
+        isAt: Boolean = message.kind == MessageKind.GROUP_AT,
+        decision: String? = null,
     ) {
         val config = configProvider()
         if (!config.enabled || !config.roomContextEnabled) return
@@ -362,6 +367,9 @@ class MemoryPipeline(
                 role = "user",
                 content = cleanText,
                 timestampMillis = clock(),
+                isAt = isAt,
+                externalId = message.messageId,
+                decision = decision,
             ),
         )
         roomContext.trim(key, retention(config))
@@ -387,6 +395,44 @@ class MemoryPipeline(
                 facts.trimTo(senderId, config.factsPerPerson)
             }
         }
+    }
+
+    /**
+     * 记录机器人对一条群消息的回复（只写 assistant 那一条）。
+     *
+     * 与 [recordExchange] 的区别：群消息的 user 部分已经由 [recordChitchat] 写过，
+     * 再调 recordExchange 会出现两条一模一样的用户发言。
+     */
+    suspend fun recordChitchatAnswer(
+        message: IncomingMessage,
+        answer: String,
+    ) {
+        val config = configProvider()
+        if (!config.enabled || !config.roomContextEnabled) return
+        if (message.targetId.isNullOrBlank() || answer.isBlank()) return
+        val key = ConversationKeys.room(message)
+        roomContext.append(
+            key,
+            RoomMessage(
+                senderId = null,
+                senderName = null,
+                role = "assistant",
+                content = answer,
+                timestampMillis = clock(),
+            ),
+        )
+        roomContext.trim(key, retention(config))
+    }
+
+    /** 回填一条群消息的处理结论（"为什么没回"）。 */
+    suspend fun markChitchatDecision(
+        message: IncomingMessage,
+        decision: String,
+    ) {
+        val config = configProvider()
+        if (!config.enabled || !config.roomContextEnabled) return
+        val externalId = message.messageId ?: return
+        roomContext.updateDecision(ConversationKeys.room(message), externalId, decision)
     }
 
     /** 群背景存储上限：取「注入条数」与「保留条数」的较大者。 */
@@ -419,6 +465,17 @@ class MemoryPipeline(
         if (!config.enabled || !config.roomContextEnabled) return emptyList()
         return roomContext.recent(ConversationKeys.groupRoom(groupId), limit)
     }
+
+    /**
+     * 实时观察某个群的消息流（维护端「群消息」查看器）。
+     *
+     * 数据就是机器人用来理解群氛围的同一份群背景——看到的就是它"听到"的。
+     */
+    fun observeGroupMessages(
+        groupId: String,
+        limit: Int,
+    ): kotlinx.coroutines.flow.Flow<List<RoomMessage>> =
+        roomContext.observeRecent(ConversationKeys.groupRoom(groupId), limit)
 
     /**
      * 记忆/群管理指令拦截。

@@ -6,6 +6,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -279,6 +280,51 @@ class MemoryPipelineTest {
         runTest {
             pipeline.recordChitchat(message("大家好", senderName = "小明"), "大家好")
             assertEquals("小明", room.recent("g:group-1", 10).last().senderName)
+        }
+
+    @Test
+    fun `全量消息记录 at 标记与处理结论`() =
+        runTest {
+            pipeline.recordChitchat(
+                message("今晚开黑吗"),
+                "今晚开黑吗",
+                isAt = false,
+                decision = "不接：冷却中（45 秒）",
+            )
+            val user = room.recent("g:group-1", 10).last()
+            assertFalse("普通群消息不应标成 @", user.isAt)
+            assertEquals("不接：冷却中（45 秒）", user.decision)
+        }
+
+    @Test
+    fun `处理结论可以按消息 id 回填`() =
+        runTest {
+            pipeline.recordChitchat(message("在吗"), "在吗", decision = "候选（规则 40 分）")
+            pipeline.markChitchatDecision(message("在吗"), "已接话（规则 40 分）")
+
+            val user = room.recent("g:group-1", 10).last()
+            assertEquals("已接话（规则 40 分）", user.decision)
+        }
+
+    @Test
+    fun `艾特消息在群背景里带 at 标记`() =
+        runTest {
+            pipeline.recordExchange(message("你好"), "你好", "你好呀")
+
+            val user = room.recent("g:group-1", 10).first { it.role == "user" }
+            assertTrue("@ 消息应带标记", user.isAt)
+            assertEquals("已回复", user.decision)
+        }
+
+    @Test
+    fun `群聊回复只补机器人那一条不重复用户消息`() =
+        runTest {
+            pipeline.recordChitchat(message("在吗"), "在吗", decision = "候选")
+            pipeline.recordChitchatAnswer(message("在吗"), "在的")
+
+            val digest = room.recent("g:group-1", 10)
+            assertEquals("不应出现两条用户消息", 1, digest.count { it.role == "user" })
+            assertEquals(1, digest.count { it.role == "assistant" })
         }
 
     // ---------- 记忆指令 ----------
