@@ -1158,11 +1158,13 @@ private fun GatewayEventsCard(
                         ) {
                             Text("只收到 @ 消息", fontWeight = FontWeight.Medium)
                             Text(
-                                "说明「群消息」事件没有推过来——两处都要打开，缺一个都收不到：\n" +
-                                    "1. 开放平台 → 开发设置 → 事件订阅 → 勾选群消息（GROUP_MESSAGE_CREATE）；\n" +
-                                    "2. QQ 群设置 → 群机器人 → 本机器人资料页 → " +
+                                "说明「群消息」事件没有推过来——三处都要对上，缺一个都收不到：\n" +
+                                    "1. 开放平台 → 开发设置 → 事件订阅与回调 → " +
+                                    "接入方式必须选「WebSocket」（不是 Webhook；本 App 没有公网回调地址）；\n" +
+                                    "2. 同一页的接收事件配置选「全部接收」；\n" +
+                                    "3. QQ 群设置 → 群机器人 → 本机器人资料页 → " +
                                     "「机器人可获取的群聊消息范围」改成「获取群内全部消息」。\n" +
-                                    "改完后重启机器人的连接，再让群里发几条不带 @ 的消息。",
+                                    "改完后停止再启动机器人，再让群里发几条不带 @ 的消息。",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -1171,7 +1173,9 @@ private fun GatewayEventsCard(
 
                 atCount == 0L && fullCount == 0L ->
                     Text(
-                        "还没收到任何群消息。先确认机器人已进群，并在群里 @ 它一次。",
+                        "还没收到任何群消息。先确认开放平台「事件订阅与回调」的接入方式是 " +
+                            "WebSocket（选了 Webhook 且没填地址时，会导致什么都收不到），" +
+                            "再确认机器人已进群并在群里 @ 它一次。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
