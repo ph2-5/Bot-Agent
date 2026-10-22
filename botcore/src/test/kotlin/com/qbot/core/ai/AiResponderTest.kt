@@ -41,6 +41,7 @@ class AiResponderTest {
         thinkingMode: ThinkingMode = ThinkingMode.DISABLED,
         baseUrl: String? = null,
         model: String = "deepseek-chat",
+        maxTokens: Int = AiConfig().maxTokens,
     ) = AiConfig(
         enabled = enabled,
         baseUrl = baseUrl ?: server.url("/").toString(),
@@ -49,6 +50,7 @@ class AiResponderTest {
         mode = mode,
         contextTokenBudget = contextTokenBudget,
         thinkingMode = thinkingMode,
+        maxTokens = maxTokens,
     )
 
     private fun message(
@@ -525,5 +527,43 @@ class AiResponderTest {
             assertTrue("用户消息应带相对时间", body.contains("[小明 · 3 分钟前]"))
             assertTrue("应告知上次发言时间", body.contains("你上次在这个群发言是1 分钟前"))
             assertTrue("应给出判断方法提示", body.contains("判断前先读上面的对话"))
+        }
+
+    @Test
+    fun `判断被输出额度截断时放宽额度重试`() =
+        runBlocking {
+            // 第一次：思考过程吃光 40 token，正文为空、finish=length
+            server.enqueue(
+                MockResponse().setBody(
+                    """{"choices":[{"message":{"content":"","reasoning_content":"让我想想"},
+                    "finish_reason":"length"}]}""".trimIndent(),
+                ),
+            )
+            // 第二次：额度放宽后正常给出结论
+            enqueueAnswer("YES\n有人提问")
+
+            val verdict =
+                responder.shouldChimeIn(message("这个怎么弄"), config(), emptyList(), "小白")
+
+            assertTrue("重试后应拿到结论", verdict.should)
+            assertEquals("应恰好调用两次模型", 2, server.requestCount)
+        }
+
+    @Test
+    fun `判断的输出额度与设置里的单次生成上限对齐`() =
+        runBlocking {
+            enqueueAnswer("NO")
+            responder.shouldChimeIn(
+                message("随便聊聊"),
+                config(maxTokens = 500),
+                emptyList(),
+                "小白",
+            )
+
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue(
+                "应直接使用设置里的额度，不在代码里另立数字，实际=$body",
+                body.contains("\"max_tokens\":500"),
+            )
         }
 }

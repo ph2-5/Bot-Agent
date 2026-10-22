@@ -220,6 +220,8 @@ class AiResponder(
 
         /** 判断理由的字符上限 */
         const val MAX_REASON_CHARS = 40
+
+
     }
 
     // 同一会话串行处理：群聊里多人连问时，避免并发请求把历史顺序打乱。
@@ -401,18 +403,30 @@ class AiResponder(
                 append("现在 [").append(speaker).append("] 说：「")
                     .append(message.content.take(120)).append("」")
             }
-        val reply =
+        suspend fun ask(tokens: Int) =
             client.chat(
                 baseUrl = config.baseUrl,
                 apiKey = config.apiKey,
                 model = config.model,
                 messages = listOf(ChatMessage("system", system), ChatMessage("user", user)),
                 temperature = 0.0,
-                maxTokens = 40,
+                maxTokens = tokens,
                 // 判断是即时动作：超时就当作不接，别把消息处理拖住
                 timeoutSeconds = 20L,
                 thinkingType = thinkingParam(config),
             )
+
+        // 输出被思考过程挤爆（finish=length）时放宽额度重试一次。
+        // 不重试的话，这类"想得多"的模型会在群消息密集时持续判不出来。
+        // 输出预算跟随设置里的「单次生成上限」，不在代码里另立一套数字
+        val budget = GenerationLimits.forConfig(config)
+        val reply =
+            try {
+                ask(budget)
+            } catch (e: EmptyContentException) {
+                if (!e.truncated) throw e
+                ask(GenerationLimits.retryFor(budget))
+            }
         return parseVerdict(reply.content)
     }
 

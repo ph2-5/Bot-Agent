@@ -250,14 +250,33 @@ fun AiModelPage(onBack: () -> Unit) {
                     "提示词越短，前缀缓存越容易命中——命中部分价格仅 1/10，首字延迟也大幅降低。",
             )
 
-            Text("单次回复长度上限 $maxTokens tokens", fontWeight = FontWeight.Medium)
+            Text(
+                "单次生成上限 $maxTokens tokens（含思考过程）",
+                fontWeight = FontWeight.Medium,
+            )
             Slider(
                 value = maxTokens.toFloat(),
                 onValueChange = { maxTokens = it.toInt() },
                 valueRange = 200f..4000f,
                 steps = 37,
             )
-            HintText("群聊建议 300~800：够把话说清，又不会一发一大串。")
+            HintText(
+                "统计的是「思考 + 正文」的总量：开启思考时，思维链会先消耗额度，" +
+                    "正文可能被挤掉（表现为只回一句空话或干脆没回）。" +
+                    "关闭思考时，它就是正文长度上限。",
+            )
+            if (thinkingMode != ThinkingMode.DISABLED && maxTokens < 800) {
+                Text(
+                    "当前额度可能不够「思考 + 正文」。建议调到 800 以上，" +
+                        "或把思考模式改为「关闭」——接话判断这类短任务尤其明显。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            HintText(
+                "所有模型调用共用这个上限：回复、接话判断、经验反思都受它约束。" +
+                    "额度只是上限、不预扣费，实际按生成量计费。群聊建议 300~800。",
+            )
 
             OutlinedTextField(
                 value = contextTurns,

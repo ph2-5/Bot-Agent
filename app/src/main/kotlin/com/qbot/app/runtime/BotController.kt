@@ -36,6 +36,7 @@ import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChimeReflection
 import com.qbot.core.ai.ChimeStats
 import com.qbot.core.ai.EmptyContentException
+import com.qbot.core.ai.GenerationLimits
 import com.qbot.core.ai.LessonCategories
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.GroupProfile
@@ -273,7 +274,7 @@ class BotController(
                         cfg = cfg,
                         system = ChimeReflection.buildSystemPrompt(),
                         user = ChimeReflection.buildUserPrompt(updated, chimeLessonStore.all()),
-                        maxTokens = 400,
+                        maxTokens = GenerationLimits.forConfig(cfg),
                     )
                 }.getOrElse {
                     return@withLock "已记录，但经验生成失败：${it.message ?: it::class.simpleName ?: "未知错误"}"
@@ -346,7 +347,7 @@ class BotController(
             call(maxTokens)
         } catch (e: EmptyContentException) {
             logger.w(TAG, "结构化调用空正文（finish=${e.finishReason}），放宽额度重试一次")
-            call(maxTokens * 2)
+            call(GenerationLimits.retryFor(maxTokens))
         }
     }
 
@@ -370,8 +371,9 @@ class BotController(
 
         val (system, user) = ChimeReflection.buildMergePrompt(category, lessons)
         val reply =
-            runCatching { chatWithRetry(cfg, system, user, maxTokens = 500) }.getOrNull()
-                ?: return null
+            runCatching {
+                chatWithRetry(cfg, system, user, maxTokens = GenerationLimits.forConfig(cfg))
+            }.getOrNull() ?: return null
 
         val merged = ChimeReflection.parseMerged(reply)
         if (merged.isEmpty()) return null
