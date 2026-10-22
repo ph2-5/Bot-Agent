@@ -335,9 +335,14 @@ class BotRuntime(
             } else {
                 listOfNotNull(botName.takeIf { it.isNotBlank() })
             }
-        // 被指名冒犯：名字（含后缀）+ 侮辱词同时成立才算
+        // 被指名冒犯：名字（含后缀）+ 侮辱词同时成立才算。
+        // 侮辱词 = 内置表 + 用户在设置里追加的自定义词（语言黑话层出不穷，
+        // 用户把自己群里实际出现的词加进来，判定才准）。
+        val extraInsultWords = chitchatConfig?.insultExtraWords ?: emptyList()
         val insulted =
-            !addressed && insultDetector.isInsult(text) && insultDetector.targetsBot(text, names)
+            !addressed &&
+                insultDetector.isInsult(text, extraInsultWords) &&
+                insultDetector.targetsBot(text, names, extraInsultWords)
         val talkingToOthers = insultDetector.talksToOthers(mentionIds, selfId)
 
         val gate =
@@ -402,6 +407,7 @@ class BotRuntime(
                                     recent,
                                     profile?.botName,
                                     personaPrompt,
+                                    userRules = config.chimeRules,
                                 )
                             }.getOrNull() ?: false
                         if (!should) {
@@ -597,8 +603,12 @@ class BotRuntime(
         runCatching {
             // @ 里直接骂人的（"你个傻逼"）也要让模型知道：这是冲你来的，
             // 不是旁听。判定比旁听链路宽——@ 了机器人，侮辱词大概率是说给它听的。
+            // 自定义侮辱词同样参与判定（用户设置里追加的词）。
             val insult =
-                if (insultDetector.isInsult(text) &&
+                if (insultDetector.isInsult(
+                        text,
+                        chitchatConfigProvider?.invoke()?.insultExtraWords ?: emptyList(),
+                    ) &&
                     (text.contains("你") || text.contains("您"))
                 ) {
                     InsultContext(

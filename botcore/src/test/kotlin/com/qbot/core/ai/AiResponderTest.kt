@@ -378,4 +378,55 @@ class AiResponderTest {
             assertTrue(reply.contains("已清空"))
             assertEquals(0, server.requestCount)
         }
+
+    // ---------- 插话判断的用户自定义规则 ----------
+
+    @Test
+    fun `插话判断注入用户自定义规则`() =
+        runBlocking {
+            enqueueAnswer("YES")
+            val should =
+                responder.shouldChimeIn(
+                    message("今天天气怎么样"),
+                    config(),
+                    recent = emptyList(),
+                    botName = "小白",
+                    personaPrompt = null,
+                    userRules = listOf("只有有人求助时才接话"),
+                )
+            assertTrue(should)
+
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue("请求体应包含用户规则，实际=$body", body.contains("只有有人求助时才接话"))
+            assertTrue("应有优先级说明", body.contains("用户补充规则"))
+            assertTrue("应声明优先于通用规则", body.contains("优先级高于"))
+        }
+
+    @Test
+    fun `没有用户规则时提示词不出现规则块`() =
+        runBlocking {
+            enqueueAnswer("NO")
+            responder.shouldChimeIn(message("随便聊聊"), config(), emptyList(), "小白")
+
+            val body = server.takeRequest().body.readUtf8()
+            assertFalse("无规则时不应注入规则块，实际=$body", body.contains("用户补充规则"))
+        }
+
+    @Test
+    fun `超过十条用户规则只注入前十条`() =
+        runBlocking {
+            enqueueAnswer("YES")
+            val rules = (1..15).map { "规则编号$it" }
+            responder.shouldChimeIn(
+                message("在吗"),
+                config(),
+                emptyList(),
+                "小白",
+                userRules = rules,
+            )
+
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue("应注入第 10 条", body.contains("规则编号10"))
+            assertFalse("第 11 条起应被截掉，实际=$body", body.contains("规则编号11"))
+        }
 }

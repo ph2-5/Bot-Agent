@@ -24,8 +24,13 @@ class InsultDetector {
         private val SECOND_PERSON = listOf("你", "您")
     }
 
-    /** 文本里是否带侮辱词。 */
-    fun isInsult(text: String): Boolean = INSULT_WORDS.any { text.contains(it, ignoreCase = true) }
+    /** 文本里是否带侮辱词。extraWords 是用户自定义词表（追加在内置表之后）。 */
+    fun isInsult(
+        text: String,
+        extraWords: List<String> = emptyList(),
+    ): Boolean =
+        (if (extraWords.isEmpty()) INSULT_WORDS else INSULT_WORDS + extraWords)
+            .any { it.isNotBlank() && text.contains(it, ignoreCase = true) }
 
     /**
      * 这句话是不是冲着机器人来的。
@@ -35,13 +40,17 @@ class InsultDetector {
      * 2. 且句子里有第二人称（"你/您"）或侮辱词紧跟在名字后。
      *
      * 只看名字不够——"阿远今天没来"不会触发；只看"你"也不够——"你妈的"可能骂别人。
+     *
+     * @param extraWords 用户自定义侮辱词，语言的黑话与谐音层出不穷，
+     *   内置表不可能穷尽，用户把自己群里实际出现的词加进来判定才准。
      */
     fun targetsBot(
         text: String,
         names: Collection<String>,
+        extraWords: List<String> = emptyList(),
     ): Boolean {
         if (!BotNameMatcher.mentioned(text, names)) return false
-        return SECOND_PERSON.any { text.contains(it) } || isInsult(text)
+        return SECOND_PERSON.any { text.contains(it) } || isInsult(text, extraWords)
     }
 
     /** 是否在跟别人说话（消息里 @ 了非机器人的其他人）。 */

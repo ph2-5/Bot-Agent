@@ -186,6 +186,9 @@ class AiResponder(
          * 超出会被服务端拒绝，这里统一截断保证发送成功。
          */
         const val MAX_REPLY_LENGTH = 1800
+
+        /** 插话判断提示词里最多注入多少条用户规则，防止把 system 撑爆 */
+        const val MAX_USER_RULES = 10
     }
 
     // 同一会话串行处理：群聊里多人连问时，避免并发请求把历史顺序打乱。
@@ -300,6 +303,10 @@ class AiResponder(
      * 调制的结论：外向人格更愿意参与，内向人格更挑剔。这正是"评分体系
      * 与系统提示词关联"的第三级实现。
      *
+     * [userRules] 是用户在维护端自定义的接话规则（自然语言），
+     * 追加在通用 YES/NO 规则之后、**优先级更高**——通用规则管常识，
+     * 用户规则管这个群的特殊约定（"讨论工作时别插话"之类）。
+     *
      * 判定失败（网络/配置）一律返回 false——宁可少说一句，
      * 也不要因为判断服务抖动而在群里乱插话。
      */
@@ -309,6 +316,7 @@ class AiResponder(
         recent: List<RoomMessage>,
         botName: String?,
         personaPrompt: String? = null,
+        userRules: List<String> = emptyList(),
     ): Boolean {
         val speaker = message.senderName?.takeIf { it.isNotBlank() } ?: "群友"
         val transcript =
@@ -324,6 +332,17 @@ class AiResponder(
                     "结合这个性格判断：外向爱聊的性格可以更主动接话，" +
                     "高冷话少的性格只在确有必要时才接话。\n"
             }.orEmpty()
+        val userRulesBlock =
+            userRules
+                .filter { it.isNotBlank() }
+                .take(MAX_USER_RULES)
+                .takeIf { it.isNotEmpty() }
+                ?.let { rules ->
+                    // 用户规则优先级高于通用规则：这是群的"家规"，
+                    // 与通用判断冲突时以用户规则为准。
+                    "用户补充规则（优先级高于以上通用规则，必须遵守）：\n" +
+                        rules.joinToString("\n") { "- $it" } + "\n"
+                }.orEmpty()
         val system =
             "你在一个 QQ 群里，判断最后这条消息是否需要你接话。\n" +
                 personaBlock +
@@ -335,6 +354,7 @@ class AiResponder(
                 "4) 话题正在继续，按你的性格插一句很自然（聊到你的兴趣、你有相关经历）；\n" +
                 "5) 按你的性格，这种场合你本来就会忍不住说一句。\n" +
                 "回答 NO 的情况：两个人在互相聊、@ 了别人、与你无关的闲扯、刷屏。\n" +
+                userRulesBlock +
                 "只输出 YES 或 NO，不要解释。"
         val user =
             buildString {

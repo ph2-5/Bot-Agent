@@ -22,6 +22,7 @@ class ChitchatPolicyTest {
         maxPerDay: Int = 200,
         minScore: Int = 15,
         aiJudge: Boolean = false,
+        scoreWeights: ScoreWeights = ScoreWeights(),
     ) = ChitchatConfig(
         enabled = enabled,
         baseCooldownMillis = baseCooldownMillis,
@@ -29,6 +30,7 @@ class ChitchatPolicyTest {
         maxPerDay = maxPerDay,
         aiJudge = aiJudge,
         minScore = minScore,
+        scoreWeights = scoreWeights,
     )
 
     private val names = listOf("小白")
@@ -344,4 +346,75 @@ class ChitchatPolicyTest {
             val gate = policy.gate("g1", "哦", names, config(aiJudge = true))
             assertTrue("单字噪音不该浪费模型调用，实际=$gate", gate is ChitchatGate.Skip)
         }
+
+    // ---------- 1.9.3：打分明细权重用户化 ----------
+
+    @Test
+    fun `调高长度分值后原本不过滤的消息进入候选`() =
+        runTest {
+            // 无上下文中性的短句：默认只有长度分 10 < 15，过不了筛
+            val recent =
+                listOf(
+                    roomMsg(senderId = "u1", content = "今天天气不错"),
+                    roomMsg(senderId = "u2", content = "晚上吃啥"),
+                )
+            val text = "咋回事啊"
+            val dft = policy.gate("g1", text, names, config(), recent = recent)
+            assertTrue("默认分值应被拦，实际=$dft", dft is ChitchatGate.Skip)
+
+            val tuned =
+                policy.gate(
+                    "g1",
+                    text,
+                    names,
+                    config(scoreWeights = ScoreWeights(lengthScore = 20)),
+                    recent = recent,
+                )
+            assertTrue("长度分值调到 20 应过筛，实际=$tuned", tuned is ChitchatGate.Candidate)
+        }
+
+    @Test
+    fun `调低各项分值后提问也被拦`() =
+        runTest {
+            // 默认：疑问 25 + 长度 10 + 冷场 10 = 45，稳过
+            val dft = policy.gate("g1", "有人吗", names, config())
+            assertTrue("默认分值应过筛，实际=$dft", dft is ChitchatGate.Candidate)
+
+            val tuned =
+                policy.gate(
+                    "g1",
+                    "有人吗",
+                    names,
+                    config(
+                        scoreWeights =
+                            ScoreWeights(
+                                lengthScore = 0,
+                                questionScore = 5,
+                                quietScore = 0,
+                            ),
+                    ),
+                )
+            assertTrue("各分值调低后应被拦，实际=$tuned", tuned is ChitchatGate.Skip)
+        }
+
+    @Test
+    fun `调高门槛后提问也被拦`() =
+        runTest {
+            val gate = policy.gate("g1", "有人吗", names, config(minScore = 50))
+            assertTrue("门槛 50 应拦下 45 分的提问，实际=$gate", gate is ChitchatGate.Skip)
+        }
+
+    @Test
+    fun `用户规则与自定义词表可存入配置`() {
+        val config =
+            config().copy(
+                chimeRules = listOf("群里讨论工作时不要插话", "有人求助时优先接话"),
+                insultExtraWords = listOf("菜狗", " farmed"),
+            )
+        assertEquals(2, config.chimeRules.size)
+        assertEquals(2, config.insultExtraWords.size)
+        // 空列表是默认值：不影响未配置的用户
+        assertEquals(emptyList<String>(), config().chimeRules)
+        assertEquals(emptyList<String>(), config().insultExtraWords)
+    }
 }

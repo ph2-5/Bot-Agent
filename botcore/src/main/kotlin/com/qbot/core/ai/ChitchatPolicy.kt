@@ -4,6 +4,33 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
+ * 规则打分明细权重（用户可调）。
+ *
+ * 每个字段对应 [ChitchatPolicy] 里一条评分规则的贡献值，
+ * 默认值即出厂行为——全部保持默认时与硬编码时代完全一致。
+ * 负值表示扣分。用户在维护端把它们调大调小，
+ * 本质上就是在调「机器人多爱接话」而不必改代码。
+ */
+data class ScoreWeights(
+    /** 长度适中（2~60 字）加分 */
+    val lengthScore: Int = 10,
+    /** 疑问句加分：最强的「需要有人接」信号 */
+    val questionScore: Int = 25,
+    /** 单字/表情消息扣分（负值） */
+    val shortPenalty: Int = -20,
+    /** @ 了别人扣分：大概率是两人对话，不该插嘴（负值） */
+    val mentionPenalty: Int = -20,
+    /** 话题延续（与最近消息共享词组）加分 */
+    val topicScore: Int = 15,
+    /** 有人在回应机器人（上一条是它自己说的）加分 */
+    val respondBotScore: Int = 15,
+    /** 冷场（群里几乎没有消息）加分 */
+    val quietScore: Int = 10,
+    /** 同一人连续发言（刷屏/抢话）扣分（负值） */
+    val spamPenalty: Int = -10,
+)
+
+/**
  * 群聊参与（插话）配置。
  *
  * 这是「机器人像群友一样自己决定要不要接话」的开关组。
@@ -32,6 +59,22 @@ data class ChitchatConfig(
     val answerOnName: Boolean = true,
     /** 规则打分阈值：低于它就放弃，不进入 AI 判断 */
     val minScore: Int = 15,
+    /** 打分明细权重：各情形加/扣多少分，全部可调 */
+    val scoreWeights: ScoreWeights = ScoreWeights(),
+    /**
+     * 用户自定义的 AI 接话规则（自然语言，逐条注入判断提示词）。
+     *
+     * 例如「群里讨论工作时不要插话」「有人求助时优先接」。
+     * 优先级高于内置的通用 YES/NO 规则。
+     */
+    val chimeRules: List<String> = emptyList(),
+    /**
+     * 用户自定义的侮辱词（追加在内置词表之后）。
+     *
+     * 语言的黑话与谐音层出不穷，内置表不可能穷尽——
+     * 用户把自己群里实际出现的词加进来，被指名冒犯时的反应才准。
+     */
+    val insultExtraWords: List<String> = emptyList(),
 )
 
 /**
@@ -240,7 +283,7 @@ class ChitchatPolicy(
             // AI 主导模式：规则层只负责挡"明显噪音"（单字、@别人、刷屏等
             // 强负分消息），其余每条都作为候选交给 AI 判断——
             // 分数不再当门槛，语境理解这种事交给模型。
-            val score = score(text, recent, state)
+            val score = score(text, recent, state, config.scoreWeights)
             if (config.aiJudge) {
                 if (score < 0) {
                     return ChitchatGate.Skip("明显插不上话（噪音）")
@@ -317,13 +360,13 @@ class ChitchatPolicy(
     }
 
     /**
-     * 内容打分。分数只决定"要不要进入下一级判断"，不代表一定回复。
+     * 内容打分：本条消息本身 + 上下文信号。
      *
+     * 分数只决定"要不要进入下一级判断"，不代表一定回复。
+     *
+     * 各情形分值来自 [ScoreWeights]（用户可调），默认值即出厂行为。
      * 频率控制已由冷却与配额负责，这里不再叠加"刚说过话"的惩罚——
      * 否则冷却刚结束又会被扣到阈值以下，等于冷却时间形同虚设。
-     */
-    /**
-     * 内容打分：本条消息本身 + 上下文信号。
      *
      * 上下文部分是"要不要插嘴"最真实的依据——同样的句子，
      * 在话题延续时接话很自然，在两人对聊中插嘴很突兀：
@@ -336,32 +379,33 @@ class ChitchatPolicy(
         text: String,
         recent: List<RoomMessage>,
         state: GroupState,
+        weights: ScoreWeights = ScoreWeights(),
     ): Int {
         var score = 0
-        if (text.length in 2..60) score += 10
+        if (text.length in 2..60) score += weights.lengthScore
         // 疑问句是最强的"需要有人接"信号
-        if (QUESTION_WORDS.any { text.contains(it) }) score += 25
-        if (text.length <= 3) score -= 20
+        if (QUESTION_WORDS.any { text.contains(it) }) score += weights.questionScore
+        if (text.length <= 3) score += weights.shortPenalty
         // @ 了别人：大概率是两个人之间的对话，强负分压到阈值以下
-        if (text.contains("<@!") || text.startsWith("@")) score -= 20
+        if (text.contains("<@!") || text.startsWith("@")) score += weights.mentionPenalty
 
         // ---- 上下文信号 ----
         val prev = recent.lastOrNull()
         if (prev != null) {
             // 有人在回应机器人刚才的话
-            if (prev.role == "assistant") score += 15
+            if (prev.role == "assistant") score += weights.respondBotScore
             // 同一人连续发言（刷屏/抢话）：上一条与这一条来自同一个人
             val prevPrev = recent.getOrNull(recent.lastIndex - 1)
             if (prevPrev != null &&
                 !prev.senderId.isNullOrBlank() &&
                 prev.senderId == prevPrev.senderId
             ) {
-                score -= 10
+                score += weights.spamPenalty
             }
         }
-        if (sharesTopic(text, recent.takeLast(6))) score += 15
+        if (sharesTopic(text, recent.takeLast(6))) score += weights.topicScore
         // 冷场：本条之前群里几乎没有消息
-        if (recent.size <= 1) score += 10
+        if (recent.size <= 1) score += weights.quietScore
         return score
     }
 

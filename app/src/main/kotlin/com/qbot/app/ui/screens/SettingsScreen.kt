@@ -4,7 +4,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -17,8 +16,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -44,6 +41,7 @@ import androidx.compose.ui.unit.dp
 import com.qbot.app.BotApplication
 import com.qbot.app.runtime.BotController
 import com.qbot.app.service.BotForegroundService
+import com.qbot.app.ui.components.ExpandableCard
 import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.LlmClient
 import com.qbot.core.model.MessageKind
@@ -79,8 +77,14 @@ fun SettingsScreen(onRequestBatteryWhitelist: () -> Unit) {
                 .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        // ---------- 凭证 ----------
-        SettingsCard(title = "机器人凭证", subtitle = "在 QQ 开放平台创建机器人后获得") {
+        Text(
+            "设置较多：常用项默认展开，点卡片标题栏可收起/展开。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        // ---------- 凭证（常用，默认展开） ----------
+        ExpandableCard(title = "机器人凭证", subtitle = "在 QQ 开放平台创建机器人后获得") {
             OutlinedTextField(
                 value = appId,
                 onValueChange = { appId = it },
@@ -143,14 +147,14 @@ fun SettingsScreen(onRequestBatteryWhitelist: () -> Unit) {
             }
         }
 
-        // ---------- AI 接入 ----------
-        AiSettingsSection()
+        // ---------- AI 接入（内容最长，默认收起） ----------
+        AiSettingsSection(initiallyExpanded = false)
 
         // ---------- 记忆系统快捷开关 ----------
-        MemoryQuickSection()
+        MemoryQuickSection(initiallyExpanded = false)
 
-        // ---------- 运行策略 ----------
-        SettingsCard(title = "运行策略") {
+        // ---------- 运行策略（常用，默认展开） ----------
+        ExpandableCard(title = "运行策略") {
             SwitchRow(
                 title = "开机自动启动",
                 desc = "设备重启后自动拉起机器人（需授权自启动权限）",
@@ -173,20 +177,41 @@ fun SettingsScreen(onRequestBatteryWhitelist: () -> Unit) {
                     }
                 },
             )
+
+            // 日志保留天数：长期挂机时日志表是唯一会无限增长的数据，
+            // 给一个滑杆让用户自己权衡「留多久」与「占多少空间」。
+            var logDays by remember { mutableStateOf(3) }
+            LaunchedEffect(Unit) {
+                logDays = settings.logRetentionDays.first()
+            }
+            Text(
+                "日志保留 $logDays 天（过期自动清理，仅影响日志页的历史记录）",
+                style = MaterialTheme.typography.labelMedium,
+            )
+            Slider(
+                value = logDays.toFloat(),
+                onValueChange = { logDays = it.toInt() },
+                valueRange = 1f..30f,
+                steps = 28,
+                onValueChangeFinished = {
+                    scope.launch { settings.setLogRetentionDays(logDays) }
+                },
+            )
         }
 
-        // ---------- 手动发送 ----------
+        // ---------- 手动发送（不常用，默认收起） ----------
         ManualSendSection(
+            initiallyExpanded = false,
             onSend = { kind, targetId, content ->
                 scope.launch { controller.sendManual(kind, targetId, content) }
             },
         )
 
-        // ---------- 备份与恢复 ----------
-        BackupSection(controller = controller)
+        // ---------- 备份与恢复（常用，默认展开） ----------
+        BackupSection(controller = controller, initiallyExpanded = true)
 
-        // ---------- 说明 ----------
-        SettingsCard(title = "使用说明") {
+        // ---------- 说明（默认收起） ----------
+        ExpandableCard(title = "使用说明", initiallyExpanded = false) {
             Text(
                 """
                 · 本应用通过 QQ 官方机器人开放平台接入，走 WebSocket 长连接，无需 root。
@@ -208,7 +233,10 @@ fun SettingsScreen(onRequestBatteryWhitelist: () -> Unit) {
  * 导入用 OpenDocument 读取后交给 [BotController.importBackup] 合并。
  */
 @Composable
-private fun BackupSection(controller: BotController) {
+private fun BackupSection(
+    controller: BotController,
+    initiallyExpanded: Boolean = true,
+) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
     var hint by remember { mutableStateOf<String?>(null) }
@@ -247,9 +275,10 @@ private fun BackupSection(controller: BotController) {
             }
         }
 
-    SettingsCard(
+    ExpandableCard(
         title = "备份与恢复",
         subtitle = "换机或备份用：规则、人设、AI/记忆/参与配置、备注名、群名片",
+        initiallyExpanded = initiallyExpanded,
     ) {
         Text(
             "导出内容包含机器人凭证与 AI Key（明文 JSON），备份文件请妥善保管。" +
@@ -287,36 +316,6 @@ private fun BackupSection(controller: BotController) {
 }
 
 @Composable
-private fun SettingsCard(
-    title: String,
-    subtitle: String? = null,
-    // Column 是 @Composable 函数而非类，不能写成 Column.() 作为 receiver 类型；
-    // Column 的 content lambda 接收者是 ColumnScope。
-    content: @Composable ColumnScope.() -> Unit,
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(title, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
-            subtitle?.let {
-                Text(
-                    it,
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            Spacer(modifier = Modifier.height(6.dp))
-            Column(
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-                content = content,
-            )
-        }
-    }
-}
-
-@Composable
 private fun SwitchRow(
     title: String,
     desc: String,
@@ -343,16 +342,18 @@ private fun SwitchRow(
  * 记忆系统快捷开关。
  *
  * 完整的记忆管理（查看/改名/删除每个人的事实、人设绑定）在「AI」Tab，
- * 这里只放一个总开关和存量概览，方便从设置页直接发现该能力。
+ * 这里只放一个总开关、存量概览与两个容量滑杆，方便从设置页直接发现该能力。
  */
 @Composable
-private fun MemoryQuickSection() {
+private fun MemoryQuickSection(initiallyExpanded: Boolean = false) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val app = context.applicationContext as BotApplication
     val settings = remember { app.settings }
     val scope = rememberCoroutineScope()
 
     var enabled by remember { mutableStateOf(settings.memoryConfig.value.enabled) }
+    var factsPerPerson by remember { mutableStateOf(settings.memoryConfig.value.factsPerPerson) }
+    var roomContextSize by remember { mutableStateOf(settings.memoryConfig.value.roomContextSize) }
     var peopleCount by remember { mutableStateOf(0) }
     var factCount by remember { mutableStateOf(0) }
 
@@ -362,9 +363,10 @@ private fun MemoryQuickSection() {
         factCount = app.database.factDao().count()
     }
 
-    SettingsCard(
+    ExpandableCard(
         title = "记忆系统",
         subtitle = "机器人会记住每个人是谁、说过什么，并按人隔离会话",
+        initiallyExpanded = initiallyExpanded,
     ) {
         SwitchRow(
             title = "启用记忆",
@@ -384,6 +386,46 @@ private fun MemoryQuickSection() {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
+        // 容量滑杆：这两个值过去只能在数据库默认值里改，
+        // 现在开放出来——记太多会稀释相关性，记太少又不够用。
+        Text(
+            "每人最多记住 $factsPerPerson 条事实",
+            style = MaterialTheme.typography.labelMedium,
+        )
+        Slider(
+            value = factsPerPerson.toFloat(),
+            onValueChange = { factsPerPerson = it.toInt() },
+            valueRange = 5f..50f,
+            steps = 8,
+            enabled = enabled,
+            onValueChangeFinished = {
+                scope.launch {
+                    settings.saveMemoryConfig(
+                        settings.memoryConfig.value.copy(factsPerPerson = factsPerPerson),
+                    )
+                }
+            },
+        )
+
+        Text(
+            "群聊背景注入 $roomContextSize 条（跨人指代的上下文窗口）",
+            style = MaterialTheme.typography.labelMedium,
+        )
+        Slider(
+            value = roomContextSize.toFloat(),
+            onValueChange = { roomContextSize = it.toInt() },
+            valueRange = 10f..100f,
+            steps = 17,
+            enabled = enabled,
+            onValueChangeFinished = {
+                scope.launch {
+                    settings.saveMemoryConfig(
+                        settings.memoryConfig.value.copy(roomContextSize = roomContextSize),
+                    )
+                }
+            },
+        )
+
         Text(
             "群聊里对机器人说「叫我 XX」即可改名；说「我的记忆」「忘掉 XX」可查看/删除。" +
                 "到「AI」Tab 可以管理每个人的记忆、给不同群和人配置专属人设。",
@@ -394,7 +436,10 @@ private fun MemoryQuickSection() {
 }
 
 @Composable
-private fun ManualSendSection(onSend: (MessageKind, String, String) -> Unit) {
+private fun ManualSendSection(
+    initiallyExpanded: Boolean = false,
+    onSend: (MessageKind, String, String) -> Unit,
+) {
     var kind by remember { mutableStateOf(MessageKind.GROUP_AT) }
     var targetId by remember { mutableStateOf("") }
     var content by remember { mutableStateOf("") }
@@ -411,9 +456,10 @@ private fun ManualSendSection(onSend: (MessageKind, String, String) -> Unit) {
         targetId = savedId
     }
 
-    SettingsCard(
+    ExpandableCard(
         title = "手动发送",
         subtitle = "这里发出的是主动消息，会占用主动消息配额",
+        initiallyExpanded = initiallyExpanded,
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FilterChip(
@@ -475,9 +521,11 @@ private fun ManualSendSection(onSend: (MessageKind, String, String) -> Unit) {
  *
  * 走 OpenAI 兼容协议，因此 DeepSeek / 通义千问 / Kimi / 智谱 / OpenAI
  * 都能用同一套字段接入——用户只需要填对三项：服务地址、API Key、模型名。
+ *
+ * @param initiallyExpanded 内容最长的一张卡，设置页里默认收起
  */
 @Composable
-private fun AiSettingsSection() {
+private fun AiSettingsSection(initiallyExpanded: Boolean = false) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val app = context.applicationContext as BotApplication
     val settings = remember { app.settings }
@@ -496,10 +544,15 @@ private fun AiSettingsSection() {
     var mode by remember { mutableStateOf(initial.mode) }
     var thinkingMode by remember { mutableStateOf(initial.thinkingMode) }
     var tokenBudget by remember { mutableFloatStateOf(initial.contextTokenBudget.toFloat()) }
+    var maxTokens by remember { mutableStateOf(initial.maxTokens) }
     var hint by remember { mutableStateOf<String?>(null) }
     var testing by remember { mutableStateOf(false) }
 
-    SettingsCard(title = "AI 接入", subtitle = "OpenAI 兼容协议，DeepSeek / 通义 / Kimi / 智谱 / OpenAI 通用") {
+    ExpandableCard(
+        title = "AI 接入",
+        subtitle = "OpenAI 兼容协议，DeepSeek / 通义 / Kimi / 智谱 / OpenAI 通用",
+        initiallyExpanded = initiallyExpanded,
+    ) {
         SwitchRow(
             title = "启用 AI 应答",
             desc = "开启后按下方触发方式决定哪些消息交给 AI",
@@ -666,6 +719,24 @@ private fun AiSettingsSection() {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
+        // maxTokens 过去只能改代码默认值，这里开放出来：
+        // 群聊回复要短平快，长回复既刷屏又费钱。
+        Text(
+            "单次回复长度上限 $maxTokens tokens",
+            fontWeight = FontWeight.Medium,
+        )
+        Slider(
+            value = maxTokens.toFloat(),
+            onValueChange = { maxTokens = it.toInt() },
+            valueRange = 200f..4000f,
+            steps = 37,
+        )
+        Text(
+            "群聊建议 300~800：够把话说清，又不会一发一大串。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
         OutlinedTextField(
             value = contextTurns,
             onValueChange = { contextTurns = it.filter { c -> c.isDigit() } },
@@ -696,7 +767,7 @@ private fun AiSettingsSection() {
                             model = model.trim(),
                             systemPrompt = systemPrompt,
                             temperature = temperature.toDouble(),
-                            maxTokens = initial.maxTokens,
+                            maxTokens = maxTokens,
                             mode = mode,
                             contextTurns = contextTurns.toIntOrNull()?.coerceIn(1, 20) ?: 6,
                             replyOnError = replyOnError,
@@ -722,7 +793,7 @@ private fun AiSettingsSection() {
                             model = model.trim(),
                             systemPrompt = systemPrompt,
                             temperature = temperature.toDouble(),
-                            maxTokens = initial.maxTokens,
+                            maxTokens = maxTokens,
                             mode = mode,
                             contextTurns = contextTurns.toIntOrNull()?.coerceIn(1, 20) ?: 6,
                             replyOnError = replyOnError,

@@ -48,4 +48,25 @@ class InsultDetectorTest {
         assertFalse(detector.talksToOthers(listOf("SELF"), "SELF"))
         assertFalse(detector.talksToOthers(emptyList(), "SELF"))
     }
+
+    @Test
+    fun `用户自定义侮辱词参与判定`() {
+        // 「菜狗」是群里的黑话，不在内置表里。
+        // 注意 targetsBot 的判定是「名字 + 第二人称或侮辱词」——
+        // 所以验证词表要用不含「你/您」的句子，否则第二人称本身就命中。
+        assertFalse(detector.targetsBot("阿远真菜狗啊", listOf("阿远")))
+        assertTrue(
+            detector.targetsBot("阿远真菜狗啊", listOf("阿远"), extraWords = listOf("菜狗")),
+        )
+        // isInsult 同样吃自定义词表
+        assertFalse(detector.isInsult("真菜狗啊"))
+        assertTrue(detector.isInsult("真菜狗啊", extraWords = listOf("菜狗")))
+    }
+
+    @Test
+    fun `自定义词表不影响内置词判定`() {
+        assertTrue(
+            detector.targetsBot("阿远你个傻逼", listOf("阿远"), extraWords = listOf("菜狗")),
+        )
+    }
 }

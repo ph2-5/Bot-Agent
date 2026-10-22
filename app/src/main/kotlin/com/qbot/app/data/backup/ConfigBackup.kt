@@ -93,6 +93,20 @@ data class ChitchatBackup(
     @SerialName("max_per_hour") val maxPerHour: Int,
     val aiJudge: Boolean,
     @SerialName("probability_percent") val probabilityPercent: Int,
+    // ---- 1.9.3 新增：全部带默认值，旧备份缺失这些字段时按出厂值导入 ----
+    @SerialName("max_per_day") val maxPerDay: Int = 400,
+    @SerialName("answer_on_name") val answerOnName: Boolean = true,
+    @SerialName("min_score") val minScore: Int = 15,
+    @SerialName("w_length") val lengthScore: Int = 10,
+    @SerialName("w_question") val questionScore: Int = 25,
+    @SerialName("w_short") val shortPenalty: Int = -20,
+    @SerialName("w_mention") val mentionPenalty: Int = -20,
+    @SerialName("w_topic") val topicScore: Int = 15,
+    @SerialName("w_respond_bot") val respondBotScore: Int = 15,
+    @SerialName("w_quiet") val quietScore: Int = 10,
+    @SerialName("w_spam") val spamPenalty: Int = -10,
+    @SerialName("chime_rules") val chimeRules: List<String> = emptyList(),
+    @SerialName("insult_extra_words") val insultExtraWords: List<String> = emptyList(),
 )
 
 @Serializable

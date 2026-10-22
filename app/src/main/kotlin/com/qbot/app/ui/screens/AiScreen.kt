@@ -19,6 +19,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
@@ -50,6 +51,7 @@ import com.qbot.app.BotApplication
 import com.qbot.app.data.repo.GreetingConfig
 import com.qbot.app.data.repo.GroupSummary
 import com.qbot.app.data.repo.observeSummaries
+import com.qbot.app.ui.components.ExpandableSection
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.KnownPerson
 import com.qbot.core.ai.MemoryConfig
@@ -58,6 +60,7 @@ import com.qbot.core.ai.Persona
 import com.qbot.core.ai.PersonaSnapshot
 import com.qbot.core.ai.PersonaSnapshotKind
 import com.qbot.core.ai.RoomMessage
+import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.UserFact
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -1208,6 +1211,10 @@ private fun GatewayEventsCard(
  *
  * 门槛在群主那边：只有群主把机器人的「消息范围」改成获取群内全部消息，
  * 非 @ 消息才会推过来。所以卡片第一块是授权指引，而不是参数。
+ *
+ * 结构分两层：**基础区**（频率类参数，常开）+ **高级分区**（折叠）——
+ * 打分明细、AI 接话规则、冒犯词表都属于「调过一次就不再碰」的参数，
+ * 默认收起，避免这张卡本身变成第二个长滚动页。
  */
 @Composable
 private fun ChitchatCard(
@@ -1263,6 +1270,7 @@ private fun ChitchatCard(
                 enabled = config.enabled,
             )
 
+            // ---------- 基础区：频率与身份 ----------
             Text(
                 "冷却 ${config.baseCooldownMillis / 1000} 秒（群里聊得热闹时自动放慢，冷场时加快；最低 1 秒）",
                 style = MaterialTheme.typography.labelMedium,
@@ -1297,6 +1305,31 @@ private fun ChitchatCard(
             )
 
             Text(
+                if (config.maxPerDay <= 0) {
+                    "每天接话：无上限"
+                } else {
+                    "每天最多接话 ${config.maxPerDay} 次"
+                },
+                style = MaterialTheme.typography.labelMedium,
+            )
+            Slider(
+                value = config.maxPerDay.toFloat().coerceIn(0f, 1000f),
+                onValueChange = { onChange(config.copy(maxPerDay = it.toInt().coerceIn(0, 1000))) },
+                valueRange = 0f..1000f,
+                steps = 99,
+                enabled = config.enabled,
+            )
+
+            SwitchRow(
+                title = "被叫名字必答",
+                desc = "有人叫机器人的名字（含群名片、短昵称）时一定接话，" +
+                    "不受冷却限制（仍有 5 秒最小间隔防刷屏）",
+                checked = config.answerOnName,
+                onCheckedChange = { onChange(config.copy(answerOnName = it)) },
+                enabled = config.enabled,
+            )
+
+            Text(
                 "候选消息参与概率 ${(config.probability * 100).toInt()}%（仅关闭 AI 判断时生效）",
                 style = MaterialTheme.typography.labelMedium,
             )
@@ -1308,7 +1341,245 @@ private fun ChitchatCard(
                 valueRange = 5f..100f,
                 enabled = config.enabled,
             )
+
+            // ---------- 高级分区 1：评分微调 ----------
+            ExpandableSection(
+                title = "评分微调",
+                subtitle = "各情形加/扣分与过筛门槛。关闭 AI 判断时分数达门槛才接话；" +
+                    "开启时只有负分消息会被拦（噪音过滤）",
+            ) {
+                val weights = config.scoreWeights
+                Text(
+                    "过筛分数门槛：${config.minScore}",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Slider(
+                    value = config.minScore.toFloat(),
+                    onValueChange = { onChange(config.copy(minScore = it.toInt())) },
+                    valueRange = 0f..40f,
+                    steps = 39,
+                    enabled = config.enabled,
+                )
+                ScoreSlider(
+                    label = "长度适中（2~60 字）",
+                    value = weights.lengthScore,
+                    range = 0..20,
+                    enabled = config.enabled,
+                ) { onChange(config.copy(scoreWeights = weights.copy(lengthScore = it))) }
+                ScoreSlider(
+                    label = "疑问句（吗/呢/怎么/为什么…）",
+                    value = weights.questionScore,
+                    range = 0..40,
+                    enabled = config.enabled,
+                ) { onChange(config.copy(scoreWeights = weights.copy(questionScore = it))) }
+                ScoreSlider(
+                    label = "单字或表情消息",
+                    value = weights.shortPenalty,
+                    range = -40..0,
+                    enabled = config.enabled,
+                ) { onChange(config.copy(scoreWeights = weights.copy(shortPenalty = it))) }
+                ScoreSlider(
+                    label = "@ 了别人（两人对话不该插嘴）",
+                    value = weights.mentionPenalty,
+                    range = -40..0,
+                    enabled = config.enabled,
+                ) { onChange(config.copy(scoreWeights = weights.copy(mentionPenalty = it))) }
+                ScoreSlider(
+                    label = "话题延续（与最近消息聊的一样）",
+                    value = weights.topicScore,
+                    range = 0..30,
+                    enabled = config.enabled,
+                ) { onChange(config.copy(scoreWeights = weights.copy(topicScore = it))) }
+                ScoreSlider(
+                    label = "有人在回应机器人（上一条是它说的）",
+                    value = weights.respondBotScore,
+                    range = 0..30,
+                    enabled = config.enabled,
+                ) { onChange(config.copy(scoreWeights = weights.copy(respondBotScore = it))) }
+                ScoreSlider(
+                    label = "冷场（群里半天没人说话）",
+                    value = weights.quietScore,
+                    range = 0..20,
+                    enabled = config.enabled,
+                ) { onChange(config.copy(scoreWeights = weights.copy(quietScore = it))) }
+                ScoreSlider(
+                    label = "同一人连续刷屏",
+                    value = weights.spamPenalty,
+                    range = -30..0,
+                    enabled = config.enabled,
+                ) { onChange(config.copy(scoreWeights = weights.copy(spamPenalty = it))) }
+
+                TextButton(
+                    onClick = {
+                        onChange(
+                            config.copy(
+                                minScore = ChitchatConfig().minScore,
+                                scoreWeights = ScoreWeights(),
+                            ),
+                        )
+                    },
+                ) {
+                    Text("恢复默认分值与门槛")
+                }
+                Text(
+                    "拿不准就先只动「过筛分数门槛」：调高变高冷，调低变话痨。" +
+                        "人设里的「话痨/高冷」关键词也会自动微调它（±10）。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            // ---------- 高级分区 2：AI 接话规则 ----------
+            ExpandableSection(
+                title = "AI 接话规则",
+                subtitle = "用自己的话约定什么场合该接话，优先级高于通用规则",
+            ) {
+                TextListEditor(
+                    items = config.chimeRules,
+                    emptyHint = "还没有自定义规则，AI 按通用规则判断。",
+                    placeholder = "例如：群里讨论工作时不要插话",
+                    addLabel = "添加规则",
+                    maxItems = 10,
+                    maxLength = 100,
+                    enabled = config.enabled,
+                    onRemove = { rule ->
+                        onChange(config.copy(chimeRules = config.chimeRules - rule))
+                    },
+                    onAdd = { rule ->
+                        onChange(config.copy(chimeRules = config.chimeRules + rule))
+                    },
+                )
+                Text(
+                    "规则会注入 AI 的接话判断提示词，例如：" +
+                        "「只有被叫到名字或有人求助才接话」「凌晨不要接话」。" +
+                        "已添加 ${config.chimeRules.size}/10 条。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            // ---------- 高级分区 3：冒犯词表 ----------
+            ExpandableSection(
+                title = "冒犯词表",
+                subtitle = "被叫名字时带这些词 = 被冒犯，机器人会按人设反应",
+            ) {
+                TextListEditor(
+                    items = config.insultExtraWords,
+                    emptyHint = "只使用内置词表（傻逼/智障/废物等常见词）。",
+                    placeholder = "例如：菜狗（你们群里的黑话）",
+                    addLabel = "添加词语",
+                    maxItems = 50,
+                    maxLength = 10,
+                    enabled = config.enabled,
+                    onRemove = { word ->
+                        onChange(config.copy(insultExtraWords = config.insultExtraWords - word))
+                    },
+                    onAdd = { word ->
+                        onChange(config.copy(insultExtraWords = config.insultExtraWords + word))
+                    },
+                )
+                Text(
+                    "语言的黑话与谐音层出不穷，内置表不可能穷尽。" +
+                        "把你们群里实际出现的词加进来，「叫名字 + 这些词」才会触发按人设的反应。" +
+                        "已添加 ${config.insultExtraWords.size}/50 个。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
+    }
+}
+
+/**
+ * 带正负号显示的打分滑杆。
+ *
+ * 负分项（单字、@别人、刷屏）的范围是负数区间，显示时带符号，
+ * 让「扣多少」和「加多少」在视觉上对称。
+ */
+@Composable
+private fun ScoreSlider(
+    label: String,
+    value: Int,
+    range: IntRange,
+    enabled: Boolean,
+    onChange: (Int) -> Unit,
+) {
+    val sign = if (value > 0) "+" else ""
+    Text("$label：$sign$value 分", style = MaterialTheme.typography.labelMedium)
+    Slider(
+        value = value.toFloat(),
+        onValueChange = { onChange(it.toInt()) },
+        valueRange = range.first.toFloat()..range.last.toFloat(),
+        steps = range.last - range.first - 1,
+        enabled = enabled,
+    )
+}
+
+/**
+ * 自然语言列表编辑器（AI 接话规则 / 冒犯词表共用）。
+ *
+ * 配置驱动而不是两份复制粘贴的代码：上限、字数、按钮文案都是参数。
+ */
+@Composable
+private fun TextListEditor(
+    items: List<String>,
+    emptyHint: String,
+    placeholder: String,
+    addLabel: String,
+    maxItems: Int,
+    maxLength: Int,
+    enabled: Boolean,
+    onRemove: (String) -> Unit,
+    onAdd: (String) -> Unit,
+) {
+    var input by remember { mutableStateOf("") }
+
+    if (items.isEmpty()) {
+        Text(
+            emptyHint,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    items.forEach { item ->
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("· $item", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+            IconButton(onClick = { onRemove(item) }) {
+                Icon(Icons.Filled.Delete, contentDescription = "删除")
+            }
+        }
+    }
+
+    if (items.size < maxItems) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = input,
+                onValueChange = { if (it.length <= maxLength) input = it },
+                placeholder = { Text(placeholder) },
+                singleLine = true,
+                enabled = enabled,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = {
+                    val text = input.trim()
+                    if (text.isNotEmpty()) {
+                        onAdd(text.take(maxLength))
+                        input = ""
+                    }
+                },
+                enabled = enabled && input.isNotBlank(),
+            ) {
+                Text(addLabel)
+            }
+        }
+    } else {
+        Text(
+            "已达上限 $maxItems 条，先删掉一些才能添加。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.error,
+        )
     }
 }
 

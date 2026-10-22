@@ -33,6 +33,7 @@ import com.qbot.core.ai.MemoryPipeline
 import com.qbot.core.ai.Persona
 import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.PersonaResolver
+import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.ThinkingMode
 import com.qbot.core.api.OpenApi
 import com.qbot.core.auth.AccessTokenManager
@@ -462,6 +463,19 @@ class BotController(
                         maxPerHour = chitchat.maxPerHour,
                         aiJudge = chitchat.aiJudge,
                         probabilityPercent = (chitchat.probability * 100).toInt().coerceIn(1, 100),
+                        maxPerDay = chitchat.maxPerDay,
+                        answerOnName = chitchat.answerOnName,
+                        minScore = chitchat.minScore,
+                        lengthScore = chitchat.scoreWeights.lengthScore,
+                        questionScore = chitchat.scoreWeights.questionScore,
+                        shortPenalty = chitchat.scoreWeights.shortPenalty,
+                        mentionPenalty = chitchat.scoreWeights.mentionPenalty,
+                        topicScore = chitchat.scoreWeights.topicScore,
+                        respondBotScore = chitchat.scoreWeights.respondBotScore,
+                        quietScore = chitchat.scoreWeights.quietScore,
+                        spamPenalty = chitchat.scoreWeights.spamPenalty,
+                        chimeRules = chitchat.chimeRules,
+                        insultExtraWords = chitchat.insultExtraWords,
                     ),
                 rules =
                     database.ruleDao().all().first().map { rule ->
@@ -577,8 +591,24 @@ class BotController(
                     enabled = it.enabled,
                     baseCooldownMillis = it.baseCooldownSeconds.coerceAtLeast(1).toLong() * 1000,
                     maxPerHour = it.maxPerHour,
+                    maxPerDay = it.maxPerDay.coerceIn(0, 1000),
                     aiJudge = it.aiJudge,
                     probability = it.probabilityPercent.coerceIn(1, 100) / 100.0,
+                    answerOnName = it.answerOnName,
+                    minScore = it.minScore.coerceIn(0, 40),
+                    scoreWeights =
+                        ScoreWeights(
+                            lengthScore = it.lengthScore.coerceIn(0, 20),
+                            questionScore = it.questionScore.coerceIn(0, 40),
+                            shortPenalty = it.shortPenalty.coerceIn(-40, 0),
+                            mentionPenalty = it.mentionPenalty.coerceIn(-40, 0),
+                            topicScore = it.topicScore.coerceIn(0, 30),
+                            respondBotScore = it.respondBotScore.coerceIn(0, 30),
+                            quietScore = it.quietScore.coerceIn(0, 20),
+                            spamPenalty = it.spamPenalty.coerceIn(-30, 0),
+                        ),
+                    chimeRules = it.chimeRules.filter { r -> r.isNotBlank() }.take(10),
+                    insultExtraWords = it.insultExtraWords.filter { w -> w.isNotBlank() }.take(50),
                 ),
             )
             applied++

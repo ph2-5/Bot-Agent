@@ -15,6 +15,7 @@ import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.MemoryConfig
+import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.ThinkingMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -26,6 +27,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
 
@@ -97,7 +100,22 @@ class SettingsRepository(private val context: Context) {
         val CHITCHAT_AI_JUDGE = booleanPreferencesKey("chitchat_ai_judge")
         val CHITCHAT_COOLDOWN_SECONDS = intPreferencesKey("chitchat_cooldown_seconds")
         val CHITCHAT_MAX_PER_HOUR = intPreferencesKey("chitchat_max_per_hour")
+        val CHITCHAT_MAX_PER_DAY = intPreferencesKey("chitchat_max_per_day")
         val CHITCHAT_PROBABILITY_PERCENT = intPreferencesKey("chitchat_probability_percent")
+        val CHITCHAT_ANSWER_ON_NAME = booleanPreferencesKey("chitchat_answer_on_name")
+        val CHITCHAT_MIN_SCORE = intPreferencesKey("chitchat_min_score")
+        // 打分明细权重（各情形加/扣分）
+        val CHITCHAT_W_LENGTH = intPreferencesKey("chitchat_w_length")
+        val CHITCHAT_W_QUESTION = intPreferencesKey("chitchat_w_question")
+        val CHITCHAT_W_SHORT = intPreferencesKey("chitchat_w_short")
+        val CHITCHAT_W_MENTION = intPreferencesKey("chitchat_w_mention")
+        val CHITCHAT_W_TOPIC = intPreferencesKey("chitchat_w_topic")
+        val CHITCHAT_W_RESPOND_BOT = intPreferencesKey("chitchat_w_respond_bot")
+        val CHITCHAT_W_QUIET = intPreferencesKey("chitchat_w_quiet")
+        val CHITCHAT_W_SPAM = intPreferencesKey("chitchat_w_spam")
+        // 自然语言列表（JSON 数组字符串）
+        val CHITCHAT_CHIME_RULES = stringPreferencesKey("chitchat_chime_rules")
+        val CHITCHAT_INSULT_WORDS = stringPreferencesKey("chitchat_insult_words")
     }
 
     private companion object {
@@ -250,6 +268,7 @@ class SettingsRepository(private val context: Context) {
 
     private fun readChitchatConfig(prefs: Preferences): ChitchatConfig {
         val defaults = ChitchatConfig()
+        val weights = defaults.scoreWeights
         return ChitchatConfig(
             enabled = prefs[Keys.CHITCHAT_ENABLED] ?: defaults.enabled,
             aiJudge = prefs[Keys.CHITCHAT_AI_JUDGE] ?: defaults.aiJudge,
@@ -257,9 +276,36 @@ class SettingsRepository(private val context: Context) {
                 (prefs[Keys.CHITCHAT_COOLDOWN_SECONDS] ?: (defaults.baseCooldownMillis / 1000).toInt())
                     .toLong() * 1000,
             maxPerHour = prefs[Keys.CHITCHAT_MAX_PER_HOUR] ?: defaults.maxPerHour,
+            maxPerDay =
+                (prefs[Keys.CHITCHAT_MAX_PER_DAY] ?: defaults.maxPerDay).coerceIn(0, 1000),
             probability =
                 (prefs[Keys.CHITCHAT_PROBABILITY_PERCENT] ?: (defaults.probability * 100).toInt())
                     .coerceIn(1, 100) / 100.0,
+            answerOnName = prefs[Keys.CHITCHAT_ANSWER_ON_NAME] ?: defaults.answerOnName,
+            minScore =
+                (prefs[Keys.CHITCHAT_MIN_SCORE] ?: defaults.minScore).coerceIn(0, 40),
+            scoreWeights =
+                ScoreWeights(
+                    lengthScore =
+                        (prefs[Keys.CHITCHAT_W_LENGTH] ?: weights.lengthScore).coerceIn(0, 20),
+                    questionScore =
+                        (prefs[Keys.CHITCHAT_W_QUESTION] ?: weights.questionScore).coerceIn(0, 40),
+                    shortPenalty =
+                        (prefs[Keys.CHITCHAT_W_SHORT] ?: weights.shortPenalty).coerceIn(-40, 0),
+                    mentionPenalty =
+                        (prefs[Keys.CHITCHAT_W_MENTION] ?: weights.mentionPenalty).coerceIn(-40, 0),
+                    topicScore =
+                        (prefs[Keys.CHITCHAT_W_TOPIC] ?: weights.topicScore).coerceIn(0, 30),
+                    respondBotScore =
+                        (prefs[Keys.CHITCHAT_W_RESPOND_BOT] ?: weights.respondBotScore)
+                            .coerceIn(0, 30),
+                    quietScore =
+                        (prefs[Keys.CHITCHAT_W_QUIET] ?: weights.quietScore).coerceIn(0, 20),
+                    spamPenalty =
+                        (prefs[Keys.CHITCHAT_W_SPAM] ?: weights.spamPenalty).coerceIn(-30, 0),
+                ),
+            chimeRules = decodeStringList(prefs[Keys.CHITCHAT_CHIME_RULES]),
+            insultExtraWords = decodeStringList(prefs[Keys.CHITCHAT_INSULT_WORDS]),
         )
     }
 
@@ -272,11 +318,57 @@ class SettingsRepository(private val context: Context) {
                 prefs[Keys.CHITCHAT_AI_JUDGE] = config.aiJudge
                 prefs[Keys.CHITCHAT_COOLDOWN_SECONDS] = (config.baseCooldownMillis / 1000).toInt()
                 prefs[Keys.CHITCHAT_MAX_PER_HOUR] = config.maxPerHour
+                prefs[Keys.CHITCHAT_MAX_PER_DAY] = config.maxPerDay.coerceIn(0, 1000)
                 prefs[Keys.CHITCHAT_PROBABILITY_PERCENT] =
                     (config.probability * 100).toInt().coerceIn(1, 100)
+                prefs[Keys.CHITCHAT_ANSWER_ON_NAME] = config.answerOnName
+                prefs[Keys.CHITCHAT_MIN_SCORE] = config.minScore.coerceIn(0, 40)
+                val w = config.scoreWeights
+                prefs[Keys.CHITCHAT_W_LENGTH] = w.lengthScore.coerceIn(0, 20)
+                prefs[Keys.CHITCHAT_W_QUESTION] = w.questionScore.coerceIn(0, 40)
+                prefs[Keys.CHITCHAT_W_SHORT] = w.shortPenalty.coerceIn(-40, 0)
+                prefs[Keys.CHITCHAT_W_MENTION] = w.mentionPenalty.coerceIn(-40, 0)
+                prefs[Keys.CHITCHAT_W_TOPIC] = w.topicScore.coerceIn(0, 30)
+                prefs[Keys.CHITCHAT_W_RESPOND_BOT] = w.respondBotScore.coerceIn(0, 30)
+                prefs[Keys.CHITCHAT_W_QUIET] = w.quietScore.coerceIn(0, 20)
+                prefs[Keys.CHITCHAT_W_SPAM] = w.spamPenalty.coerceIn(-30, 0)
+                prefs[Keys.CHITCHAT_CHIME_RULES] =
+                    encodeStringList(config.chimeRules, maxItems = 10, maxLength = 100)
+                prefs[Keys.CHITCHAT_INSULT_WORDS] =
+                    encodeStringList(config.insultExtraWords, maxItems = 50, maxLength = 10)
             }
         }
     }
+
+    // ---------- 自然语言列表的存取（插话规则 / 自定义侮辱词） ----------
+    //
+    // DataStore 没有列表类型，用 JSON 数组字符串承载。
+    // 读取失败（坏数据/旧格式）时退回空表——这些是增强项，
+    // 不该让一条坏记录把整个设置仓库的 Flow 搞崩。
+
+    private val listJson = Json { ignoreUnknownKeys = true }
+
+    private fun decodeStringList(raw: String?): List<String> =
+        if (raw.isNullOrBlank()) {
+            emptyList()
+        } else {
+            runCatching { listJson.decodeFromString<List<String>>(raw) }
+                .getOrDefault(emptyList())
+                .filter { it.isNotBlank() }
+        }
+
+    private fun encodeStringList(
+        items: List<String>,
+        maxItems: Int,
+        maxLength: Int,
+    ): String =
+        listJson.encodeToString(
+            items
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .take(maxItems)
+                .map { it.take(maxLength) },
+        )
 
     private fun readAiConfig(prefs: Preferences): AiConfig {
         val defaults = AiConfig()
