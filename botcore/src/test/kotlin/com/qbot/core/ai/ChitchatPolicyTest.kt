@@ -151,4 +151,42 @@ class ChitchatPolicyTest {
             val other = policy.gate("g2", "今晚有人开黑吗", names, config(maxPerHour = 3))
             assertTrue("别的群不受影响，实际=$other", other is ChitchatGate.Candidate)
         }
+
+    @Test
+    fun `被指名冒犯时强制接话`() =
+        runTest {
+            val gate =
+                policy.gate(
+                    "g1",
+                    "阿远你个傻逼",
+                    listOf("过去的阿远"),
+                    config(),
+                    insulted = true,
+                )
+            assertTrue("被指名骂必须按人设反应，实际=$gate", gate is ChitchatGate.Forced)
+        }
+
+    @Test
+    fun `冒犯回应同样受最小间隔约束`() =
+        runTest {
+            policy.markSpoke("g1")
+            now += 3_000
+            val gate =
+                policy.gate("g1", "阿远你个傻逼", listOf("过去的阿远"), config(), insulted = true)
+            assertTrue("刚说过话时骂人回应也不该刷屏，实际=$gate", gate is ChitchatGate.Skip)
+        }
+
+    @Test
+    fun `艾特了其他群友时不插嘴`() =
+        runTest {
+            val gate =
+                policy.gate(
+                    "g1",
+                    "你觉得呢",
+                    names,
+                    config(),
+                    talkingToOthers = true,
+                )
+            assertTrue("那是两个人的对话，不该接，实际=$gate", gate is ChitchatGate.Skip)
+        }
 }

@@ -23,12 +23,14 @@ class PromptAssemblerTest {
         digest: List<RoomMessage> = emptyList(),
         group: GroupDigest? = null,
         quoted: QuotedMessage? = null,
+        insult: InsultContext? = null,
     ) = MemoryContext(
         senderLabel = label,
         facts = facts,
         roomDigest = digest,
         group = group,
         quoted = quoted,
+        insult = insult,
     )
 
     private fun fact(text: String) = UserFact(senderId = "s", text = text)
@@ -427,5 +429,51 @@ class PromptAssemblerTest {
         assertTrue("应带上被引用的人", quotedBlock.content.contains("「阿远」"))
         assertTrue("应带上被引用的原文", quotedBlock.content.contains("我刚刚说什么了"))
         assertTrue("应提示据此判断指代", quotedBlock.content.contains("优先看这条原文"))
+    }
+
+    @Test
+    fun `冒犯块宣告被骂并给人设反应许可`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "你脾气很差",
+                memory =
+                    memory(
+                        label = "阿远",
+                        insult = InsultContext(byWhom = "阿远", quote = "潮水你个傻逼"),
+                    ),
+                history = emptyList(),
+                question = "潮水你个傻逼",
+                tokenBudget = 10_000,
+            )
+
+        val block = messages.first { it.content.contains("当众骂了你") }
+        assertTrue("应指出是谁骂的", block.content.contains("「阿远」"))
+        assertTrue("应带上原话", block.content.contains("潮水你个傻逼"))
+        assertTrue("应授权按人设反应", block.content.contains("按你的人设做出反应"))
+        assertTrue("应守住底线", block.content.contains("不连续对骂"))
+    }
+
+    @Test
+    fun `冒犯块带上对骂者的了解以区分熟人与陌生人`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "你是群友",
+                memory =
+                    memory(
+                        label = "阿远",
+                        facts = listOf(fact("喜欢熬夜")),
+                        insult = InsultContext(byWhom = "阿远", quote = "你是废物"),
+                    ),
+                history = emptyList(),
+                question = "你是废物",
+                tokenBudget = 10_000,
+            )
+
+        val block = messages.first { it.content.contains("当众骂了你") }
+        assertTrue("应带上关于此人的事实", block.content.contains("喜欢熬夜"))
+        assertTrue(
+            "熟人玩笑与陌生人挑衅应有区别",
+            block.content.contains("反应程度应当不一样"),
+        )
     }
 }

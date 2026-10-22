@@ -159,6 +159,7 @@ class MemoryPipeline(
         message: IncomingMessage,
         botId: String,
         cleanText: String,
+        insult: InsultContext? = null,
     ): MemoryContext {
         val config = configProvider()
         if (!config.enabled) {
@@ -223,6 +224,7 @@ class MemoryPipeline(
             roomDigest = digest,
             group = groupDigest,
             quoted = quoted,
+            insult = insult,
         )
     }
 

@@ -157,6 +157,30 @@ class PromptAssembler {
             remaining -= TokenEstimator.estimate(block)
         }
 
+        // 2.8) 被指名冒犯：给人设一个"反应许可"。
+        // 不注入这条的话，模型会继续按"旁听者"口吻装没看见，
+        // 脾气不好的人设就完全立不住。
+        memory?.insult?.let { insult ->
+            val who = insult.byWhom?.takeIf { it.isNotBlank() } ?: "对方"
+            val known =
+                memory.facts.take(3).joinToString("、") { it.text }
+                    .takeIf { it.isNotBlank() }
+            val block =
+                buildString {
+                    appendLine("刚刚「$who」当众骂了你：「${insult.quote.take(80)}」。")
+                    append("这不是旁听，是冲你来的，必须按你的人设做出反应：")
+                    append("脾气暴躁的人设可以直接怼回去，阴阳怪气的人设可以冷嘲，")
+                    append("温和的人设也可以冷处理或点破对方。")
+                    if (known != null) {
+                        append("你对「$who」的了解：$known。")
+                        append("熟人开玩笑和陌生人挑衅，反应程度应当不一样。")
+                    }
+                    append("底线：不攻击家人、不威胁、不连续对骂，一两句到位即可。")
+                }
+            result += ChatMessage(role = "system", content = block)
+            remaining -= TokenEstimator.estimate(block)
+        }
+
         // 3) 群聊背景：动态内容，预算紧张时最先牺牲
         val digest = memory?.roomDigest.orEmpty()
         if (digest.isNotEmpty() && remaining > 0) {

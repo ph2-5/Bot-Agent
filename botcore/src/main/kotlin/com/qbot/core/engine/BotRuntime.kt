@@ -7,6 +7,8 @@ import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.ChitchatGate
 import com.qbot.core.ai.ChitchatPolicy
 import com.qbot.core.ai.CommandOutcome
+import com.qbot.core.ai.InsultContext
+import com.qbot.core.ai.InsultDetector
 import com.qbot.core.ai.MemoryPipeline
 import com.qbot.core.ai.describe
 import com.qbot.core.api.OpenApi
@@ -93,6 +95,8 @@ class BotRuntime(
     private val chitchatConfigProvider: (() -> ChitchatConfig)? = null,
     /** 插话决策引擎；默认实例即可，测试可注入固定时钟 */
     private val chitchatPolicy: ChitchatPolicy = ChitchatPolicy(),
+    /** 冒犯检测：被指名辱骂时要按人设反应，不能装没看见 */
+    private val insultDetector: InsultDetector = InsultDetector(),
     /** 概率源，测试里可注入固定值 */
     private val random: () -> Double = { kotlin.random.Random.nextDouble() },
 ) : SimpleGatewayListener() {
@@ -300,6 +304,18 @@ class BotRuntime(
                 pipeline.groupProfile(groupId)
             }
 
+        val mentionIds = mentionIdsOf(message)
+        val names =
+            if (profile != null) {
+                listOfNotNull(profile.botName, botName.takeIf { it.isNotBlank() })
+            } else {
+                listOfNotNull(botName.takeIf { it.isNotBlank() })
+            }
+        // 被指名冒犯：名字（含后缀）+ 侮辱词同时成立才算
+        val insulted =
+            !addressed && insultDetector.isInsult(text) && insultDetector.targetsBot(text, names)
+        val talkingToOthers = insultDetector.talksToOthers(mentionIds, selfId)
+
         val gate =
             when {
                 addressed -> ChitchatGate.Skip("@ 了机器人，交给 @ 链路")
@@ -308,8 +324,14 @@ class BotRuntime(
                 else -> {
                     // 活跃度统计对所有消息生效（热群/冷场的自适应依赖它）
                     chitchatPolicy.observe(groupId)
-                    val names = listOfNotNull(profile.botName, botName.takeIf { it.isNotBlank() })
-                    chitchatPolicy.gate(groupId, text, names, chitchatConfig)
+                    chitchatPolicy.gate(
+                        groupId = groupId,
+                        text = text,
+                        botNames = names,
+                        config = chitchatConfig,
+                        insulted = insulted,
+                        talkingToOthers = talkingToOthers,
+                    )
                 }
             }
 
@@ -376,7 +398,17 @@ class BotRuntime(
         }
 
         runCatching {
-            val memory = pipeline.buildContext(message, selfId, text)
+            // 被指名冒犯时告诉模型"你刚被骂了"，人设才知道该反应而不是装没看见
+            val insult =
+                if (insulted) {
+                    InsultContext(
+                        byWhom = runCatching { pipeline.resolveLabel(message, text) }.getOrNull(),
+                        quote = text,
+                    )
+                } else {
+                    null
+                }
+            val memory = pipeline.buildContext(message, selfId, text, insult)
             val answer = responder.reply(message, aiConfig, memory)
             if (answer.isBlank()) return@runCatching
             sendReply(message, answer)
@@ -398,12 +430,16 @@ class BotRuntime(
         selfId: String,
     ): Boolean {
         if (message.content.contains("<@!$selfId>")) return true
-        val mentions = message.raw["mentions"] as? JsonArray ?: return false
-        // 不同事件版本把 id 放在不同字段里，逐个比对
-        return mentions.any { el ->
-            val obj = el as? JsonObject ?: return@any false
+        return mentionIdsOf(message).contains(selfId)
+    }
+
+    /** 提取消息 @ 的所有用户 id（不同事件版本字段名不一致，逐个取）。 */
+    private fun mentionIdsOf(message: IncomingMessage): List<String> {
+        val mentions = message.raw["mentions"] as? JsonArray ?: return emptyList()
+        return mentions.mapNotNull { el ->
+            val obj = el as? JsonObject ?: return@mapNotNull null
             listOf("id", "member_openid", "user_openid", "union_openid")
-                .any { key -> obj[key]?.jsonPrimitive?.contentOrNull == selfId }
+                .firstNotNullOfOrNull { key -> obj[key]?.jsonPrimitive?.contentOrNull }
         }
     }
 
@@ -526,8 +562,21 @@ class BotRuntime(
         text: String,
     ) {
         runCatching {
+            // @ 里直接骂人的（"你个傻逼"）也要让模型知道：这是冲你来的，
+            // 不是旁听。判定比旁听链路宽——@ 了机器人，侮辱词大概率是说给它听的。
+            val insult =
+                if (insultDetector.isInsult(text) &&
+                    (text.contains("你") || text.contains("您"))
+                ) {
+                    InsultContext(
+                        byWhom = memoryPipeline?.resolveLabel(message, text),
+                        quote = text,
+                    )
+                } else {
+                    null
+                }
             // 组装这条消息的记忆上下文：展示名 / 关于此人的事实 / 所在范围的近期对话
-            val memory = memoryPipeline?.buildContext(message, botId, text)
+            val memory = memoryPipeline?.buildContext(message, botId, text, insult)
             val answer = aiResponder!!.reply(message, config, memory)
             sendReply(message, answer)
             memoryPipeline?.recordExchange(message, text, answer)

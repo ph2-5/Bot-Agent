@@ -123,15 +123,21 @@ class ChitchatPolicy(
      * 预筛：判断这条消息值不值得让机器人接。
      *
      * @param botNames 机器人在本群的称呼（群名片优先，其次官方名）
+     * @param insulted 这句话是否在指名冒犯机器人（由 [InsultDetector] 判定）
+     * @param talkingToOthers 是否 @ 了别的群友
      */
     suspend fun gate(
         groupId: String,
         text: String,
         botNames: Collection<String>,
         config: ChitchatConfig,
+        insulted: Boolean = false,
+        talkingToOthers: Boolean = false,
     ): ChitchatGate {
         if (!config.enabled) return ChitchatGate.Skip("参与开关关闭")
         if (text.isBlank()) return ChitchatGate.Skip("空消息")
+        // @ 了别人：这是两个人之间的对话，再热闹也不接
+        if (talkingToOthers) return ChitchatGate.Skip("@ 了其他群友")
 
         val now = clock()
 
@@ -152,6 +158,15 @@ class ChitchatPolicy(
             }
             if (config.maxPerDay > 0 && state.speakTimes.size >= config.maxPerDay) {
                 return ChitchatGate.Skip("本日已达上限 ${config.maxPerDay} 次")
+            }
+
+            // 被指名冒犯是最高优先级：这是"人设是否可信"的问题，
+            // 不能交给概率和 AI 判断。仍保留最小间隔，避免对骂刷屏。
+            if (insulted) {
+                if (now - state.lastSpokeAt < NAME_MIN_GAP_MILLIS) {
+                    return ChitchatGate.Skip("刚说过话，冒犯回应冷却中")
+                }
+                return ChitchatGate.Forced("被指名冒犯")
             }
 
             if (named) {

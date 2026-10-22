@@ -261,6 +261,17 @@ data class QuotedMessage(
 )
 
 /**
+ * 一次指名针对机器人的冒犯。
+ *
+ * 用来告诉模型"你刚被骂了"，让它按人设决定反应强度，
+ * 而不是继续用"旁听者"的口吻装没看见。
+ */
+data class InsultContext(
+    val byWhom: String?,
+    val quote: String,
+)
+
+/**
  * 一条消息的记忆上下文（每次回复前组装）。
  *
  * @param senderLabel 已解析的展示名（回退值保证非空）
@@ -268,6 +279,7 @@ data class QuotedMessage(
  * @param roomDigest 所在范围的近期对话（注入提示词，群聊才非空）
  * @param group 所在群的画像（机器人群名片、见过多少成员；群聊才非空）
  * @param quoted 本条消息回复的那条原文（有引用关系时才非空）
+ * @param insult 本条消息是否在指名冒犯机器人
  */
 data class MemoryContext(
     val senderLabel: String,
@@ -275,6 +287,7 @@ data class MemoryContext(
     val roomDigest: List<RoomMessage> = emptyList(),
     val group: GroupDigest? = null,
     val quoted: QuotedMessage? = null,
+    val insult: InsultContext? = null,
 )
 
 /**
