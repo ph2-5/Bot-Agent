@@ -4,6 +4,7 @@ import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiResponder
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.InMemoryAiHistoryStore
+import com.qbot.core.ai.InMemoryChimeTrainer
 import com.qbot.core.ai.InMemoryGroupStore
 import com.qbot.core.ai.InMemoryIdentityStore
 import com.qbot.core.ai.InMemoryMemoryStore
@@ -54,6 +55,10 @@ class BotRuntimeChitchatTest {
     private lateinit var http: OkHttpClient
     private lateinit var groups: InMemoryGroupStore
     private lateinit var room: InMemoryRoomContextStore
+    private lateinit var trainer: InMemoryChimeTrainer
+
+    /** 判断调用的模型输出；测试里可改（默认 YES + 理由） */
+    private var llmVerdict = "YES\n有人在征求意见"
 
     private val sentMessages = CopyOnWriteArrayList<String>()
     private val llmBodies = CopyOnWriteArrayList<String>()
@@ -71,9 +76,22 @@ class BotRuntimeChitchatTest {
                             MockResponse().setBody("""{"access_token":"TK","expires_in":7200}""")
 
                         request.path == "/v1/chat/completions" -> {
-                            llmBodies += request.body.readUtf8()
+                            val body = request.body.readUtf8()
+                            llmBodies += body
+                            // 同一个端点承担两件事：插话判断与正式回复。
+                            // 用 system 提示词里的特征句区分，避免两套 mock。
+                            val content =
+                                if (body.contains("判断最后这条消息是否需要你接话")) {
+                                    llmVerdict
+                                } else {
+                                    "行啊，带我一个"
+                                }
+                            val escaped =
+                                content.replace("\\", "\\\\")
+                                    .replace("\n", "\\n")
+                                    .replace("\"", "\\\"")
                             MockResponse()
-                                .setBody("""{"choices":[{"message":{"content":"行啊，带我一个"}}]}""")
+                                .setBody("""{"choices":[{"message":{"content":"$escaped"}}]}""")
                         }
 
                         request.path!!.startsWith("/v2/groups/") -> {
@@ -101,6 +119,7 @@ class BotRuntimeChitchatTest {
     private fun buildRuntime(
         scope: CoroutineScope,
         chitchat: ChitchatConfig = ChitchatConfig(enabled = true, aiJudge = false),
+        random: () -> Double = { 0.0 },
     ): BotRuntime {
         val auth =
             AccessTokenManager(
@@ -122,6 +141,7 @@ class BotRuntimeChitchatTest {
             )
         groups = InMemoryGroupStore()
         room = InMemoryRoomContextStore()
+        trainer = InMemoryChimeTrainer()
         val pipeline =
             MemoryPipeline(
                 identities = InMemoryIdentityStore(),
@@ -147,8 +167,9 @@ class BotRuntimeChitchatTest {
             },
             memoryPipeline = pipeline,
             chitchatConfigProvider = { chitchat },
+            chimeTrainer = trainer,
             // 概率固定命中，避免测试随机抖动
-            random = { 0.0 },
+            random = random,
         )
     }
 
@@ -187,8 +208,12 @@ class BotRuntimeChitchatTest {
             },
     )
 
-    private suspend fun prepareRuntime(scope: CoroutineScope, config: ChitchatConfig = ChitchatConfig(enabled = true, aiJudge = false)): BotRuntime {
-        val runtime = buildRuntime(scope, config)
+    private suspend fun prepareRuntime(
+        scope: CoroutineScope,
+        config: ChitchatConfig = ChitchatConfig(enabled = true, aiJudge = false),
+        random: () -> Double = { 0.0 },
+    ): BotRuntime {
+        val runtime = buildRuntime(scope, config, random)
         // 模拟 READY：botId / botName 来自网关下发
         runtime.onReady("sid-1", ReadyUser(id = "bot-1", username = "小白"))
         runtime.onRawEvent("GROUP_ADD_ROBOT", rawEvent("GROUP_ADD_ROBOT", actorId = null))
@@ -323,5 +348,85 @@ class BotRuntimeChitchatTest {
             delay(500)
 
             assertEquals("重复推送不应回两次", 1, sentMessages.size)
+        }
+
+    // ---------- 训练闭环：决策记录 ----------
+
+    @Test
+    fun `不接话时也留下结构化决策记录`() =
+        runBlocking {
+            // 概率抽样必定不命中 → 走「概率未命中」分支
+            val runtime = prepareRuntime(this, random = { 1.0 })
+
+            runtime.onMessage(fullMessage("今晚有人开黑吗"))
+            withTimeout(15_000) {
+                while (trainer.decisions.isEmpty()) delay(50)
+            }
+
+            val record = trainer.decisions.single()
+            assertEquals("SILENT", record.action)
+            assertEquals("CANDIDATE", record.gatePath)
+            assertTrue("原因应保留分支文案，实际=${record.reason}", record.reason.contains("概率"))
+            assertEquals("member-1", record.speakerId)
+            assertEquals("小明", record.speakerName)
+            assertTrue("应带上规则分", (record.ruleScore ?: -1) >= 0)
+        }
+
+    @Test
+    fun `AI 判断不接时记录判断与理由`() =
+        runBlocking {
+            llmVerdict = "NO\n两人正在私聊"
+            val runtime =
+                prepareRuntime(this, ChitchatConfig(enabled = true, aiJudge = true))
+
+            runtime.onMessage(fullMessage("你吃了吗"))
+            withTimeout(15_000) {
+                while (trainer.decisions.isEmpty()) delay(50)
+            }
+
+            val record = trainer.decisions.single()
+            assertEquals("SILENT", record.action)
+            assertEquals("NO", record.aiVerdict)
+            assertTrue("应记录模型理由，实际=${record.aiReason}", record.aiReason?.contains("私聊") == true)
+        }
+
+    @Test
+    fun `接话后记录动作与回复内容`() =
+        runBlocking {
+            llmVerdict = "YES\n有人在征求意见"
+            val runtime =
+                prepareRuntime(this, ChitchatConfig(enabled = true, aiJudge = true))
+
+            runtime.onMessage(fullMessage("这个周末有人去爬山吗"))
+            awaitSent(1)
+            withTimeout(15_000) {
+                while (trainer.decisions.none { it.action == "SPOKE" }) delay(50)
+            }
+
+            val record = trainer.decisions.last { it.action == "SPOKE" }
+            assertEquals("YES", record.aiVerdict)
+            assertTrue("应记录实际回复，实际=${record.replyText}", record.replyText?.contains("行啊") == true)
+            assertTrue("应记录原始消息", record.messageText.contains("爬山"))
+        }
+
+    @Test
+    fun `学到的经验注入判断提示词并累计命中`() =
+        runBlocking {
+            llmVerdict = "YES\n有人在征求意见"
+            val runtime =
+                prepareRuntime(this, ChitchatConfig(enabled = true, aiJudge = true))
+            trainer.addLesson("有人提问时主动接话", scopeGroupId = "group-openid", updatedAt = 1)
+
+            runtime.onMessage(fullMessage("这个怎么设置"))
+            awaitSent(1)
+
+            val body = llmBodies.first { it.contains("判断最后这条消息是否需要你接话") }
+            assertTrue("经验应进入判断提示词，实际=$body", body.contains("有人提问时主动接话"))
+            assertTrue("应有经验块标题", body.contains("从主人反馈中学到的经验"))
+
+            withTimeout(15_000) {
+                while (trainer.lessons.single().hits == 0) delay(50)
+            }
+            assertEquals(1, trainer.lessons.single().hits)
         }
 }

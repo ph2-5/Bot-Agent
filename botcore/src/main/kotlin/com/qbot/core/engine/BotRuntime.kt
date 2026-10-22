@@ -3,6 +3,9 @@ package com.qbot.core.engine
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.AiResponder
+import com.qbot.core.ai.BehaviorContext
+import com.qbot.core.ai.ChimeDecisionRecord
+import com.qbot.core.ai.ChimeTrainer
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.ChitchatGate
 import com.qbot.core.ai.ChitchatPolicy
@@ -11,6 +14,7 @@ import com.qbot.core.ai.InsultContext
 import com.qbot.core.ai.InsultDetector
 import com.qbot.core.ai.MemoryPipeline
 import com.qbot.core.ai.PersonaBias
+import com.qbot.core.ai.RoomMessage
 import com.qbot.core.ai.describe
 import com.qbot.core.api.OpenApi
 import com.qbot.core.gateway.GatewayClient
@@ -101,6 +105,14 @@ class BotRuntime(
      * AI 插话判断的"按性格决定要不要接话"。
      */
     private val personaPromptProvider: (suspend (IncomingMessage) -> String?)? = null,
+    /**
+     * 插话决策出口（训练闭环）。
+     *
+     * [handleChitchat] 在 finally 里只调用一次：成功、失败、提前返回都会留一条
+     * 结构化记录。实现方负责落库、经验注入与命中计数；为 null 时完全关闭，
+     * 行为与 1.9.x 一致（测试与「不落库」模式用）。
+     */
+    private val chimeTrainer: ChimeTrainer? = null,
     /** 插话决策引擎；默认实例即可，测试可注入固定时钟 */
     private val chitchatPolicy: ChitchatPolicy = ChitchatPolicy(),
     /** 冒犯检测：被指名辱骂时要按人设反应，不能装没看见 */
@@ -379,89 +391,178 @@ class BotRuntime(
 
         // 2) 三级漏斗的后两级
         val config = chitchatConfig ?: return
-        val why =
-            when (val current = gate) {
-                is ChitchatGate.Skip -> {
-                    log(LogLevel.VERBOSE, TAG, "群聊消息不接：${current.reason}")
-                    return
-                }
 
-                is ChitchatGate.Forced -> current.reason
+        // 训练闭环：整个判断过程只在这里落一条记录，无论从哪个分支返回。
+        // 用 finally 而不是在每个 return 前写库——既不会漏记，也是未来把
+        // sink 换成事件总线（插件化）的前提。
+        var aiVerdict: String? = null
+        var aiReason: String? = null
+        var action = ChimeDecisionRecord.ACTION_SILENT
+        var finalReason = gate.describe()
+        var replyText: String? = null
+        val gatePath =
+            when (gate) {
+                is ChitchatGate.Forced -> ChimeDecisionRecord.GATE_FORCED
+                is ChitchatGate.Candidate -> ChimeDecisionRecord.GATE_CANDIDATE
+                is ChitchatGate.Skip -> ChimeDecisionRecord.GATE_SKIP
+            }
+        val ruleScore = (gate as? ChitchatGate.Candidate)?.score
 
-                is ChitchatGate.Candidate -> {
-                    if (config.aiJudge) {
-                        // AI 主导：每条候选都问模型，不再按概率抽样
-                        val aiCfg = aiConfigProvider?.invoke()
-                        val responder = aiResponder
-                        if (aiCfg == null || responder == null ||
-                            !aiCfg.enabled || !aiCfg.isReady
-                        ) {
-                            pipeline.markChitchatDecision(message, "不接：AI 未配置")
-                            return
+        try {
+            val why =
+                when (val current = gate) {
+                    is ChitchatGate.Skip -> {
+                        log(LogLevel.VERBOSE, TAG, "群聊消息不接：${current.reason}")
+                        return
+                    }
+
+                    is ChitchatGate.Forced -> current.reason
+
+                    is ChitchatGate.Candidate -> {
+                        if (config.aiJudge) {
+                            // AI 主导：每条候选都问模型，不再按概率抽样
+                            val aiCfg = aiConfigProvider?.invoke()
+                            val responder = aiResponder
+                            if (aiCfg == null || responder == null ||
+                                !aiCfg.enabled || !aiCfg.isReady
+                            ) {
+                                finalReason = "不接：AI 未配置"
+                                pipeline.markChitchatDecision(message, finalReason)
+                                return
+                            }
+                            // 经验注入：群级优先、全局兜底；失败不影响判断
+                            val lessons =
+                                runCatching {
+                                    chimeTrainer?.lessonsForPrompt(groupId) ?: emptyList()
+                                }.getOrDefault(emptyList())
+                            val verdict =
+                                runCatching {
+                                    responder.shouldChimeIn(
+                                        message,
+                                        aiCfg,
+                                        recent,
+                                        profile?.botName,
+                                        personaPrompt,
+                                        behavior =
+                                            BehaviorContext(
+                                                userRules = config.chimeRules,
+                                                lessons = lessons.map { it.text },
+                                            ),
+                                    )
+                                }.getOrNull()
+                            // 判断没跑起来（网络/配置）按不接处理
+                            if (verdict == null) {
+                                finalReason = "不接：AI 判断失败"
+                                pipeline.markChitchatDecision(message, finalReason)
+                                log(LogLevel.VERBOSE, TAG, "群聊消息不接：AI 判断失败")
+                                return
+                            }
+                            aiVerdict = if (verdict.should) "YES" else "NO"
+                            aiReason = verdict.reason
+                            // 被参考过的经验计一次命中（失败不影响判断）
+                            if (lessons.isNotEmpty()) {
+                                runCatching { chimeTrainer?.bumpHits(lessons.map { it.id }) }
+                            }
+                            if (!verdict.should) {
+                                finalReason = "不接：AI 判断不需要接话"
+                                pipeline.markChitchatDecision(message, finalReason)
+                                log(LogLevel.VERBOSE, TAG, "群聊消息不接：AI 判断不需要接话")
+                                return
+                            }
+                            "AI 判断接话"
+                        } else {
+                            // 规则主导：抽样概率随人设性格浮动（话痨 ×1.4，高冷 ×0.7）
+                            if (random() > (config.probability * personaBias.probabilityFactor).coerceAtMost(1.0)) {
+                                finalReason = "不接：概率未命中"
+                                pipeline.markChitchatDecision(message, finalReason)
+                                log(LogLevel.VERBOSE, TAG, "群聊消息不接：概率未命中")
+                                return
+                            }
+                            "规则 ${current.score} 分"
                         }
-                        val should =
-                            runCatching {
-                                responder.shouldChimeIn(
-                                    message,
-                                    aiCfg,
-                                    recent,
-                                    profile?.botName,
-                                    personaPrompt,
-                                    userRules = config.chimeRules,
-                                )
-                            }.getOrNull() ?: false
-                        if (!should) {
-                            pipeline.markChitchatDecision(message, "不接：AI 判断不需要接话")
-                            log(LogLevel.VERBOSE, TAG, "群聊消息不接：AI 判断不需要接话")
-                            return
-                        }
-                        "AI 判断接话"
-                    } else {
-                        // 规则主导：抽样概率随人设性格浮动（话痨 ×1.4，高冷 ×0.7）
-                        if (random() > (config.probability * personaBias.probabilityFactor).coerceAtMost(1.0)) {
-                            pipeline.markChitchatDecision(message, "不接：概率未命中")
-                            log(LogLevel.VERBOSE, TAG, "群聊消息不接：概率未命中")
-                            return
-                        }
-                        "规则 ${current.score} 分"
                     }
                 }
+
+            // 3) 回复：人设 + 关于此人的事实 + 整个群最近的聊天
+            val aiConfig = aiConfigProvider?.invoke()
+            val responder = aiResponder
+            if (aiConfig == null || responder == null || !aiConfig.enabled || !aiConfig.isReady) {
+                finalReason = "不接：AI 未配置"
+                pipeline.markChitchatDecision(message, finalReason)
+                return
             }
 
-        // 3) 回复：人设 + 关于此人的事实 + 整个群最近的聊天
-        val aiConfig = aiConfigProvider?.invoke() ?: return
-        val responder = aiResponder ?: return
-        if (!aiConfig.enabled || !aiConfig.isReady) {
-            pipeline.markChitchatDecision(message, "不接：AI 未配置")
-            return
-        }
-
-        runCatching {
-            // 被指名冒犯时告诉模型"你刚被骂了"，人设才知道该反应而不是装没看见
-            val insult =
-                if (insulted) {
-                    InsultContext(
-                        byWhom = runCatching { pipeline.resolveLabel(message, text) }.getOrNull(),
-                        quote = text,
-                    )
-                } else {
-                    null
+            runCatching {
+                // 被指名冒犯时告诉模型"你刚被骂了"，人设才知道该反应而不是装没看见
+                val insult =
+                    if (insulted) {
+                        InsultContext(
+                            byWhom = runCatching { pipeline.resolveLabel(message, text) }.getOrNull(),
+                            quote = text,
+                        )
+                    } else {
+                        null
+                    }
+                val memory = pipeline.buildContext(message, selfId, text, insult)
+                val answer = responder.reply(message, aiConfig, memory)
+                if (answer.isBlank()) {
+                    finalReason = "不接：回复为空"
+                    return@runCatching
                 }
-            val memory = pipeline.buildContext(message, selfId, text, insult)
-            val answer = responder.reply(message, aiConfig, memory)
-            if (answer.isBlank()) return@runCatching
-            sendReply(message, answer)
-            chitchatPolicy.markSpoke(groupId)
-            // 用户那条已经由 recordChitchat 写过，这里只补机器人这一条
-            pipeline.recordChitchatAnswer(message, answer)
-            pipeline.markChitchatDecision(message, "已接话（$why）")
-            log(LogLevel.INFO, TAG, "群聊插话（$why，${answer.length} 字）")
-        }.onFailure { t ->
-            pipeline.markChitchatDecision(message, "不接：回复失败")
-            logger.e(TAG, "群聊插话失败", t)
-            log(LogLevel.WARN, TAG, "群聊插话失败：${t.message}")
+                sendReply(message, answer)
+                chitchatPolicy.markSpoke(groupId)
+                // 用户那条已经由 recordChitchat 写过，这里只补机器人这一条
+                pipeline.recordChitchatAnswer(message, answer)
+                pipeline.markChitchatDecision(message, "已接话（$why）")
+                action = ChimeDecisionRecord.ACTION_SPOKE
+                replyText = answer
+                finalReason = "已接话（$why）"
+                log(LogLevel.INFO, TAG, "群聊插话（$why，${answer.length} 字）")
+            }.onFailure { t ->
+                finalReason = "不接：回复失败"
+                pipeline.markChitchatDecision(message, finalReason)
+                logger.e(TAG, "群聊插话失败", t)
+                log(LogLevel.WARN, TAG, "群聊插话失败：${t.message}")
+            }
+        } finally {
+            // 训练闭环的单一入口：成功 / 失败 / 提前返回都记一条
+            chimeTrainer?.let { trainer ->
+                runCatching {
+                    trainer.onDecision(
+                        ChimeDecisionRecord(
+                            groupId = groupId,
+                            speakerId = message.senderId,
+                            speakerName = message.senderName,
+                            messageText = text.take(200),
+                            contextSnippet = buildContextSnippet(recent),
+                            ruleScore = ruleScore,
+                            gatePath = gatePath,
+                            aiVerdict = aiVerdict,
+                            aiReason = aiReason,
+                            action = action,
+                            reason = finalReason,
+                            replyText = replyText?.take(200),
+                            addressed = addressed,
+                            insulted = insulted,
+                            externalId = message.messageId,
+                            createdAt = System.currentTimeMillis(),
+                        ),
+                    )
+                }
+            }
         }
     }
+
+    /** 把最近几条群消息压成一段转录，供复盘页还原"当时的局面"。 */
+    private fun buildContextSnippet(recent: List<RoomMessage>): String =
+        recent
+            .takeLast(8)
+            .joinToString("\n") { msg ->
+                val who =
+                    msg.senderName?.takeIf { it.isNotBlank() }
+                        ?: if (msg.role == "assistant") botName.ifBlank { "机器人" } else "某人"
+                "[$who] ${msg.content.replace("\n", " ").take(60)}"
+            }.take(400)
 
     /** 消息里是否 @ 了机器人（全量模式下 @ 消息也可能从这里进来）。 */
     private fun mentionsBot(

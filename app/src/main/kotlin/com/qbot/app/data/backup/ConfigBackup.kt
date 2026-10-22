@@ -33,6 +33,8 @@ data class ConfigBackup(
     val personas: List<PersonaBackup> = emptyList(),
     @SerialName("display_names") val displayNames: List<DisplayNameBackup> = emptyList(),
     @SerialName("group_bot_names") val groupBotNames: List<GroupBotNameBackup> = emptyList(),
+    /** 2.0.0 新增：从反馈学到的接话经验（用户的训练成果，换机不该丢） */
+    @SerialName("chime_lessons") val chimeLessons: List<LessonBackup> = emptyList(),
 ) {
     companion object {
         private val json =
@@ -140,4 +142,20 @@ data class DisplayNameBackup(
 data class GroupBotNameBackup(
     @SerialName("group_id") val groupId: String,
     @SerialName("bot_name") val botName: String,
+)
+
+/**
+ * 一条接话经验。
+ *
+ * 只备份经验本身与作用域；`hits` 一起带上，换机后能保留"哪几条真的常用"。
+ * 决策日志属于运行数据，不备份。
+ */
+@Serializable
+data class LessonBackup(
+    val text: String,
+    val source: String = "REFLECTION",
+    @SerialName("group_id") val groupId: String? = null,
+    val hits: Int = 0,
+    @SerialName("created_at") val createdAt: Long = 0,
+    @SerialName("updated_at") val updatedAt: Long = 0,
 )

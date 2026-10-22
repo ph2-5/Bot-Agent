@@ -28,8 +28,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Slider
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
@@ -48,19 +46,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.qbot.app.BotApplication
-import com.qbot.app.data.repo.GreetingConfig
 import com.qbot.app.data.repo.GroupSummary
 import com.qbot.app.data.repo.observeSummaries
-import com.qbot.app.ui.components.ExpandableSection
-import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.KnownPerson
-import com.qbot.core.ai.MemoryConfig
 import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.Persona
 import com.qbot.core.ai.PersonaSnapshot
 import com.qbot.core.ai.PersonaSnapshotKind
 import com.qbot.core.ai.RoomMessage
-import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.UserFact
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -81,7 +74,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun AiScreen() {
     var tab by remember { mutableIntStateOf(0) }
-    val tabs = listOf("记忆", "人设", "群组")
+    val tabs = listOf("记忆", "人设", "群组", "接话")
 
     Column(modifier = Modifier.fillMaxSize()) {
         TabRow(selectedTabIndex = tab) {
@@ -96,7 +89,8 @@ fun AiScreen() {
         when (tab) {
             0 -> MemoryTab()
             1 -> PersonaTab()
-            else -> GroupTab()
+            2 -> GroupTab()
+            else -> ChimeReviewScreen()
         }
     }
 }
@@ -155,11 +149,6 @@ private fun MemoryTab() {
                 .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        MemoryConfigCard(
-            config = memoryConfig,
-            onChange = { app.settings.saveMemoryConfig(it) },
-        )
-
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -172,6 +161,12 @@ private fun MemoryTab() {
                 Modifier.weight(1f),
             )
         }
+
+        Text(
+            "记忆参数（开关、容量）在「设置 → 记忆系统」",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
 
         if (people.isEmpty()) {
             EmptyHint(
@@ -233,88 +228,6 @@ private fun MemoryTab() {
                 }
             },
         )
-    }
-}
-
-@Composable
-private fun MemoryConfigCard(
-    config: MemoryConfig,
-    onChange: (MemoryConfig) -> Unit,
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text("记忆系统", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
-
-            SwitchRow(
-                title = "启用记忆",
-                desc = "关闭后退化为纯对话机器人：不认人、不记事",
-                checked = config.enabled,
-                onCheckedChange = { onChange(config.copy(enabled = it)) },
-            )
-
-            SwitchRow(
-                title = "学习自称名",
-                desc = "用户说「叫我XXX」时记住，群里就能认人",
-                checked = config.learnNames,
-                onCheckedChange = { onChange(config.copy(learnNames = it)) },
-                enabled = config.enabled,
-            )
-
-            SwitchRow(
-                title = "提取事实",
-                desc = "从「我喜欢/在备考/住在…」这类陈述里提取长期记忆",
-                checked = config.learnFacts,
-                onCheckedChange = { onChange(config.copy(learnFacts = it)) },
-                enabled = config.enabled,
-            )
-
-            SwitchRow(
-                title = "共享群聊背景",
-                desc = "记住群里最近的对话，让「那他呢」这类承接能听懂",
-                checked = config.roomContextEnabled,
-                onCheckedChange = { onChange(config.copy(roomContextEnabled = it)) },
-                enabled = config.enabled,
-            )
-
-            SwitchRow(
-                title = "指令回复人设化",
-                desc = "「我叫什么 / 我的记忆 / 叫你X / 群里都有谁」等指令的结果" +
-                    "交给 AI 按人设语气说出，不再用固定句式；关闭后走固定文案，不消耗 API",
-                checked = config.personaRewrite,
-                onCheckedChange = { onChange(config.copy(personaRewrite = it)) },
-                enabled = config.enabled,
-            )
-
-            Text(
-                "每人最多保留 ${config.factsPerPerson} 条事实（超出自动淘汰最旧的）",
-                style = MaterialTheme.typography.labelMedium,
-            )
-            Slider(
-                value = config.factsPerPerson.toFloat(),
-                onValueChange = { onChange(config.copy(factsPerPerson = it.toInt().coerceIn(5, 100))) },
-                valueRange = 5f..100f,
-                enabled = config.enabled,
-            )
-
-            Text(
-                "群聊背景保留 ${config.roomContextSize} 条",
-                style = MaterialTheme.typography.labelMedium,
-            )
-            Slider(
-                value = config.roomContextSize.toFloat(),
-                onValueChange = {
-                    onChange(config.copy(roomContextSize = it.toInt().coerceIn(5, 50)))
-                },
-                valueRange = 5f..50f,
-                enabled = config.enabled && config.roomContextEnabled,
-            )
-        }
     }
 }
 
@@ -992,8 +905,6 @@ private fun GroupTab() {
     val groupStore = controller.groupStore()
     val scope = rememberCoroutineScope()
 
-    val greeting by controller.greetingConfig.collectAsState()
-    val chitchat by controller.chitchatConfig.collectAsState()
     val gatewayStatus by controller.status.collectAsState()
     val summaries by groupStore.observeSummaries().collectAsState(initial = emptyList())
 
@@ -1014,16 +925,6 @@ private fun GroupTab() {
             state = gatewayStatus.state.name,
             counts = gatewayStatus.eventCounts,
             intents = gatewayStatus.intents,
-        )
-
-        ChitchatCard(
-            config = chitchat,
-            onChange = { app.settings.saveChitchatConfig(it) },
-        )
-
-        GreetingCard(
-            config = greeting,
-            onChange = { app.settings.saveGreetingConfig(it) },
         )
 
         Card(
@@ -1202,424 +1103,6 @@ private fun GatewayEventsCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-        }
-    }
-}
-
-/**
- * 群聊参与卡片。
- *
- * 门槛在群主那边：只有群主把机器人的「消息范围」改成获取群内全部消息，
- * 非 @ 消息才会推过来。所以卡片第一块是授权指引，而不是参数。
- *
- * 结构分两层：**基础区**（频率类参数，常开）+ **高级分区**（折叠）——
- * 打分明细、AI 接话规则、冒犯词表都属于「调过一次就不再碰」的参数，
- * 默认收起，避免这张卡本身变成第二个长滚动页。
- */
-@Composable
-private fun ChitchatCard(
-    config: ChitchatConfig,
-    onChange: (ChitchatConfig) -> Unit,
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text("群聊参与", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
-            Text(
-                "授权后机器人能看见群里所有消息，并在合适的时候自己接话；" +
-                    "没授权时它仍然只回复 @ 它的消息。",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
-            ) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("群主怎么授权", fontWeight = FontWeight.Medium)
-                    Text(
-                        "QQ 群设置 → 群机器人 → 本机器人资料页 → 把「机器人可获取的群聊消息范围」" +
-                            "改成「获取群内全部消息」。每个群要单独开一次，" +
-                            "关掉时机器人会收到通知并自动停止接话。",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-
-            SwitchRow(
-                title = "允许自己接话",
-                desc = "关闭后仍会把群消息记进记忆，但绝不主动发言",
-                checked = config.enabled,
-                onCheckedChange = { onChange(config.copy(enabled = it)) },
-            )
-
-            SwitchRow(
-                title = "让 AI 决定要不要接话（推荐）",
-                desc = "开启后每条消息都交给 AI 判断（规则只挡单字、@别人等明显噪音），" +
-                    "最懂语境；每条多一次很小的模型调用（maxTokens=8）",
-                checked = config.aiJudge,
-                onCheckedChange = { onChange(config.copy(aiJudge = it)) },
-                enabled = config.enabled,
-            )
-
-            // ---------- 基础区：频率与身份 ----------
-            Text(
-                "冷却 ${config.baseCooldownMillis / 1000} 秒（群里聊得热闹时自动放慢，冷场时加快；最低 1 秒）",
-                style = MaterialTheme.typography.labelMedium,
-            )
-            Slider(
-                value = (config.baseCooldownMillis / 1000).toFloat().coerceIn(1f, 300f),
-                onValueChange = {
-                    onChange(config.copy(baseCooldownMillis = it.toInt().coerceIn(1, 300) * 1000L))
-                },
-                valueRange = 1f..300f,
-                enabled = config.enabled,
-            )
-
-            Text(
-                if (config.maxPerHour <= 0) {
-                    "每小时接话：无上限"
-                } else {
-                    "每小时最多接话 ${config.maxPerHour} 次"
-                },
-                style = MaterialTheme.typography.labelMedium,
-            )
-            Slider(
-                value = config.maxPerHour.toFloat().coerceIn(0f, 200f),
-                onValueChange = { onChange(config.copy(maxPerHour = it.toInt().coerceIn(0, 200))) },
-                valueRange = 0f..200f,
-                enabled = config.enabled,
-            )
-            Text(
-                "调到 0 表示不限制（只靠冷却控制节奏）",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-
-            Text(
-                if (config.maxPerDay <= 0) {
-                    "每天接话：无上限"
-                } else {
-                    "每天最多接话 ${config.maxPerDay} 次"
-                },
-                style = MaterialTheme.typography.labelMedium,
-            )
-            Slider(
-                value = config.maxPerDay.toFloat().coerceIn(0f, 1000f),
-                onValueChange = { onChange(config.copy(maxPerDay = it.toInt().coerceIn(0, 1000))) },
-                valueRange = 0f..1000f,
-                steps = 99,
-                enabled = config.enabled,
-            )
-
-            SwitchRow(
-                title = "被叫名字必答",
-                desc = "有人叫机器人的名字（含群名片、短昵称）时一定接话，" +
-                    "不受冷却限制（仍有 5 秒最小间隔防刷屏）",
-                checked = config.answerOnName,
-                onCheckedChange = { onChange(config.copy(answerOnName = it)) },
-                enabled = config.enabled,
-            )
-
-            Text(
-                "候选消息参与概率 ${(config.probability * 100).toInt()}%（仅关闭 AI 判断时生效）",
-                style = MaterialTheme.typography.labelMedium,
-            )
-            Slider(
-                value = (config.probability * 100).toFloat(),
-                onValueChange = {
-                    onChange(config.copy(probability = it.toInt().coerceIn(5, 100) / 100.0))
-                },
-                valueRange = 5f..100f,
-                enabled = config.enabled,
-            )
-
-            // ---------- 高级分区 1：评分微调 ----------
-            ExpandableSection(
-                title = "评分微调",
-                subtitle = "各情形加/扣分与过筛门槛。关闭 AI 判断时分数达门槛才接话；" +
-                    "开启时只有负分消息会被拦（噪音过滤）",
-            ) {
-                val weights = config.scoreWeights
-                Text(
-                    "过筛分数门槛：${config.minScore}",
-                    style = MaterialTheme.typography.labelMedium,
-                )
-                Slider(
-                    value = config.minScore.toFloat(),
-                    onValueChange = { onChange(config.copy(minScore = it.toInt())) },
-                    valueRange = 0f..40f,
-                    steps = 39,
-                    enabled = config.enabled,
-                )
-                ScoreSlider(
-                    label = "长度适中（2~60 字）",
-                    value = weights.lengthScore,
-                    range = 0..20,
-                    enabled = config.enabled,
-                ) { onChange(config.copy(scoreWeights = weights.copy(lengthScore = it))) }
-                ScoreSlider(
-                    label = "疑问句（吗/呢/怎么/为什么…）",
-                    value = weights.questionScore,
-                    range = 0..40,
-                    enabled = config.enabled,
-                ) { onChange(config.copy(scoreWeights = weights.copy(questionScore = it))) }
-                ScoreSlider(
-                    label = "单字或表情消息",
-                    value = weights.shortPenalty,
-                    range = -40..0,
-                    enabled = config.enabled,
-                ) { onChange(config.copy(scoreWeights = weights.copy(shortPenalty = it))) }
-                ScoreSlider(
-                    label = "@ 了别人（两人对话不该插嘴）",
-                    value = weights.mentionPenalty,
-                    range = -40..0,
-                    enabled = config.enabled,
-                ) { onChange(config.copy(scoreWeights = weights.copy(mentionPenalty = it))) }
-                ScoreSlider(
-                    label = "话题延续（与最近消息聊的一样）",
-                    value = weights.topicScore,
-                    range = 0..30,
-                    enabled = config.enabled,
-                ) { onChange(config.copy(scoreWeights = weights.copy(topicScore = it))) }
-                ScoreSlider(
-                    label = "有人在回应机器人（上一条是它说的）",
-                    value = weights.respondBotScore,
-                    range = 0..30,
-                    enabled = config.enabled,
-                ) { onChange(config.copy(scoreWeights = weights.copy(respondBotScore = it))) }
-                ScoreSlider(
-                    label = "冷场（群里半天没人说话）",
-                    value = weights.quietScore,
-                    range = 0..20,
-                    enabled = config.enabled,
-                ) { onChange(config.copy(scoreWeights = weights.copy(quietScore = it))) }
-                ScoreSlider(
-                    label = "同一人连续刷屏",
-                    value = weights.spamPenalty,
-                    range = -30..0,
-                    enabled = config.enabled,
-                ) { onChange(config.copy(scoreWeights = weights.copy(spamPenalty = it))) }
-
-                TextButton(
-                    onClick = {
-                        onChange(
-                            config.copy(
-                                minScore = ChitchatConfig().minScore,
-                                scoreWeights = ScoreWeights(),
-                            ),
-                        )
-                    },
-                ) {
-                    Text("恢复默认分值与门槛")
-                }
-                Text(
-                    "拿不准就先只动「过筛分数门槛」：调高变高冷，调低变话痨。" +
-                        "人设里的「话痨/高冷」关键词也会自动微调它（±10）。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            // ---------- 高级分区 2：AI 接话规则 ----------
-            ExpandableSection(
-                title = "AI 接话规则",
-                subtitle = "用自己的话约定什么场合该接话，优先级高于通用规则",
-            ) {
-                TextListEditor(
-                    items = config.chimeRules,
-                    emptyHint = "还没有自定义规则，AI 按通用规则判断。",
-                    placeholder = "例如：群里讨论工作时不要插话",
-                    addLabel = "添加规则",
-                    maxItems = 10,
-                    maxLength = 100,
-                    enabled = config.enabled,
-                    onRemove = { rule ->
-                        onChange(config.copy(chimeRules = config.chimeRules - rule))
-                    },
-                    onAdd = { rule ->
-                        onChange(config.copy(chimeRules = config.chimeRules + rule))
-                    },
-                )
-                Text(
-                    "规则会注入 AI 的接话判断提示词，例如：" +
-                        "「只有被叫到名字或有人求助才接话」「凌晨不要接话」。" +
-                        "已添加 ${config.chimeRules.size}/10 条。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            // ---------- 高级分区 3：冒犯词表 ----------
-            ExpandableSection(
-                title = "冒犯词表",
-                subtitle = "被叫名字时带这些词 = 被冒犯，机器人会按人设反应",
-            ) {
-                TextListEditor(
-                    items = config.insultExtraWords,
-                    emptyHint = "只使用内置词表（傻逼/智障/废物等常见词）。",
-                    placeholder = "例如：菜狗（你们群里的黑话）",
-                    addLabel = "添加词语",
-                    maxItems = 50,
-                    maxLength = 10,
-                    enabled = config.enabled,
-                    onRemove = { word ->
-                        onChange(config.copy(insultExtraWords = config.insultExtraWords - word))
-                    },
-                    onAdd = { word ->
-                        onChange(config.copy(insultExtraWords = config.insultExtraWords + word))
-                    },
-                )
-                Text(
-                    "语言的黑话与谐音层出不穷，内置表不可能穷尽。" +
-                        "把你们群里实际出现的词加进来，「叫名字 + 这些词」才会触发按人设的反应。" +
-                        "已添加 ${config.insultExtraWords.size}/50 个。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-    }
-}
-
-/**
- * 带正负号显示的打分滑杆。
- *
- * 负分项（单字、@别人、刷屏）的范围是负数区间，显示时带符号，
- * 让「扣多少」和「加多少」在视觉上对称。
- */
-@Composable
-private fun ScoreSlider(
-    label: String,
-    value: Int,
-    range: IntRange,
-    enabled: Boolean,
-    onChange: (Int) -> Unit,
-) {
-    val sign = if (value > 0) "+" else ""
-    Text("$label：$sign$value 分", style = MaterialTheme.typography.labelMedium)
-    Slider(
-        value = value.toFloat(),
-        onValueChange = { onChange(it.toInt()) },
-        valueRange = range.first.toFloat()..range.last.toFloat(),
-        steps = range.last - range.first - 1,
-        enabled = enabled,
-    )
-}
-
-/**
- * 自然语言列表编辑器（AI 接话规则 / 冒犯词表共用）。
- *
- * 配置驱动而不是两份复制粘贴的代码：上限、字数、按钮文案都是参数。
- */
-@Composable
-private fun TextListEditor(
-    items: List<String>,
-    emptyHint: String,
-    placeholder: String,
-    addLabel: String,
-    maxItems: Int,
-    maxLength: Int,
-    enabled: Boolean,
-    onRemove: (String) -> Unit,
-    onAdd: (String) -> Unit,
-) {
-    var input by remember { mutableStateOf("") }
-
-    if (items.isEmpty()) {
-        Text(
-            emptyHint,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
-    items.forEach { item ->
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("· $item", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-            IconButton(onClick = { onRemove(item) }) {
-                Icon(Icons.Filled.Delete, contentDescription = "删除")
-            }
-        }
-    }
-
-    if (items.size < maxItems) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = input,
-                onValueChange = { if (it.length <= maxLength) input = it },
-                placeholder = { Text(placeholder) },
-                singleLine = true,
-                enabled = enabled,
-                modifier = Modifier.weight(1f),
-            )
-            Spacer(Modifier.width(8.dp))
-            Button(
-                onClick = {
-                    val text = input.trim()
-                    if (text.isNotEmpty()) {
-                        onAdd(text.take(maxLength))
-                        input = ""
-                    }
-                },
-                enabled = enabled && input.isNotBlank(),
-            ) {
-                Text(addLabel)
-            }
-        }
-    } else {
-        Text(
-            "已达上限 $maxItems 条，先删掉一些才能添加。",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.error,
-        )
-    }
-}
-
-@Composable
-private fun GreetingCard(
-    config: GreetingConfig,
-    onChange: (GreetingConfig) -> Unit,
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text("加群问候语", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
-
-            SwitchRow(
-                title = "被拉进群时打招呼",
-                desc = "开启后进群会主动发一句自我介绍（属于主动消息，消耗每日配额）",
-                checked = config.enabled,
-                onCheckedChange = { onChange(config.copy(enabled = it)) },
-            )
-
-            OutlinedTextField(
-                value = config.text,
-                onValueChange = { onChange(config.copy(text = it)) },
-                label = { Text("问候语正文") },
-                minLines = 2,
-                enabled = config.enabled,
-                modifier = Modifier.fillMaxWidth(),
-            )
-
-            Text(
-                "留空等同于关闭。问候语只在新群第一次进群时发；" +
-                    "群管理员关闭主动消息后（GROUP_MSG_REJECT）不再发送。",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
         }
     }
 }
@@ -1902,29 +1385,5 @@ private fun EmptyHint(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-    }
-}
-
-@Composable
-private fun SwitchRow(
-    title: String,
-    desc: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit,
-    enabled: Boolean = true,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(title, fontWeight = FontWeight.Medium)
-            Text(
-                desc,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
     }
 }

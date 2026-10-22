@@ -140,8 +140,10 @@ interface AiHistoryDao {
         PersonaSnapshotEntity::class,
         GroupEntity::class,
         GroupMemberEntity::class,
+        ChimeDecisionEntity::class,
+        ChimeLessonEntity::class,
     ],
-    version = 6,
+    version = 7,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -164,6 +166,10 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun groupDao(): GroupDao
 
     abstract fun groupMemberDao(): GroupMemberDao
+
+    abstract fun chimeDecisionDao(): ChimeDecisionDao
+
+    abstract fun chimeLessonDao(): ChimeLessonDao
 
     companion object {
         /**
@@ -316,6 +322,79 @@ abstract class AppDatabase : RoomDatabase() {
                     )
                     db.execSQL("ALTER TABLE room_messages ADD COLUMN externalId TEXT")
                     db.execSQL("ALTER TABLE room_messages ADD COLUMN decision TEXT")
+                }
+            }
+
+        /**
+         * v6 → v7：接话训练闭环（决策日志 + 经验库）。
+         *
+         * 纯增量：只建两张新表，不碰任何既有数据。
+         * 索引名必须与 Room 生成规则一致（index_<表>_<列>），
+         * 否则打开数据库时 schema 校验失败——而本项目开着
+         * fallbackToDestructiveMigration，校验失败会直接清库。
+         */
+        val MIGRATION_6_7 =
+            object : androidx.room.migration.Migration(6, 7) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS chime_decisions (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            groupId TEXT NOT NULL,
+                            externalId TEXT,
+                            speakerId TEXT,
+                            speakerName TEXT,
+                            messageText TEXT NOT NULL,
+                            contextSnippet TEXT NOT NULL,
+                            ruleScore INTEGER,
+                            gatePath TEXT NOT NULL,
+                            aiVerdict TEXT,
+                            aiReason TEXT,
+                            action TEXT NOT NULL,
+                            reason TEXT NOT NULL,
+                            replyText TEXT,
+                            addressed INTEGER NOT NULL DEFAULT 0,
+                            insulted INTEGER NOT NULL DEFAULT 0,
+                            feedback INTEGER,
+                            correctedAction TEXT,
+                            feedbackNote TEXT,
+                            feedbackAt INTEGER,
+                            createdAt INTEGER NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS index_chime_decisions_groupId" +
+                            " ON chime_decisions(groupId)",
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS index_chime_decisions_createdAt" +
+                            " ON chime_decisions(createdAt)",
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS index_chime_decisions_feedback" +
+                            " ON chime_decisions(feedback)",
+                    )
+
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS chime_lessons (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            text TEXT NOT NULL,
+                            source TEXT NOT NULL,
+                            scopeGroupId TEXT,
+                            fromDecisionId INTEGER,
+                            hits INTEGER NOT NULL DEFAULT 0,
+                            enabled INTEGER NOT NULL DEFAULT 1,
+                            createdAt INTEGER NOT NULL,
+                            updatedAt INTEGER NOT NULL
+                        )
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS index_chime_lessons_updatedAt" +
+                            " ON chime_lessons(updatedAt)",
+                    )
                 }
             }
     }

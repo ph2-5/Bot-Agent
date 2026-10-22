@@ -150,6 +150,25 @@ class InMemoryAiHistoryStore : AiHistoryStore {
 }
 
 /**
+ * 判断链路的全部「行为约束」。
+ *
+ * 优先级：userRules（用户显式规则）> lessons（从反馈学到的经验）> 通用规则。
+ * 未来扩展点放在这里，而不是继续往 [AiResponder.shouldChimeIn] 加参数：
+ * mood（情绪语气）、affinity（好感亲疏）、memes（热梗）都会是新的字段。
+ */
+data class BehaviorContext(
+    val userRules: List<String> = emptyList(),
+    val lessons: List<String> = emptyList(),
+)
+
+/** 插话判断结果：是否接话 + 一句理由。 */
+data class ChimeVerdict(
+    val should: Boolean,
+    /** ≤40 字；模型没给理由时为 null。复盘页与反思都依赖它。 */
+    val reason: String? = null,
+)
+
+/**
  * AI 应答器。
  *
  * 职责：
@@ -189,6 +208,18 @@ class AiResponder(
 
         /** 插话判断提示词里最多注入多少条用户规则，防止把 system 撑爆 */
         const val MAX_USER_RULES = 10
+
+        /** 每次判断最多注入几条「学到的经验」 */
+        const val MAX_LESSONS = 8
+
+        /** 单条用户规则的字符上限 */
+        const val MAX_RULE_CHARS = 100
+
+        /** 单条经验的字符上限（与反思的输出要求一致） */
+        const val MAX_LESSON_CHARS = 40
+
+        /** 判断理由的字符上限 */
+        const val MAX_REASON_CHARS = 40
     }
 
     // 同一会话串行处理：群聊里多人连问时，避免并发请求把历史顺序打乱。
@@ -300,14 +331,15 @@ class AiResponder(
      *
      * [personaPrompt] 是当前生效的人设（按 人→群→全局 解析）。
      * 带上它之后，"要不要接话"就由性格决定——参考 HUMA 与 Big Five 人格
-     * 调制的结论：外向人格更愿意参与，内向人格更挑剔。这正是"评分体系
-     * 与系统提示词关联"的第三级实现。
+     * 调制的结论：外向人格更愿意参与，内向人格更挑剔。
      *
-     * [userRules] 是用户在维护端自定义的接话规则（自然语言），
-     * 追加在通用 YES/NO 规则之后、**优先级更高**——通用规则管常识，
-     * 用户规则管这个群的特殊约定（"讨论工作时别插话"之类）。
+     * [behavior] 收拢了所有行为约束：用户显式规则 + 从反馈学到的经验。
+     * 未来情绪值 / 好感度 / 热梗也在这里扩展，判断链路的签名不用再变。
      *
-     * 判定失败（网络/配置）一律返回 false——宁可少说一句，
+     * 返回 [ChimeVerdict]（是否接话 + 一句理由）。理由是复盘页与反思的原料：
+     * 没有它，用户只能看到「AI 判断不需要接话」，无法指出具体哪里想错了。
+     *
+     * 判定失败（网络/配置）一律返回 should=false——宁可少说一句，
      * 也不要因为判断服务抖动而在群里乱插话。
      */
     suspend fun shouldChimeIn(
@@ -316,8 +348,8 @@ class AiResponder(
         recent: List<RoomMessage>,
         botName: String?,
         personaPrompt: String? = null,
-        userRules: List<String> = emptyList(),
-    ): Boolean {
+        behavior: BehaviorContext = BehaviorContext(),
+    ): ChimeVerdict {
         val speaker = message.senderName?.takeIf { it.isNotBlank() } ?: "群友"
         val transcript =
             recent.takeLast(8).joinToString("\n") { msg ->
@@ -332,17 +364,7 @@ class AiResponder(
                     "结合这个性格判断：外向爱聊的性格可以更主动接话，" +
                     "高冷话少的性格只在确有必要时才接话。\n"
             }.orEmpty()
-        val userRulesBlock =
-            userRules
-                .filter { it.isNotBlank() }
-                .take(MAX_USER_RULES)
-                .takeIf { it.isNotEmpty() }
-                ?.let { rules ->
-                    // 用户规则优先级高于通用规则：这是群的"家规"，
-                    // 与通用判断冲突时以用户规则为准。
-                    "用户补充规则（优先级高于以上通用规则，必须遵守）：\n" +
-                        rules.joinToString("\n") { "- $it" } + "\n"
-                }.orEmpty()
+        val behaviorBlock = renderBehavior(behavior)
         val system =
             "你在一个 QQ 群里，判断最后这条消息是否需要你接话。\n" +
                 personaBlock +
@@ -354,8 +376,11 @@ class AiResponder(
                 "4) 话题正在继续，按你的性格插一句很自然（聊到你的兴趣、你有相关经历）；\n" +
                 "5) 按你的性格，这种场合你本来就会忍不住说一句。\n" +
                 "回答 NO 的情况：两个人在互相聊、@ 了别人、与你无关的闲扯、刷屏。\n" +
-                userRulesBlock +
-                "只输出 YES 或 NO，不要解释。"
+                behaviorBlock +
+                "输出格式（严格遵守）：\n" +
+                "第一行：YES 或 NO\n" +
+                "第二行：不超过 20 字的中文理由\n" +
+                "不要输出其它内容。"
         val user =
             buildString {
                 if (transcript.isNotBlank()) append("最近消息：\n").append(transcript).append("\n\n")
@@ -369,11 +394,66 @@ class AiResponder(
                 model = config.model,
                 messages = listOf(ChatMessage("system", system), ChatMessage("user", user)),
                 temperature = 0.0,
-                maxTokens = 8,
+                maxTokens = 40,
                 thinkingType = thinkingParam(config),
             )
-        val answer = reply.content.trim().uppercase()
-        return answer.startsWith("YES") || answer.startsWith("是")
+        return parseVerdict(reply.content)
+    }
+
+    /**
+     * 渲染行为约束块。用户规则在上、经验在下——冲突时以用户显式约定为准。
+     * 空表不产生任何文本，避免给模型塞无意义的标题。
+     */
+    private fun renderBehavior(behavior: BehaviorContext): String {
+        val rules =
+            behavior.userRules.map { it.trim() }.filter { it.isNotEmpty() }.take(MAX_USER_RULES)
+        val lessons =
+            behavior.lessons.map { it.trim() }.filter { it.isNotEmpty() }.take(MAX_LESSONS)
+        if (rules.isEmpty() && lessons.isEmpty()) return ""
+        return buildString {
+            if (rules.isNotEmpty()) {
+                append("用户补充规则（优先级最高，必须遵守）：\n")
+                rules.forEach { append("- ").append(it.take(MAX_RULE_CHARS)).append('\n') }
+            }
+            if (lessons.isNotEmpty()) {
+                append("从主人反馈中学到的经验（与上面的用户规则冲突时，以用户规则为准）：\n")
+                lessons.forEach { append("- ").append(it.take(MAX_LESSON_CHARS)).append('\n') }
+            }
+        }
+    }
+
+    /**
+     * 解析「第一行 YES/NO + 第二行理由」。
+     *
+     * 模型并不总是严格分行：常见变体有「YES，因为…」「NO：两人在私聊」。
+     * 因此首行既决定结论，也承担「同行理由」的抽取；都拿不到就判 false。
+     */
+    internal fun parseVerdict(raw: String): ChimeVerdict {
+        val lines = raw.trim().lines().map { it.trim() }.filter { it.isNotEmpty() }
+        val first = lines.firstOrNull().orEmpty()
+        val head = first.uppercase()
+        val should =
+            when {
+                head.startsWith("NO") || head.startsWith("否") || head.startsWith("不") -> false
+                head.startsWith("YES") || head.startsWith("是") -> true
+                head.contains("YES") -> true
+                else -> false
+            }
+        val inline =
+            first
+                .removePrefix("YES")
+                .removePrefix("NO")
+                .removePrefix("是")
+                .removePrefix("否")
+                .removePrefix("不")
+                .trim()
+                .trimStart('，', ',', '。', '.', '：', ':', ' ', '、')
+        val reason =
+            inline
+                .ifBlank { lines.drop(1).joinToString(" ").trim() }
+                .take(MAX_REASON_CHARS)
+                .ifBlank { null }
+        return ChimeVerdict(should = should, reason = reason)
     }
 
     /**

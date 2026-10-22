@@ -8,6 +8,7 @@ import com.qbot.app.data.backup.CredentialsBackup
 import com.qbot.app.data.backup.DisplayNameBackup
 import com.qbot.app.data.backup.GreetingBackup
 import com.qbot.app.data.backup.GroupBotNameBackup
+import com.qbot.app.data.backup.LessonBackup
 import com.qbot.app.data.backup.MemoryBackup
 import com.qbot.app.data.backup.PersonaBackup
 import com.qbot.app.data.backup.RuleBackup
@@ -15,6 +16,9 @@ import com.qbot.app.data.db.AppDatabase
 import com.qbot.app.data.db.LogEntity
 import com.qbot.app.data.db.RuleEntity
 import com.qbot.app.data.repo.PersonaRepository
+import com.qbot.app.data.repo.RoomChimeDecisionStore
+import com.qbot.app.data.repo.RoomChimeLessonStore
+import com.qbot.app.data.repo.RoomChimeTrainer
 import com.qbot.app.data.repo.RoomAiHistoryStore
 import com.qbot.app.data.repo.RoomFactStore
 import com.qbot.app.data.repo.RoomGroupStore
@@ -25,6 +29,12 @@ import com.qbot.app.data.repo.GreetingConfig
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.AiResponder
+import com.qbot.core.ai.ChatMessage
+import com.qbot.core.ai.ChimeDecision
+import com.qbot.core.ai.ChimeDecisionRecord
+import com.qbot.core.ai.ChimeLesson
+import com.qbot.core.ai.ChimeReflection
+import com.qbot.core.ai.ChimeStats
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.GroupProfile
 import com.qbot.core.ai.LlmClient
@@ -58,10 +68,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
 
@@ -85,6 +98,12 @@ class BotController(
 
         /** 内存里保留的最新日志条数，用于 UI 实时展示（数据库负责长期留存） */
         private const val MEMORY_LOG_LIMIT = 500
+
+        /** 决策日志保留天数（复盘用，过期即删） */
+        private const val CHIME_RETENTION_DAYS = 7L
+
+        /** 决策日志总量上限，防止高频群把库撑大 */
+        private const val CHIME_MAX_DECISIONS = 2000
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -163,6 +182,22 @@ class BotController(
             botNameProvider = { runtime?.botName?.takeIf { it.isNotBlank() } },
         )
 
+    /**
+     * 接话训练闭环：决策日志 + 经验库。
+     *
+     * 决策由 [RoomChimeTrainer] 在 BotRuntime 的单一出口写入；
+     * 经验在判断前读取、注入提示词，并累计命中次数。
+     */
+    private val chimeDecisionStore = RoomChimeDecisionStore(database.chimeDecisionDao())
+    private val chimeLessonStore = RoomChimeLessonStore(database.chimeLessonDao())
+    private val chimeTrainer = RoomChimeTrainer(chimeDecisionStore, chimeLessonStore)
+
+    /** 反思串行化：一次只处理一条反馈，避免并发写入把经验库弄乱 */
+    private val reflectionMutex = Mutex()
+
+    /** 反思与正式回复共用连接池 */
+    private val reflectionClient by lazy { LlmClient(http = http, logger = logger) }
+
     /** 身份存储（公开给维护端 UI 做备注名 / 忘掉某人）。 */
     fun identityStore(): RoomIdentityStore = identityStore
 
@@ -171,6 +206,122 @@ class BotController(
 
     /** 群档案存储（公开给维护端 UI 做群管理与群名片编辑）。 */
     fun groupStore(): RoomGroupStore = groupStore
+
+    /** 复盘页：最近的接话判断，可按群过滤。 */
+    fun observeChimeDecisions(
+        groupId: String? = null,
+        limit: Int = 100,
+    ): Flow<List<ChimeDecision>> = chimeDecisionStore.observe(groupId, limit)
+
+    /** 经验库。 */
+    fun observeChimeLessons(): Flow<List<ChimeLesson>> = chimeLessonStore.observeAll()
+
+    /** 近 N 天的判断质量统计。 */
+    suspend fun chimeStats(days: Int = 7): ChimeStats =
+        chimeDecisionStore.stats(System.currentTimeMillis() - days.toLong() * 24 * 3600 * 1000)
+
+    /**
+     * 提交一条反馈。
+     *
+     * 标「正确」只落库；标「错误」会立刻调一次模型，把这个案例总结成经验。
+     * 返回值直接作为提示文案展示给用户（成功与失败都是人话）。
+     *
+     * 反思是串行的：一次只跑一条，避免连点把多条相似经验同时写进去。
+     */
+    suspend fun submitChimeFeedback(
+        id: Long,
+        correct: Boolean,
+        note: String? = null,
+    ): String =
+        reflectionMutex.withLock {
+            val decision = chimeDecisionStore.find(id) ?: return@withLock "这条记录已经不在了"
+            val corrected =
+                when {
+                    correct -> null
+                    decision.record.action == ChimeDecisionRecord.ACTION_SPOKE ->
+                        ChimeDecision.SHOULD_SILENT
+                    else -> ChimeDecision.SHOULD_SPEAK
+                }
+            val now = System.currentTimeMillis()
+            chimeDecisionStore.markFeedback(
+                id = id,
+                correct = correct,
+                correctedAction = corrected,
+                note = note?.trim()?.take(100)?.takeIf { it.isNotEmpty() },
+                at = now,
+            )
+            if (correct) return@withLock "已记录：这次判断是对的"
+
+            val cfg = settings.aiConfig.value
+            if (!cfg.enabled || !cfg.isReady) {
+                return@withLock "已记录，但 AI 未启用，暂时无法生成经验"
+            }
+
+            val existing = chimeLessonStore.all()
+            val updated =
+                decision.copy(
+                    feedback = false,
+                    correctedAction = corrected,
+                    feedbackNote = note?.trim()?.take(100),
+                )
+            val reply =
+                runCatching {
+                    reflectionClient.chat(
+                        baseUrl = cfg.baseUrl,
+                        apiKey = cfg.apiKey,
+                        model = cfg.model,
+                        messages =
+                            listOf(
+                                ChatMessage("system", ChimeReflection.buildSystemPrompt()),
+                                ChatMessage(
+                                    "user",
+                                    ChimeReflection.buildUserPrompt(updated, existing),
+                                ),
+                            ),
+                        temperature = 0.3,
+                        maxTokens = 120,
+                    )
+                }.getOrElse {
+                    return@withLock "已记录，但经验生成失败：${it.message ?: it::class.simpleName ?: "未知错误"}"
+                }
+
+            val text =
+                ChimeReflection.parseLesson(reply.content)
+                    ?: return@withLock "已记录，但模型没给出可用的经验"
+
+            val similar = ChimeReflection.findSimilar(text, existing)
+            if (similar != null && similar.scopeGroupId == decision.record.groupId) {
+                chimeLessonStore.updateText(similar.id, text, now)
+                "已记录，并修正了原来的经验：$text"
+            } else {
+                chimeLessonStore.insert(
+                    ChimeLesson(
+                        text = text,
+                        source = ChimeLesson.SOURCE_REFLECTION,
+                        scopeGroupId = decision.record.groupId,
+                        fromDecisionId = id,
+                        createdAt = now,
+                        updatedAt = now,
+                    ),
+                )
+                chimeLessonStore.trim(ChimeLesson.MAX_LESSONS)
+                "已记录，学到一条新经验：$text"
+            }
+        }
+
+    suspend fun setChimeLessonEnabled(id: Long, enabled: Boolean) {
+        chimeLessonStore.setEnabled(id, enabled)
+    }
+
+    suspend fun updateChimeLessonText(id: Long, text: String) {
+        val clean = text.trim().take(ChimeLesson.MAX_TEXT_CHARS)
+        if (clean.isBlank()) return
+        chimeLessonStore.updateText(id, clean, System.currentTimeMillis())
+    }
+
+    suspend fun deleteChimeLesson(id: Long) {
+        chimeLessonStore.delete(id)
+    }
 
     /** AI 配置快照，供 UI 展示机器人是否具备 AI 能力。 */
     val aiConfig = settings.aiConfig
@@ -223,6 +374,13 @@ class BotController(
         // 启动时收敛记忆系统：每个人事实总量与各范围共享背景条数
         scope.launch {
             runCatching { memoryPipeline.trimAll() }
+        }
+
+        // 启动时收敛训练数据：决策日志 7 天 / 2000 条，经验库 40 条
+        scope.launch {
+            val before = System.currentTimeMillis() - CHIME_RETENTION_DAYS * 24 * 3600 * 1000
+            runCatching { chimeDecisionStore.trim(before, CHIME_MAX_DECISIONS) }
+            runCatching { chimeLessonStore.trim(ChimeLesson.MAX_LESSONS) }
         }
     }
 
@@ -514,6 +672,18 @@ class BotController(
                             botName = profile.botName ?: return@mapNotNull null,
                         )
                     },
+                // 训练成果：经验库跟着配置走，换机后不必重新教一遍
+                chimeLessons =
+                    chimeLessonStore.all().map { lesson ->
+                        LessonBackup(
+                            text = lesson.text,
+                            source = lesson.source,
+                            groupId = lesson.scopeGroupId,
+                            hits = lesson.hits,
+                            createdAt = lesson.createdAt,
+                            updatedAt = lesson.updatedAt,
+                        )
+                    },
             )
         return ConfigBackup.encode(backup)
     }
@@ -614,6 +784,45 @@ class BotController(
             applied++
         }
 
+        // 接话经验：按「同作用域 + 文本相似」去重合并，不覆盖已有条目
+        var lessonCount = 0
+        if (backup.chimeLessons.isNotEmpty()) {
+            val merged = chimeLessonStore.all().toMutableList()
+            val now = System.currentTimeMillis()
+            backup.chimeLessons.forEach { dto ->
+                val text = dto.text.trim().take(ChimeLesson.MAX_TEXT_CHARS)
+                if (text.length < 4) return@forEach
+                val sameScope = merged.filter { it.scopeGroupId == dto.groupId }
+                if (ChimeReflection.findSimilar(text, sameScope) != null) return@forEach
+                val created = dto.createdAt.takeIf { it > 0 } ?: now
+                val updated = dto.updatedAt.takeIf { it > 0 } ?: created
+                val id =
+                    chimeLessonStore.insert(
+                        ChimeLesson(
+                            text = text,
+                            source = ChimeLesson.SOURCE_REFLECTION,
+                            scopeGroupId = dto.groupId,
+                            hits = dto.hits.coerceAtLeast(0),
+                            createdAt = created,
+                            updatedAt = updated,
+                        ),
+                    )
+                merged +=
+                    ChimeLesson(
+                        id = id,
+                        text = text,
+                        source = ChimeLesson.SOURCE_REFLECTION,
+                        scopeGroupId = dto.groupId,
+                        hits = dto.hits,
+                        createdAt = created,
+                        updatedAt = updated,
+                    )
+                lessonCount++
+            }
+            if (lessonCount > 0) chimeLessonStore.trim(ChimeLesson.MAX_LESSONS)
+            applied++
+        }
+
         var ruleCount = 0
         backup.rules.forEach { dto ->
             val matchType = runCatching { MatchType.valueOf(dto.matchType) }.getOrNull() ?: return@forEach
@@ -686,10 +895,10 @@ class BotController(
             LogLevel.INFO,
             TAG,
             "配置导入完成：规则 $ruleCount 条、人设 +$personaNew/更新$personaUpdated、" +
-                "备注 $nameCount、群名片 $groupNameCount、配置项 $applied",
+                "备注 $nameCount、群名片 $groupNameCount、经验 $lessonCount 条、配置项 $applied",
         )
         return "导入完成：规则 $ruleCount 条，人设新增 $personaNew、更新 $personaUpdated，" +
-            "备注名 $nameCount，群名片 $groupNameCount，配置组 $applied 项" +
+            "备注名 $nameCount，群名片 $groupNameCount，经验 $lessonCount 条，配置组 $applied 项" +
             (if (backup.credentials != null) "（含凭证，需重新启动机器人生效）" else "")
     }
 
@@ -771,6 +980,8 @@ class BotController(
                 // 人设同时喂给插话漏斗（性格偏置）与 AI 插话判断（按性格决定接不接），
                 // 让"要不要说话"也由人设说了算。
                 personaPromptProvider = { message -> personaResolver.promptFor(message) },
+                // 训练闭环：每条判断结束后落一条结构化记录
+                chimeTrainer = chimeTrainer,
             )
 
         // 把网关状态转发到控制器自己的流上，

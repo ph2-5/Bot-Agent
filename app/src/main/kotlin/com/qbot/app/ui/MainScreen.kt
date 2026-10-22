@@ -16,7 +16,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -45,7 +45,8 @@ fun MainScreen(
     onStopService: () -> Unit,
     onRequestBatteryWhitelist: () -> Unit,
 ) {
-    var selected by remember { mutableIntStateOf(0) }
+    // 旋屏 / 进程重建后停在原来的 Tab，而不是跳回状态页
+    var selected by rememberSaveable { mutableIntStateOf(0) }
 
     Scaffold(
         bottomBar = {

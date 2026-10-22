@@ -384,22 +384,22 @@ class AiResponderTest {
     @Test
     fun `插话判断注入用户自定义规则`() =
         runBlocking {
-            enqueueAnswer("YES")
-            val should =
+            enqueueAnswer("YES\n有人求助")
+            val verdict =
                 responder.shouldChimeIn(
                     message("今天天气怎么样"),
                     config(),
                     recent = emptyList(),
                     botName = "小白",
                     personaPrompt = null,
-                    userRules = listOf("只有有人求助时才接话"),
+                    behavior = BehaviorContext(userRules = listOf("只有有人求助时才接话")),
                 )
-            assertTrue(should)
+            assertTrue(verdict.should)
 
             val body = server.takeRequest().body.readUtf8()
             assertTrue("请求体应包含用户规则，实际=$body", body.contains("只有有人求助时才接话"))
-            assertTrue("应有优先级说明", body.contains("用户补充规则"))
-            assertTrue("应声明优先于通用规则", body.contains("优先级高于"))
+            assertTrue("应有规则块标题", body.contains("用户补充规则"))
+            assertTrue("应声明优先级最高", body.contains("优先级最高"))
         }
 
     @Test
@@ -422,11 +422,71 @@ class AiResponderTest {
                 config(),
                 emptyList(),
                 "小白",
-                userRules = rules,
+                behavior = BehaviorContext(userRules = rules),
             )
 
             val body = server.takeRequest().body.readUtf8()
             assertTrue("应注入第 10 条", body.contains("规则编号10"))
             assertFalse("第 11 条起应被截掉，实际=$body", body.contains("规则编号11"))
+        }
+
+    // ---------- 判断结果与理由 ----------
+
+    @Test
+    fun `判断结果带出模型给的理由`() =
+        runBlocking {
+            enqueueAnswer("YES\n话题冷场，适合搭一句")
+            val verdict =
+                responder.shouldChimeIn(message("有人吗"), config(), emptyList(), "小白")
+            assertTrue(verdict.should)
+            assertTrue("应带上理由，实际=${verdict.reason}", verdict.reason?.contains("冷场") == true)
+        }
+
+    @Test
+    fun `理由写在同一行也能解析`() =
+        runBlocking {
+            enqueueAnswer("NO，两人正在私聊")
+            val verdict =
+                responder.shouldChimeIn(message("你吃了吗"), config(), emptyList(), "小白")
+            assertFalse(verdict.should)
+            assertTrue("应抽出同行理由，实际=${verdict.reason}", verdict.reason?.contains("私聊") == true)
+        }
+
+    @Test
+    fun `无法解析的回复按不接处理`() =
+        runBlocking {
+            enqueueAnswer("这个我得想想")
+            val verdict =
+                responder.shouldChimeIn(message("随便说说"), config(), emptyList(), "小白")
+            assertFalse(verdict.should)
+        }
+
+    @Test
+    fun `经验注入提示词且最多八条`() =
+        runBlocking {
+            enqueueAnswer("YES")
+            val lessons = (1..12).map { "经验编号$it" }
+            responder.shouldChimeIn(
+                message("在吗"),
+                config(),
+                emptyList(),
+                "小白",
+                behavior = BehaviorContext(lessons = lessons),
+            )
+
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue("应出现经验块", body.contains("从主人反馈中学到的经验"))
+            assertTrue("应注入第 8 条", body.contains("经验编号8"))
+            assertFalse("第 9 条起应被截掉，实际=$body", body.contains("经验编号9"))
+        }
+
+    @Test
+    fun `没有经验时不出现经验块`() =
+        runBlocking {
+            enqueueAnswer("NO")
+            responder.shouldChimeIn(message("随便聊聊"), config(), emptyList(), "小白")
+
+            val body = server.takeRequest().body.readUtf8()
+            assertFalse("无经验时不应出现经验块，实际=$body", body.contains("从主人反馈中学到的经验"))
         }
 }
