@@ -991,6 +991,7 @@ private fun GroupTab() {
 
     val greeting by controller.greetingConfig.collectAsState()
     val chitchat by controller.chitchatConfig.collectAsState()
+    val gatewayStatus by controller.status.collectAsState()
     val summaries by groupStore.observeSummaries().collectAsState(initial = emptyList())
 
     var expandedGroup by remember { mutableStateOf<String?>(null) }
@@ -1006,6 +1007,11 @@ private fun GroupTab() {
                 .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        GatewayEventsCard(
+            state = gatewayStatus.state.name,
+            counts = gatewayStatus.eventCounts,
+        )
+
         ChitchatCard(
             config = chitchat,
             onChange = { app.settings.saveChitchatConfig(it) },
@@ -1102,6 +1108,89 @@ private fun GroupTab() {
                 }
             },
         )
+    }
+}
+
+/**
+ * 接收诊断。
+ *
+ * 排障顺序：先看这里，再看「消息」列表。
+ * @ 消息有、普通消息为 0，问题一定在平台侧的订阅/授权，跟接话策略无关。
+ */
+@Composable
+private fun GatewayEventsCard(
+    state: String,
+    counts: Map<String, Long>,
+) {
+    val atCount = counts["GROUP_AT_MESSAGE_CREATE"] ?: 0L
+    val fullCount = counts["GROUP_MESSAGE_CREATE"] ?: 0L
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text("接收诊断", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+            Text("网关：$state", style = MaterialTheme.typography.labelMedium)
+            Text(
+                "@我消息：$atCount 条 · 普通群消息：$fullCount 条",
+                style = MaterialTheme.typography.labelMedium,
+            )
+
+            when {
+                atCount > 0 && fullCount == 0L ->
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                        ),
+                    ) {
+                        Column(
+                            Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text("只收到 @ 消息", fontWeight = FontWeight.Medium)
+                            Text(
+                                "说明「群消息」事件没有推过来——两处都要打开，缺一个都收不到：\n" +
+                                    "1. 开放平台 → 开发设置 → 事件订阅 → 勾选群消息（GROUP_MESSAGE_CREATE）；\n" +
+                                    "2. QQ 群设置 → 群机器人 → 本机器人资料页 → " +
+                                    "「机器人可获取的群聊消息范围」改成「获取群内全部消息」。\n" +
+                                    "改完后重启机器人的连接，再让群里发几条不带 @ 的消息。",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+
+                atCount == 0L && fullCount == 0L ->
+                    Text(
+                        "还没收到任何群消息。先确认机器人已进群，并在群里 @ 它一次。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+
+                else ->
+                    Text(
+                        "两类消息都在收到。普通消息会进「群聊参与」的三级漏斗。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+            }
+
+            if (counts.isNotEmpty()) {
+                Text(
+                    "事件统计：" +
+                        counts.entries
+                            .sortedByDescending { it.value }
+                            .take(4)
+                            .joinToString("、") { "${it.key}×${it.value}" },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 

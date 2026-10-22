@@ -530,6 +530,34 @@ class GatewayClientIntegrationTest {
     }
 
     @Test
+    fun `按事件类型统计收到次数`() {
+        enqueueToken()
+        enqueueGateway()
+        enqueueWebSocketUpgrade { ws, frame ->
+            if (Json.frameOp(frame) == OpCode.IDENTIFY) {
+                ws.send("""{"op":0,"s":1,"t":"READY","d":{"version":1,"session_id":"s"}}""")
+                ws.send(
+                    """{"op":0,"s":2,"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"m1",""" +
+                        """"group_openid":"g1","op_member_openid":"u1","content":"hi","timestamp":"1"}}""",
+                )
+                ws.send(
+                    """{"op":0,"s":3,"t":"GROUP_MESSAGE_CREATE","d":{"id":"m2",""" +
+                        """"group_openid":"g1","author":{"member_openid":"u2","username":"小明"},""" +
+                        """"content":"在吗","timestamp":"1"}}""",
+                )
+            }
+        }
+
+        client = buildClient()
+        client.start()
+
+        // 排障指标的语义：两类消息分别计数，全量为 0 就说明平台没推送
+        val status = waitFor { (it.eventCounts["GROUP_MESSAGE_CREATE"] ?: 0L) >= 1L }
+        assertEquals(1L, status.eventCounts["GROUP_AT_MESSAGE_CREATE"])
+        assertEquals(1L, status.eventCounts["GROUP_MESSAGE_CREATE"])
+    }
+
+    @Test
     fun `端口号与网关地址来源于接口返回`() {
         enqueueToken()
         enqueueGateway()

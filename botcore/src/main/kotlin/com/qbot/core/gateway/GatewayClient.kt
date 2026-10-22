@@ -163,6 +163,10 @@ class GatewayClient(
     /** 当前连接纪元，用于丢弃旧连接的迟到回调 */
     private val epoch = AtomicInteger(0)
 
+    /** 已见过的事件类型，用于"首次收到"日志只打一次 */
+    private val seenEventTypes: MutableSet<String> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
+
     private val reconnectScheduled = AtomicBoolean()
 
     /**
@@ -475,10 +479,18 @@ class GatewayClient(
         val eventType = payload.t ?: return
         val now = clock.nowMillis()
 
+        // 首次收到某类事件时记一条 INFO：排障时能直接看出
+        // 「全量消息到底有没有推过来」，而不用翻原始帧。
+        if (seenEventTypes.add(eventType)) {
+            logger.i(TAG, "首次收到事件类型：$eventType")
+        }
+
         updateStatus {
             copy(
                 lastEventSeq = lastSeq,
                 totalEvents = this.totalEvents + 1,
+                eventCounts =
+                    eventCounts + (eventType to (eventCounts[eventType] ?: 0L) + 1L),
             )
         }
 

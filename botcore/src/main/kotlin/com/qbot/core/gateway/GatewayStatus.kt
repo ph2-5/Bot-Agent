@@ -45,6 +45,14 @@ data class GatewayStatus(
     val totalEvents: Long = 0,
     /** 累计收到的消息数 */
     val totalMessages: Long = 0,
+    /**
+     * 按事件类型统计的收到次数（如 GROUP_AT_MESSAGE_CREATE=12、GROUP_MESSAGE_CREATE=0）。
+     *
+     * 排障核心指标：@ 消息有、GROUP_MESSAGE_CREATE 一直为 0，
+     * 就说明全量消息压根没推过来（平台事件订阅或群授权没开），
+     * 而不是接话策略把它过滤掉了。
+     */
+    val eventCounts: Map<String, Long> = emptyMap(),
 ) {
     val isConnected: Boolean
         get() = state == ConnectionState.READY
