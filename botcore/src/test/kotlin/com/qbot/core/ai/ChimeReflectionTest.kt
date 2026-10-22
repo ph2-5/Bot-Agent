@@ -113,7 +113,7 @@ class ChimeReflectionTest {
                 decision(note = "他们只是在互相道晚安"),
                 listOf(ChimeLesson(id = 1, text = "凌晨不要接话")),
             )
-        assertTrue(prompt.contains("【主人反馈】判断错了，这种情况应该接话"))
+        assertTrue(prompt.contains("【主人反馈】判断错了，这种场合它其实会想接话"))
         assertTrue(prompt.contains("他们只是在互相道晚安"))
         assertTrue(prompt.contains("【你的判断】NO（理由：像在自言自语）"))
         assertTrue(prompt.contains("【规则打分】25"))

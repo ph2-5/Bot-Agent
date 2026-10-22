@@ -161,12 +161,21 @@ data class BehaviorContext(
     val lessons: List<String> = emptyList(),
 )
 
-/** 插话判断结果：是否接话 + 一句理由。 */
+/**
+ * 插话判断结果：想不想接 + 一句理由。
+ *
+ * 2.2 起语义从「应不应该」改为「想不想」——机器人不是客服，判断的是
+ * 这个"人"此刻有没有说话的冲动。
+ */
 data class ChimeVerdict(
-    val should: Boolean,
+    val wants: Boolean,
     /** ≤40 字；模型没给理由时为 null。复盘页与反思都依赖它。 */
     val reason: String? = null,
-)
+) {
+    /** 旧名字，保留以免外部调用方断裂 */
+    @Deprecated("语义已改为想不想，请用 wants", ReplaceWith("wants"))
+    val should: Boolean get() = wants
+}
 
 /**
  * AI 应答器。
@@ -220,6 +229,14 @@ class AiResponder(
 
         /** 判断理由的字符上限 */
         const val MAX_REASON_CHARS = 40
+
+        /**
+         * 判断提示词的固定标记。
+         *
+         * 测试与日志用它识别"这是一次接话判断"，不依赖具体措辞——
+         * 提示词改版时不会连带改一堆断言。
+         */
+        const val JUDGE_PROMPT_TAG = "【接话判断】"
 
 
     }
@@ -344,7 +361,7 @@ class AiResponder(
      * 判定失败（网络/配置）一律返回 should=false——宁可少说一句，
      * 也不要因为判断服务抖动而在群里乱插话。
      */
-    suspend fun shouldChimeIn(
+    suspend fun wantsToChimeIn(
         message: IncomingMessage,
         config: AiConfig,
         recent: List<RoomMessage>,
@@ -353,6 +370,8 @@ class AiResponder(
         behavior: BehaviorContext = BehaviorContext(),
         /** 机器人上次在本群发言距今多久；null 表示还没说过 */
         lastBotSpokeAgoMillis: Long? = null,
+        /** 这句话大概率是对谁说的；null 时不下结论 */
+        addressee: Addressee? = null,
     ): ChimeVerdict {
         val speaker = message.senderName?.takeIf { it.isNotBlank() } ?: "群友"
         // 以当前消息时间为基准算相对时间：模型靠间隔判断冷场还是两人快速对聊
@@ -370,39 +389,48 @@ class AiResponder(
             }
         val personaBlock =
             personaPrompt?.takeIf { it.isNotBlank() }?.let { persona ->
-                "你的性格设定：「${persona.take(300)}」\n" +
-                    "结合这个性格判断：外向爱聊的性格可以更主动接话，" +
-                    "高冷话少的性格只在确有必要时才接话。\n"
+                "你的性格：「${persona.take(300)}」\n" +
+                    "按这个性格来：外向的人更容易被话题勾住，高冷的人大部分时候懒得开口。\n"
             }.orEmpty()
         val behaviorBlock = renderBehavior(behavior)
         val spokeBlock =
-            lastBotSpokeAgoMillis?.let { "你上次在这个群发言是${humanAgo(it)}。\n" }.orEmpty()
+            lastBotSpokeAgoMillis
+                ?.let { "你上次在这个群发言是${humanAgo(it)}。\n" }
+                ?: "你今晚还没在这个群说过话。\n"
+        val addresseeBlock = addressee?.let { describeAddressee(it) }.orEmpty()
         val system =
-            "你在一个 QQ 群里，判断最后这条消息是否需要你接话。\n" +
+            JUDGE_PROMPT_TAG + "\n" +
+                "你在 QQ 群里旁听。你不是客服，也不欠任何人回复——现在判断的只有一件事：" +
+                "你此刻**想不想**接这一句。\n" +
+                "注意：这条消息没有 @ 你。\n" +
                 personaBlock +
-                "注意：这条消息**没有 @ 你**，你只是旁听的群友——不要因为看到了就抢着回。\n" +
                 spokeBlock +
-                "判断前先读上面的对话：他们在聊什么、谁在跟谁说话、有没有人在等回应。\n" +
-                "如果最后几条是两个人快速互相回复、且没向你提问，倾向 NO；\n" +
-                "如果是抛给全群的问题、明显冷场、或在延续你刚才的话题，倾向 YES。\n" +
-                "回答 YES 的情况：\n" +
-                "1) 有人向你提问或求助；\n" +
-                "2) 话题明显需要别人搭话（冷场、抛问题、征求意见、求推荐）；\n" +
-                "3) 有人说的话明显有误，且你有把握纠正；\n" +
-                "4) 话题正在继续，按你的性格插一句很自然（聊到你的兴趣、你有相关经历）；\n" +
-                "5) 按你的性格，这种场合你本来就会忍不住说一句。\n" +
-                "回答 NO 的情况：两个人在互相聊、@ 了别人、与你无关的闲扯、刷屏。\n" +
+                addresseeBlock +
+                "先读上面的对话：他们在聊什么、谁在跟谁说话、有没有人在等回应。\n" +
+                "你会想接的情况：\n" +
+                "1) 有人问你、点你，或明显在等一个回应；\n" +
+                "2) 这话让你有共鸣、想吐槽、想补充、想纠正；\n" +
+                "3) 冷场了，你想救一下；\n" +
+                "4) 话题正好是你懂的 / 感兴趣的，你有话可说；\n" +
+                "5) 按你的性格，这种场面你会忍不住。\n" +
+                "你不想接的情况：\n" +
+                "- 两个人正在互聊，尤其这句话是对其中一个人说的；\n" +
+                "- 你刚说完，再说就是刷屏；\n" +
+                "- 你没什么想说的，只是「可以回」；\n" +
+                "- 这话与你无关，或者你只是在复述别人。\n" +
+                "想接就 YES，不想就 NO。安静完全正常，没人会怪你。\n" +
                 behaviorBlock +
                 "输出格式（严格遵守）：\n" +
-                "第一行：YES 或 NO\n" +
+                "第一行：YES（想接）或 NO（不想）\n" +
                 "第二行：不超过 20 字的中文理由\n" +
                 "不要输出其它内容。"
         val user =
             buildString {
                 if (transcript.isNotBlank()) append("最近消息：\n").append(transcript).append("\n\n")
                 append("现在 [").append(speaker).append("] 说：「")
-                    .append(message.content.take(120)).append("」")
+                    .append(message.content.take(160)).append("」")
             }
+
         suspend fun ask(tokens: Int) =
             client.chat(
                 baseUrl = config.baseUrl,
@@ -416,8 +444,6 @@ class AiResponder(
                 thinkingType = thinkingParam(config),
             )
 
-        // 输出被思考过程挤爆（finish=length）时放宽额度重试一次。
-        // 不重试的话，这类"想得多"的模型会在群消息密集时持续判不出来。
         // 输出预算跟随设置里的「单次生成上限」，不在代码里另立一套数字
         val budget = GenerationLimits.forConfig(config)
         val reply =
@@ -429,6 +455,17 @@ class AiResponder(
             }
         return parseVerdict(reply.content)
     }
+
+    /** 把对话对象推断渲染成一句可执行的提示。 */
+    private fun describeAddressee(addressee: Addressee): String =
+        when (addressee.kind) {
+            AddresseeKind.BOT -> "【这句话是对你说的】${addressee.evidence}。\n"
+            AddresseeKind.MEMBER ->
+                "【这句话是对「${addressee.name ?: "某位群友"}」说的】${addressee.evidence}。" +
+                    "别人之间的对话，插进去通常很怪。\n"
+            AddresseeKind.GROUP -> "【这句话像是对全群说的】${addressee.evidence}。\n"
+            AddresseeKind.UNKNOWN -> ""
+        }
 
     /** 把毫秒差写成模型能理解的时间感。 */
     private fun humanAgo(deltaMillis: Long): String =
@@ -455,7 +492,7 @@ class AiResponder(
                 rules.forEach { append("- ").append(it.take(MAX_RULE_CHARS)).append('\n') }
             }
             if (lessons.isNotEmpty()) {
-                append("从主人反馈中学到的经验（与上面的用户规则冲突时，以用户规则为准）：\n")
+                append("从主人反馈里学到的偏好（与上面的用户规则冲突时，以用户规则为准）：\n")
                 lessons.forEach { append("- ").append(it.take(MAX_LESSON_CHARS)).append('\n') }
             }
         }
@@ -492,7 +529,7 @@ class AiResponder(
                 .ifBlank { lines.drop(1).joinToString(" ").trim() }
                 .take(MAX_REASON_CHARS)
                 .ifBlank { null }
-        return ChimeVerdict(should = should, reason = reason)
+        return ChimeVerdict(wants = should, reason = reason)
     }
 
     /**

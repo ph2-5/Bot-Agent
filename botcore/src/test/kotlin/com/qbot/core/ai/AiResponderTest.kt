@@ -388,7 +388,7 @@ class AiResponderTest {
         runBlocking {
             enqueueAnswer("YES\n有人求助")
             val verdict =
-                responder.shouldChimeIn(
+                responder.wantsToChimeIn(
                     message("今天天气怎么样"),
                     config(),
                     recent = emptyList(),
@@ -396,7 +396,7 @@ class AiResponderTest {
                     personaPrompt = null,
                     behavior = BehaviorContext(userRules = listOf("只有有人求助时才接话")),
                 )
-            assertTrue(verdict.should)
+            assertTrue(verdict.wants)
 
             val body = server.takeRequest().body.readUtf8()
             assertTrue("请求体应包含用户规则，实际=$body", body.contains("只有有人求助时才接话"))
@@ -408,7 +408,7 @@ class AiResponderTest {
     fun `没有用户规则时提示词不出现规则块`() =
         runBlocking {
             enqueueAnswer("NO")
-            responder.shouldChimeIn(message("随便聊聊"), config(), emptyList(), "小白")
+            responder.wantsToChimeIn(message("随便聊聊"), config(), emptyList(), "小白")
 
             val body = server.takeRequest().body.readUtf8()
             assertFalse("无规则时不应注入规则块，实际=$body", body.contains("用户补充规则"))
@@ -419,7 +419,7 @@ class AiResponderTest {
         runBlocking {
             enqueueAnswer("YES")
             val rules = (1..15).map { "规则编号$it" }
-            responder.shouldChimeIn(
+            responder.wantsToChimeIn(
                 message("在吗"),
                 config(),
                 emptyList(),
@@ -439,8 +439,8 @@ class AiResponderTest {
         runBlocking {
             enqueueAnswer("YES\n话题冷场，适合搭一句")
             val verdict =
-                responder.shouldChimeIn(message("有人吗"), config(), emptyList(), "小白")
-            assertTrue(verdict.should)
+                responder.wantsToChimeIn(message("有人吗"), config(), emptyList(), "小白")
+            assertTrue(verdict.wants)
             assertTrue("应带上理由，实际=${verdict.reason}", verdict.reason?.contains("冷场") == true)
         }
 
@@ -449,8 +449,8 @@ class AiResponderTest {
         runBlocking {
             enqueueAnswer("NO，两人正在私聊")
             val verdict =
-                responder.shouldChimeIn(message("你吃了吗"), config(), emptyList(), "小白")
-            assertFalse(verdict.should)
+                responder.wantsToChimeIn(message("你吃了吗"), config(), emptyList(), "小白")
+            assertFalse(verdict.wants)
             assertTrue("应抽出同行理由，实际=${verdict.reason}", verdict.reason?.contains("私聊") == true)
         }
 
@@ -459,8 +459,8 @@ class AiResponderTest {
         runBlocking {
             enqueueAnswer("这个我得想想")
             val verdict =
-                responder.shouldChimeIn(message("随便说说"), config(), emptyList(), "小白")
-            assertFalse(verdict.should)
+                responder.wantsToChimeIn(message("随便说说"), config(), emptyList(), "小白")
+            assertFalse(verdict.wants)
         }
 
     @Test
@@ -468,7 +468,7 @@ class AiResponderTest {
         runBlocking {
             enqueueAnswer("YES")
             val lessons = (1..15).map { "经验编号$it" }
-            responder.shouldChimeIn(
+            responder.wantsToChimeIn(
                 message("在吗"),
                 config(),
                 emptyList(),
@@ -477,7 +477,7 @@ class AiResponderTest {
             )
 
             val body = server.takeRequest().body.readUtf8()
-            assertTrue("应出现经验块", body.contains("从主人反馈中学到的经验"))
+            assertTrue("应出现偏好块", body.contains("从主人反馈里学到的偏好"))
             assertTrue("应注入第 12 条", body.contains("经验编号12"))
             assertFalse("第 13 条起应被截掉，实际=$body", body.contains("经验编号13"))
         }
@@ -486,10 +486,10 @@ class AiResponderTest {
     fun `没有经验时不出现经验块`() =
         runBlocking {
             enqueueAnswer("NO")
-            responder.shouldChimeIn(message("随便聊聊"), config(), emptyList(), "小白")
+            responder.wantsToChimeIn(message("随便聊聊"), config(), emptyList(), "小白")
 
             val body = server.takeRequest().body.readUtf8()
-            assertFalse("无经验时不应出现经验块，实际=$body", body.contains("从主人反馈中学到的经验"))
+            assertFalse("无经验时不应出现偏好块，实际=$body", body.contains("从主人反馈里学到的偏好"))
         }
 
     @Test
@@ -513,7 +513,7 @@ class AiResponderTest {
                         timestampMillis = 1_700_000_000_000L - 60_000L,
                     ),
                 )
-            responder.shouldChimeIn(
+            responder.wantsToChimeIn(
                 message("你们玩啥").copy(timestampMillis = 1_700_000_000_000L),
                 config(),
                 history,
@@ -526,7 +526,7 @@ class AiResponderTest {
             assertTrue("机器人消息应标为「你」", body.contains("[你 · 1 分钟前]"))
             assertTrue("用户消息应带相对时间", body.contains("[小明 · 3 分钟前]"))
             assertTrue("应告知上次发言时间", body.contains("你上次在这个群发言是1 分钟前"))
-            assertTrue("应给出判断方法提示", body.contains("判断前先读上面的对话"))
+            assertTrue("应给出判断方法提示", body.contains("先读上面的对话"))
         }
 
     @Test
@@ -543,9 +543,9 @@ class AiResponderTest {
             enqueueAnswer("YES\n有人提问")
 
             val verdict =
-                responder.shouldChimeIn(message("这个怎么弄"), config(), emptyList(), "小白")
+                responder.wantsToChimeIn(message("这个怎么弄"), config(), emptyList(), "小白")
 
-            assertTrue("重试后应拿到结论", verdict.should)
+            assertTrue("重试后应拿到结论", verdict.wants)
             assertEquals("应恰好调用两次模型", 2, server.requestCount)
         }
 
@@ -553,7 +553,7 @@ class AiResponderTest {
     fun `判断的输出额度与设置里的单次生成上限对齐`() =
         runBlocking {
             enqueueAnswer("NO")
-            responder.shouldChimeIn(
+            responder.wantsToChimeIn(
                 message("随便聊聊"),
                 config(maxTokens = 500),
                 emptyList(),
@@ -565,5 +565,24 @@ class AiResponderTest {
                 "应直接使用设置里的额度，不在代码里另立数字，实际=$body",
                 body.contains("\"max_tokens\":500"),
             )
+        }
+
+    @Test
+    fun `判断提示词表达意愿并带上对话对象`() =
+        runBlocking {
+            enqueueAnswer("NO")
+            responder.wantsToChimeIn(
+                message("你吃了吗"),
+                config(),
+                emptyList(),
+                "小白",
+                addressee = Addressee(AddresseeKind.MEMBER, "阿远", "开头叫了对方的名字"),
+            )
+
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue("应有判断标记", body.contains(AiResponder.JUDGE_PROMPT_TAG))
+            assertTrue("应表达想不想而不是该不该", body.contains("想不想"))
+            assertTrue("应给出对话对象", body.contains("对「阿远」说的"))
+            assertTrue("应说明插别人对话很怪", body.contains("插进去通常很怪"))
         }
 }

@@ -85,9 +85,9 @@ fun ChitchatPage(onBack: () -> Unit) {
                 onCheckedChange = { update(config.copy(enabled = it)) },
             )
             SwitchRow(
-                title = "让 AI 决定要不要接话（推荐）",
-                desc = "每条消息都交给 AI 判断（规则只挡单字、@别人等明显噪音），最懂语境；"
-                    + "每条多一次很小的模型调用",
+                title = "让 AI 自己判断想不想接（推荐）",
+                desc = "不是「该不该回」，而是按性格和当时的语境判断它有没有说话的冲动；"
+                    + "会先看这句话是对谁说的，再决定要不要插",
                 checked = config.aiJudge,
                 onCheckedChange = { update(config.copy(aiJudge = it)) },
                 enabled = config.enabled,

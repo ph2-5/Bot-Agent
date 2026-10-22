@@ -83,7 +83,7 @@ class BotRuntimeChitchatTest {
                             llmBodies += body
                             // 同一个端点承担两件事：插话判断与正式回复。
                             // 用 system 提示词里的特征句区分，避免两套 mock。
-                            val isJudge = body.contains("判断最后这条消息是否需要你接话")
+                            val isJudge = body.contains(AiResponder.JUDGE_PROMPT_TAG)
                             if (isJudge && llmJudgeStatus != 200) {
                                 MockResponse().setResponseCode(llmJudgeStatus)
                                     .setBody("""{"error":{"message":"upstream error"}}""")
@@ -373,6 +373,7 @@ class BotRuntimeChitchatTest {
             assertTrue("原因应保留分支文案，实际=${record.reason}", record.reason.contains("概率"))
             assertEquals("member-1", record.speakerId)
             assertEquals("小明", record.speakerName)
+            assertTrue("应记录对话对象，实际=${record.addresseeKind}", record.addresseeKind != null)
             assertTrue("应带上规则分", (record.ruleScore ?: -1) >= 0)
         }
 
@@ -424,9 +425,9 @@ class BotRuntimeChitchatTest {
             runtime.onMessage(fullMessage("这个怎么设置"))
             awaitSent(1)
 
-            val body = llmBodies.first { it.contains("判断最后这条消息是否需要你接话") }
+            val body = llmBodies.first { it.contains(AiResponder.JUDGE_PROMPT_TAG) }
             assertTrue("经验应进入判断提示词，实际=$body", body.contains("有人提问时主动接话"))
-            assertTrue("应有经验块标题", body.contains("从主人反馈中学到的经验"))
+            assertTrue("应有偏好块标题", body.contains("从主人反馈里学到的偏好"))
 
             withTimeout(15_000) {
                 while (trainer.lessons.single().hits == 0) delay(50)

@@ -420,6 +420,21 @@ private fun DecisionCard(
 
             Text(record.messageText, style = MaterialTheme.typography.bodyMedium)
 
+            record.addresseeKind?.let { kind ->
+                val label =
+                    when (kind) {
+                        "BOT" -> "对你说"
+                        "MEMBER" -> "对「${record.addresseeName ?: "某位群友"}」说"
+                        "GROUP" -> "对全群说"
+                        else -> "对象不明"
+                    }
+                Text(
+                    "它以为：这句话是$label",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
             // 让它"当时看到了什么"可见——否则用户只能猜它是不是没看上下文
             if (record.contextSnippet.isNotBlank()) {
                 Text(

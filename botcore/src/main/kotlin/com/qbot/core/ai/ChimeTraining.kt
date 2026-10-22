@@ -48,6 +48,10 @@ data class ChimeDecisionRecord(
     val addressed: Boolean,
     /** 是否被指名冒犯（情绪值未来要用）。 */
     val insulted: Boolean,
+    /** 这句话大概率是对谁说的：BOT / MEMBER / GROUP / UNKNOWN */
+    val addresseeKind: String? = null,
+    /** 对某个成员说时的名字 */
+    val addresseeName: String? = null,
     val externalId: String?,
     val createdAt: Long,
 ) {
@@ -369,13 +373,13 @@ object ChimeReflection {
     private val json = Json { ignoreUnknownKeys = true }
 
     fun buildSystemPrompt(): String =
-        "你在帮一个群聊机器人总结经验。用户会给你一次「是否该接话」的判断记录，" +
-            "以及主人对这个判断的纠正。请把它归入一个固定类别，并总结成一条以后可以直接照着做的经验。\n" +
+        "你在帮一个群聊机器人总结「什么场合它想接话」的偏好。用户会给你一次判断记录，" +
+            "以及主人对这个判断的纠正。请归入一个固定类别，总结成一条以后判断时参考的偏好。\n" +
             "类别只能从下面选一个：\n" +
             LessonCategories.ALL.joinToString("\n") { "- ${it.first}：${it.second}" } +
             "\n\n要求：\n" +
             "- 一条经验不超过 ${ChimeLesson.MAX_TEXT_CHARS} 字；\n" +
-            "- 用第二人称祈使句，写清「什么场景下该/不该做什么」；\n" +
+            "- 用第二人称写清「什么场景下你会想接 / 不想接」；\n" +
             "- 只依据这次反馈，不要编造；\n" +
             "- 只输出一个 JSON 对象，格式：{\"category\":\"类别\",\"text\":\"经验\"}，" +
             "不要输出代码块、解释或其它文字。"
@@ -396,8 +400,8 @@ object ChimeReflection {
             }
         val correction =
             when (decision.correctedAction) {
-                ChimeDecision.SHOULD_SPEAK -> "判断错了，这种情况应该接话"
-                ChimeDecision.SHOULD_SILENT -> "判断错了，这种情况应该保持安静"
+                ChimeDecision.SHOULD_SPEAK -> "判断错了，这种场合它其实会想接话"
+                ChimeDecision.SHOULD_SILENT -> "判断错了，这种场合它其实不想接话"
                 else -> "判断错了"
             }
         val existing =

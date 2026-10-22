@@ -143,7 +143,7 @@ interface AiHistoryDao {
         ChimeDecisionEntity::class,
         ChimeLessonEntity::class,
     ],
-    version = 8,
+    version = 9,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -415,6 +415,20 @@ abstract class AppDatabase : RoomDatabase() {
                         "ALTER TABLE chime_lessons ADD COLUMN supportCount INTEGER NOT NULL" +
                             " DEFAULT 1",
                     )
+                }
+            }
+
+        /**
+         * v8 → v9：决策记录增加「对话对象」。
+         *
+         * 判断从「该不该」改成「想不想」之后，模型需要知道自己是在接谁的话；
+         * 记录下来也能让复盘页核对"它以为这话是对谁说的"。
+         */
+        val MIGRATION_8_9 =
+            object : androidx.room.migration.Migration(8, 9) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL("ALTER TABLE chime_decisions ADD COLUMN addresseeKind TEXT")
+                    db.execSQL("ALTER TABLE chime_decisions ADD COLUMN addresseeName TEXT")
                 }
             }
     }

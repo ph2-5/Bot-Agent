@@ -145,6 +145,8 @@ private fun ChimeDecisionRecord.toEntity() =
         replyText = replyText,
         addressed = addressed,
         insulted = insulted,
+        addresseeKind = addresseeKind,
+        addresseeName = addresseeName,
         createdAt = createdAt,
     )
 
@@ -167,6 +169,8 @@ private fun ChimeDecisionEntity.toModel() =
                 replyText = replyText,
                 addressed = addressed,
                 insulted = insulted,
+                addresseeKind = addresseeKind,
+                addresseeName = addresseeName,
                 externalId = externalId,
                 createdAt = createdAt,
             ),

@@ -1,6 +1,7 @@
 package com.qbot.core.engine
 
 import com.qbot.core.ai.AiConfig
+import com.qbot.core.ai.AddresseeDetector
 import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.AiResponder
 import com.qbot.core.ai.BehaviorContext
@@ -360,6 +361,10 @@ class BotRuntime(
                 insultDetector.targetsBot(text, names, extraInsultWords)
         val talkingToOthers = insultDetector.talksToOthers(mentionIds, selfId)
 
+        // 这句话大概率是对谁说的：人说话是有对象的，
+        // 「两人互道晚安」和「有人吗」该不该接完全不同。
+        val addressee = AddresseeDetector.infer(message, recent, names, selfId)
+
         val gate =
             when {
                 addressed -> ChitchatGate.Skip("@ 了机器人，交给 @ 链路")
@@ -444,7 +449,7 @@ class BotRuntime(
                             var judgeFailure: Throwable? = null
                             val verdict =
                                 runCatching {
-                                    responder.shouldChimeIn(
+                                    responder.wantsToChimeIn(
                                         message,
                                         aiCfg,
                                         recent,
@@ -452,6 +457,7 @@ class BotRuntime(
                                         personaPrompt,
                                         lastBotSpokeAgoMillis =
                                             chitchatPolicy.lastSpokeAgoMillis(groupId),
+                                        addressee = addressee,
                                         behavior =
                                             BehaviorContext(
                                                 userRules = config.chimeRules,
@@ -473,13 +479,13 @@ class BotRuntime(
                                 log(LogLevel.WARN, TAG, "群聊消息不接：AI 判断失败（$why）")
                                 return
                             }
-                            aiVerdict = if (verdict.should) "YES" else "NO"
+                            aiVerdict = if (verdict.wants) "YES" else "NO"
                             aiReason = verdict.reason
                             // 被参考过的经验计一次命中（失败不影响判断）
                             if (lessons.isNotEmpty()) {
                                 runCatching { chimeTrainer?.bumpHits(lessons.map { it.id }) }
                             }
-                            if (!verdict.should) {
+                            if (!verdict.wants) {
                                 finalReason = "不接：AI 判断不需要接话"
                                 pipeline.markChitchatDecision(message, finalReason)
                                 log(LogLevel.VERBOSE, TAG, "群聊消息不接：AI 判断不需要接话")
@@ -560,6 +566,8 @@ class BotRuntime(
                             replyText = replyText?.take(200),
                             addressed = addressed,
                             insulted = insulted,
+                            addresseeKind = addressee.kind.name,
+                            addresseeName = addressee.name,
                             externalId = message.messageId,
                             createdAt = System.currentTimeMillis(),
                         ),

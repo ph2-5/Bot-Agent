@@ -45,6 +45,9 @@ data class ChimeDecisionEntity(
     val replyText: String? = null,
     @ColumnInfo(defaultValue = "0") val addressed: Boolean = false,
     @ColumnInfo(defaultValue = "0") val insulted: Boolean = false,
+    /** 这句话大概率对谁说的：BOT / MEMBER / GROUP / UNKNOWN */
+    val addresseeKind: String? = null,
+    val addresseeName: String? = null,
     /** null = 未反馈；1 = 正确；0 = 错误 */
     val feedback: Boolean? = null,
     /** SHOULD_SPEAK / SHOULD_SILENT（仅错误时） */
