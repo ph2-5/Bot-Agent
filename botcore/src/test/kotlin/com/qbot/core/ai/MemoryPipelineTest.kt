@@ -229,13 +229,25 @@ class MemoryPipelineTest {
         }
 
     @Test
-    fun `关闭共享背景后不写不读`() =
+    fun `关闭背景注入后仍记录但不注入回复`() =
         runTest {
             val p = newPipeline(MemoryConfig(roomContextEnabled = false))
             p.recordExchange(message("你好"), "你好", "你好呀")
             val ctx = p.buildContext(message("在吗"), "bot", "在吗")
-            assertTrue(room.recent("g:group-1", 10).isEmpty())
-            assertTrue(ctx.roomDigest.isEmpty())
+            assertTrue(
+                "仍需记录：接话判断与复盘要用，不能跟着失忆",
+                room.recent("g:group-1", 10).isNotEmpty(),
+            )
+            assertTrue("但回复时不注入背景", ctx.roomDigest.isEmpty())
+        }
+
+    @Test
+    fun `关闭背景注入仍能给接话判断提供上下文`() =
+        runTest {
+            val p = newPipeline(MemoryConfig(roomContextEnabled = false))
+            p.recordChitchat(message("今晚有人开黑吗"), "今晚有人开黑吗")
+            val recent = p.recentRoomMessages(message("几点啊"), 10)
+            assertEquals("判断上下文不应受注入开关影响", 1, recent.size)
         }
 
     // ---------- 全量群消息 ----------

@@ -200,6 +200,7 @@ fun ChimeReviewScreen() {
                     note = ""
                     wrongTarget = decision
                 },
+                onRetry = { submit(decision.id, false, decision.feedbackNote) },
             )
         }
 
@@ -382,6 +383,7 @@ private fun DecisionCard(
     busy: Boolean,
     onCorrect: () -> Unit,
     onWrong: () -> Unit,
+    onRetry: () -> Unit,
 ) {
     val record = decision.record
     val spoke = record.action == ChimeDecisionRecord.ACTION_SPOKE
@@ -417,6 +419,20 @@ private fun DecisionCard(
             }
 
             Text(record.messageText, style = MaterialTheme.typography.bodyMedium)
+
+            // 让它"当时看到了什么"可见——否则用户只能猜它是不是没看上下文
+            if (record.contextSnippet.isNotBlank()) {
+                Text(
+                    "它当时看到的：",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    record.contextSnippet.lines().takeLast(4).joinToString("\n"),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
 
             val meta =
                 buildString {
@@ -471,16 +487,25 @@ private fun DecisionCard(
                         "已标记：判断错误" +
                             (decision.feedbackNote?.takeIf { it.isNotBlank() }?.let { "（$it）" } ?: "")
                     }
-                Text(
-                    result,
-                    style = MaterialTheme.typography.labelSmall,
-                    color =
-                        if (decision.feedback == true) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.error
-                        },
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        result,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelSmall,
+                        color =
+                            if (decision.feedback == true) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.error
+                            },
+                    )
+                    // 已标错但经验生成失败（网络/额度）时，允许重新生成一次
+                    if (decision.feedback == false) {
+                        TextButton(onClick = onRetry, enabled = !busy) {
+                            Text(if (busy) "生成中…" else "重新总结")
+                        }
+                    }
+                }
             }
         }
     }

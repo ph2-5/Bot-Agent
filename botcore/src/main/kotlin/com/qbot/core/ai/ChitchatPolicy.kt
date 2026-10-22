@@ -84,6 +84,17 @@ data class ChitchatConfig(
     val maxLessons: Int = 80,
     /** 每次判断注入几条经验（本群优先）。这一项才是提示词成本。 */
     val maxInjectedLessons: Int = 8,
+    /**
+     * 判断时携带多少条最近群消息。
+     *
+     * 过去写死 8 条、每条砍到 60 字：快群几秒钟就刷满，模型看到的是断章；
+     * 也看不到消息间隔，判断不出「冷场」还是「两人快速私聊」。
+     * 现在可调，并在提示词里带上相对时间。
+     */
+    val judgeContextSize: Int = 12,
+    /** 判断上下文条数的可选范围 */
+    val MIN_JUDGE_CONTEXT: Int = 6,
+    val MAX_JUDGE_CONTEXT: Int = 24,
 )
 
 /**
@@ -311,6 +322,17 @@ class ChitchatPolicy(
     }
 
     /** 当前自适应冷却时长（测试与日志用）。 */
+    /**
+     * 距机器人上次在本群发言过了多久（毫秒）；没说过返回 null。
+     *
+     * 判断"现在该不该说话"时，"我刚说过"和"我半天没说话了"是两种完全不同的局面。
+     */
+    suspend fun lastSpokeAgoMillis(groupId: String): Long? =
+        mutex.withLock {
+            val state = states[groupId] ?: return@withLock null
+            if (state.lastSpokeAt <= 0L) null else (clock() - state.lastSpokeAt).coerceAtLeast(0L)
+        }
+
     suspend fun cooldownFor(
         groupId: String,
         config: ChitchatConfig,

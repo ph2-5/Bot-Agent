@@ -35,6 +35,7 @@ import com.qbot.core.ai.ChimeDecisionRecord
 import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChimeReflection
 import com.qbot.core.ai.ChimeStats
+import com.qbot.core.ai.EmptyContentException
 import com.qbot.core.ai.LessonCategories
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.GroupProfile
@@ -46,6 +47,7 @@ import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.PersonaResolver
 import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.ThinkingMode
+import com.qbot.core.ai.ThinkingParams
 import com.qbot.core.api.OpenApi
 import com.qbot.core.auth.AccessTokenManager
 import com.qbot.core.engine.BotRuntime
@@ -267,27 +269,18 @@ class BotController(
                 )
             val reply =
                 runCatching {
-                    reflectionClient.chat(
-                        baseUrl = cfg.baseUrl,
-                        apiKey = cfg.apiKey,
-                        model = cfg.model,
-                        messages =
-                            listOf(
-                                ChatMessage("system", ChimeReflection.buildSystemPrompt()),
-                                ChatMessage(
-                                    "user",
-                                    ChimeReflection.buildUserPrompt(updated, chimeLessonStore.all()),
-                                ),
-                            ),
-                        temperature = 0.3,
-                        maxTokens = 150,
+                    chatWithRetry(
+                        cfg = cfg,
+                        system = ChimeReflection.buildSystemPrompt(),
+                        user = ChimeReflection.buildUserPrompt(updated, chimeLessonStore.all()),
+                        maxTokens = 400,
                     )
                 }.getOrElse {
                     return@withLock "已记录，但经验生成失败：${it.message ?: it::class.simpleName ?: "未知错误"}"
                 }
 
             val parsed =
-                ChimeReflection.parse(reply.content)
+                ChimeReflection.parse(reply)
                     ?: return@withLock "已记录，但模型没给出可用的经验"
 
             // 归档到固定类别后，只在该类别里查重：
@@ -326,6 +319,38 @@ class BotController(
         }
 
     /**
+     * 结构化短任务的模型调用：空正文时放宽额度重试一次。
+     *
+     * 有些代理不认 `thinking=disabled`，或长上下文下把额度耗在解释上。
+     * 一次重试比把失败直接抛给用户体面；仍失败才报错（文案由调用方给）。
+     */
+    private suspend fun chatWithRetry(
+        cfg: AiConfig,
+        system: String,
+        user: String,
+        maxTokens: Int,
+    ): String {
+        suspend fun call(tokens: Int): String =
+            reflectionClient
+                .chat(
+                    baseUrl = cfg.baseUrl,
+                    apiKey = cfg.apiKey,
+                    model = cfg.model,
+                    messages = listOf(ChatMessage("system", system), ChatMessage("user", user)),
+                    temperature = 0.2,
+                    maxTokens = tokens,
+                    thinkingType = ThinkingParams.forConfig(cfg, forceDisable = true),
+                ).content
+
+        return try {
+            call(maxTokens)
+        } catch (e: EmptyContentException) {
+            logger.w(TAG, "结构化调用空正文（finish=${e.finishReason}），放宽额度重试一次")
+            call(maxTokens * 2)
+        }
+    }
+
+    /**
      * 同类归并：某类别条数超过上限时，让模型把近义条目压成 ≤3 条。
      *
      * 只在「超限」时触发，成本可控；失败保持原样，下次再试。
@@ -345,18 +370,10 @@ class BotController(
 
         val (system, user) = ChimeReflection.buildMergePrompt(category, lessons)
         val reply =
-            runCatching {
-                reflectionClient.chat(
-                    baseUrl = cfg.baseUrl,
-                    apiKey = cfg.apiKey,
-                    model = cfg.model,
-                    messages = listOf(ChatMessage("system", system), ChatMessage("user", user)),
-                    temperature = 0.2,
-                    maxTokens = 200,
-                )
-            }.getOrNull() ?: return null
+            runCatching { chatWithRetry(cfg, system, user, maxTokens = 500) }.getOrNull()
+                ?: return null
 
-        val merged = ChimeReflection.parseMerged(reply.content)
+        val merged = ChimeReflection.parseMerged(reply)
         if (merged.isEmpty()) return null
 
         val now = System.currentTimeMillis()
@@ -708,6 +725,9 @@ class BotController(
                         spamPenalty = chitchat.scoreWeights.spamPenalty,
                         chimeRules = chitchat.chimeRules,
                         insultExtraWords = chitchat.insultExtraWords,
+                        maxLessons = chitchat.maxLessons,
+                        maxInjectedLessons = chitchat.maxInjectedLessons,
+                        judgeContextSize = chitchat.judgeContextSize,
                     ),
                 rules =
                     database.ruleDao().all().first().map { rule ->
@@ -855,6 +875,9 @@ class BotController(
                         ),
                     chimeRules = it.chimeRules.filter { r -> r.isNotBlank() }.take(10),
                     insultExtraWords = it.insultExtraWords.filter { w -> w.isNotBlank() }.take(50),
+                    maxLessons = it.maxLessons.coerceIn(20, 200),
+                    maxInjectedLessons = it.maxInjectedLessons.coerceIn(3, 12),
+                    judgeContextSize = it.judgeContextSize.coerceIn(6, 24),
                 ),
             )
             applied++

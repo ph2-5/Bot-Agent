@@ -94,6 +94,34 @@ fun ChitchatPage(onBack: () -> Unit) {
             )
         }
 
+        SectionHeader(
+            "判断上下文",
+            "每次判断时带上最近多少条群消息——太少会看不懂语境，太多会稀释重点",
+        )
+        SettingsCard {
+            var judgeSize by remember(config.judgeContextSize) {
+                mutableFloatStateOf(config.judgeContextSize.toFloat())
+            }
+            Text(
+                "判断时参考最近 ${judgeSize.toInt()} 条消息",
+                style = MaterialTheme.typography.labelMedium,
+            )
+            Slider(
+                value = judgeSize,
+                onValueChange = { judgeSize = it },
+                valueRange = 6f..24f,
+                steps = 17,
+                enabled = config.enabled,
+                onValueChangeFinished = {
+                    update(config.copy(judgeContextSize = judgeSize.toInt().coerceIn(6, 24)))
+                },
+            )
+            HintText(
+                "提示词里会带每条消息的相对时间（刚刚 / N 分钟前），" +
+                    "以及你上次发言是多久前——它才能分辨「冷场」和「两人快速对聊」。",
+            )
+        }
+
         SectionHeader("频率", "先挡住「说太多」，剩下才轮到内容判断")
         SettingsCard {
             var cooldown by remember(config.baseCooldownMillis) {

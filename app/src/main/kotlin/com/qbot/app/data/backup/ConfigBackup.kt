@@ -109,6 +109,10 @@ data class ChitchatBackup(
     @SerialName("w_spam") val spamPenalty: Int = -10,
     @SerialName("chime_rules") val chimeRules: List<String> = emptyList(),
     @SerialName("insult_extra_words") val insultExtraWords: List<String> = emptyList(),
+    // ---- 2.1 新增：训练参数（旧备份按默认值导入） ----
+    @SerialName("max_lessons") val maxLessons: Int = 80,
+    @SerialName("max_injected_lessons") val maxInjectedLessons: Int = 8,
+    @SerialName("judge_context_size") val judgeContextSize: Int = 12,
 )
 
 @Serializable

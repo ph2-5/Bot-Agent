@@ -120,6 +120,7 @@ class SettingsRepository(private val context: Context) {
         // 训练闭环：经验库容量与每次注入条数
         val CHITCHAT_MAX_LESSONS = intPreferencesKey("chitchat_max_lessons")
         val CHITCHAT_MAX_INJECTED = intPreferencesKey("chitchat_max_injected")
+        val CHITCHAT_JUDGE_CONTEXT = intPreferencesKey("chitchat_judge_context")
     }
 
     private companion object {
@@ -316,6 +317,9 @@ class SettingsRepository(private val context: Context) {
             maxInjectedLessons =
                 (prefs[Keys.CHITCHAT_MAX_INJECTED] ?: defaults.maxInjectedLessons)
                     .coerceIn(ChimeLesson.MIN_INJECTED, ChimeLesson.MAX_INJECTED),
+            judgeContextSize =
+                (prefs[Keys.CHITCHAT_JUDGE_CONTEXT] ?: defaults.judgeContextSize)
+                    .coerceIn(defaults.MIN_JUDGE_CONTEXT, defaults.MAX_JUDGE_CONTEXT),
         )
     }
 
@@ -352,6 +356,11 @@ class SettingsRepository(private val context: Context) {
                     config.maxInjectedLessons.coerceIn(
                         ChimeLesson.MIN_INJECTED,
                         ChimeLesson.MAX_INJECTED,
+                    )
+                prefs[Keys.CHITCHAT_JUDGE_CONTEXT] =
+                    config.judgeContextSize.coerceIn(
+                        config.MIN_JUDGE_CONTEXT,
+                        config.MAX_JUDGE_CONTEXT,
                     )
             }
         }

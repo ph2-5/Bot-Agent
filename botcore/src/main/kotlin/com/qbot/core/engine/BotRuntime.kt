@@ -339,7 +339,8 @@ class BotRuntime(
 
         // 上下文：最近几条群消息——打分（话题延续/回应机器人/冷场）与
         // AI 判断共用同一份，本条消息尚未入库所以天然不含自身
-        val recent = pipeline.recentRoomMessages(message, 8)
+        // 判断上下文条数可配：快群 8 条只够几秒钟，模型看到的是断章
+        val recent = pipeline.recentRoomMessages(message, chitchatConfig?.judgeContextSize ?: 8)
 
         val mentionIds = mentionIdsOf(message)
         val names =
@@ -447,6 +448,8 @@ class BotRuntime(
                                         recent,
                                         profile?.botName,
                                         personaPrompt,
+                                        lastBotSpokeAgoMillis =
+                                            chitchatPolicy.lastSpokeAgoMillis(groupId),
                                         behavior =
                                             BehaviorContext(
                                                 userRules = config.chimeRules,

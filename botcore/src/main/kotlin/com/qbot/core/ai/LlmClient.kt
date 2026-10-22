@@ -29,6 +29,21 @@ open class LlmException(message: String, val statusCode: Int? = null, cause: Thr
     Exception(message, cause)
 
 /**
+ * 模型返回了空正文。
+ *
+ * 常见于「思考模式 + 输出额度太小」：思维链把 maxTokens 吃完，content 为空。
+ * 单独类型是为了让调用方能识别并降级重试，而不是把所有失败混成一句报错。
+ */
+class EmptyContentException(
+    message: String,
+    val reasoning: String? = null,
+    val finishReason: String? = null,
+) : LlmException(message) {
+    /** 是否因为输出额度被截断（finish_reason = length） */
+    val truncated: Boolean get() = finishReason == "length"
+}
+
+/**
  * 请求上下文超出模型窗口。
  *
  * 服务端返回 400 且报文含 context length / maximum context 等字样时抛出，
@@ -58,6 +73,10 @@ data class LlmUsage(
 data class LlmReply(
     val content: String,
     val usage: LlmUsage = LlmUsage(),
+    /** 思考过程（DeepSeek 等），仅在开启思考时有值；不作为正文使用 */
+    val reasoning: String? = null,
+    /** stop / length / content_filter …；length 表示被输出额度截断 */
+    val finishReason: String? = null,
 )
 
 /**
@@ -199,6 +218,15 @@ class LlmClient(
         return parseReply(body)
     }
 
+    /** 读取 choices[0].finish_reason（缺失时为 null）。 */
+    private fun JsonObject.finishReason(): String? =
+        runCatching {
+            val choices = this["choices"] as? kotlinx.serialization.json.JsonArray
+            val first = choices?.firstOrNull() as? JsonObject
+            first?.get("finish_reason")?.let { it as? kotlinx.serialization.json.JsonPrimitive }
+                ?.contentOrNull
+        }.getOrNull()
+
     /** 按状态码造异常；上下文超限单独分类，便于调用方自动裁剪重试。 */
     private fun httpError(
         code: Int,
@@ -233,25 +261,40 @@ class LlmClient(
                 throw LlmException("响应解析失败：${e.message}", cause = e)
             }
 
-        // 依次尝试 content → reasoning_content。
-        // 推理模型（DeepSeek-R1 等）有时 content 为 null 而思考过程在 reasoning_content 里，
-        // 也有兼容实现在 content 里放 JsonNull；都兜住，避免"返回 null"这类莫名失败。
-        val content =
-            root.messageText("content")
-                ?: root.messageText("reasoning_content")
+        // 正文与思考过程分开取：reasoning_content 绝不能当答案返回。
+        // 之前把它当兜底，结果是"看似成功、内容其实是思维链"，下游解析全乱。
+        val content = root.messageText("content")
+        val reasoning = root.messageText("reasoning_content")
+        val finishReason = root.finishReason()
+        val snippet = body.take(120)
 
         if (content.isNullOrBlank()) {
             // 有些兼容实现在错误时也返回 200，靠 error 字段说明原因
-            val err = root["error"]
-            val msg =
-                (err as? JsonObject)?.get("message")
+            val err =
+                (root["error"] as? JsonObject)?.get("message")
                     ?.let { it as? kotlinx.serialization.json.JsonPrimitive }
                     ?.contentOrNull
-            val snippet = body.take(200)
-            throw LlmException(msg ?: "响应中没有回复内容（原始返回：$snippet）")
+            if (!err.isNullOrBlank()) throw LlmException(err)
+
+            val reasonText =
+                when {
+                    reasoning.isNullOrBlank() -> "模型返回了空内容"
+                    finishReason == "length" -> "模型只输出了思考过程，正文被输出额度截断"
+                    else -> "模型只输出了思考过程，没有给出正文"
+                }
+            throw EmptyContentException(
+                "$reasonText（finish=${finishReason ?: "未知"}）。原始返回：$snippet",
+                reasoning = reasoning,
+                finishReason = finishReason,
+            )
         }
 
-        return LlmReply(content = content.trim(), usage = parseUsage(root))
+        return LlmReply(
+            content = content.trim(),
+            usage = parseUsage(root),
+            reasoning = reasoning?.takeIf { it.isNotBlank() },
+            finishReason = finishReason,
+        )
     }
 
     /**

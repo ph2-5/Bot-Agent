@@ -324,12 +324,15 @@ class MemoryPipeline(
     }
 
     /** 把一轮问答写进共享背景（回复后调用）。 */
-    suspend fun recordExchange(        message: IncomingMessage,
+    suspend fun recordExchange(
+        message: IncomingMessage,
         cleanText: String,
         answer: String,
     ) {
         val config = configProvider()
-        if (!config.enabled || !config.roomContextEnabled) return
+        // 只受总开关控制：roomContextEnabled 管的是「回复时是否注入背景」，
+        // 不该让接话判断和复盘跟着失忆（详见 recentRoomMessages 的注释）。
+        if (!config.enabled) return
         if (message.targetId.isNullOrBlank()) return
 
         val now = clock()
@@ -376,7 +379,7 @@ class MemoryPipeline(
         decision: String? = null,
     ) {
         val config = configProvider()
-        if (!config.enabled || !config.roomContextEnabled) return
+        if (!config.enabled) return
         if (message.targetId.isNullOrBlank()) return
         if (cleanText.isBlank()) return
 
@@ -433,7 +436,7 @@ class MemoryPipeline(
         answer: String,
     ) {
         val config = configProvider()
-        if (!config.enabled || !config.roomContextEnabled) return
+        if (!config.enabled) return
         if (message.targetId.isNullOrBlank() || answer.isBlank()) return
         val key = ConversationKeys.room(message)
         roomContext.append(
@@ -455,7 +458,7 @@ class MemoryPipeline(
         decision: String,
     ) {
         val config = configProvider()
-        if (!config.enabled || !config.roomContextEnabled) return
+        if (!config.enabled) return
         val externalId = message.messageId ?: return
         roomContext.updateDecision(ConversationKeys.room(message), externalId, decision)
     }
@@ -476,7 +479,9 @@ class MemoryPipeline(
         limit: Int,
     ): List<RoomMessage> {
         val config = configProvider()
-        if (!config.enabled || !config.roomContextEnabled) return emptyList()
+        // 这里刻意不看 roomContextEnabled：那个开关只决定「回复时是否带背景」。
+        // 接话判断必须有上下文才谈得上语境，否则等于闭着眼睛决定说不说话。
+        if (!config.enabled) return emptyList()
         if (message.targetId.isNullOrBlank()) return emptyList()
         return roomContext.recent(ConversationKeys.room(message), limit)
     }
@@ -487,7 +492,7 @@ class MemoryPipeline(
         limit: Int,
     ): List<RoomMessage> {
         val config = configProvider()
-        if (!config.enabled || !config.roomContextEnabled) return emptyList()
+        if (!config.enabled) return emptyList()
         return roomContext.recent(ConversationKeys.groupRoom(groupId), limit)
     }
 

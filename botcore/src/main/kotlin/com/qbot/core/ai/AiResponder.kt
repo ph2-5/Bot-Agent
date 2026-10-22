@@ -349,14 +349,22 @@ class AiResponder(
         botName: String?,
         personaPrompt: String? = null,
         behavior: BehaviorContext = BehaviorContext(),
+        /** 机器人上次在本群发言距今多久；null 表示还没说过 */
+        lastBotSpokeAgoMillis: Long? = null,
     ): ChimeVerdict {
         val speaker = message.senderName?.takeIf { it.isNotBlank() } ?: "群友"
+        // 以当前消息时间为基准算相对时间：模型靠间隔判断冷场还是两人快速对聊
+        val now = message.timestampMillis.takeIf { it > 0L } ?: System.currentTimeMillis()
         val transcript =
-            recent.takeLast(8).joinToString("\n") { msg ->
+            recent.joinToString("\n") { msg ->
                 val who =
-                    msg.senderName?.takeIf { it.isNotBlank() }
-                        ?: if (msg.role == "assistant") (botName ?: "机器人") else "某人"
-                "[$who] ${msg.content.replace("\n", " ").take(60)}"
+                    if (msg.role == "assistant") {
+                        "你"
+                    } else {
+                        msg.senderName?.takeIf { it.isNotBlank() } ?: "某人"
+                    }
+                val ago = humanAgo((now - msg.timestampMillis).coerceAtLeast(0L))
+                "[$who · $ago] ${msg.content.replace("\n", " ").take(120)}"
             }
         val personaBlock =
             personaPrompt?.takeIf { it.isNotBlank() }?.let { persona ->
@@ -365,10 +373,16 @@ class AiResponder(
                     "高冷话少的性格只在确有必要时才接话。\n"
             }.orEmpty()
         val behaviorBlock = renderBehavior(behavior)
+        val spokeBlock =
+            lastBotSpokeAgoMillis?.let { "你上次在这个群发言是${humanAgo(it)}。\n" }.orEmpty()
         val system =
             "你在一个 QQ 群里，判断最后这条消息是否需要你接话。\n" +
                 personaBlock +
                 "注意：这条消息**没有 @ 你**，你只是旁听的群友——不要因为看到了就抢着回。\n" +
+                spokeBlock +
+                "判断前先读上面的对话：他们在聊什么、谁在跟谁说话、有没有人在等回应。\n" +
+                "如果最后几条是两个人快速互相回复、且没向你提问，倾向 NO；\n" +
+                "如果是抛给全群的问题、明显冷场、或在延续你刚才的话题，倾向 YES。\n" +
                 "回答 YES 的情况：\n" +
                 "1) 有人向你提问或求助；\n" +
                 "2) 话题明显需要别人搭话（冷场、抛问题、征求意见、求推荐）；\n" +
@@ -399,6 +413,15 @@ class AiResponder(
             )
         return parseVerdict(reply.content)
     }
+
+    /** 把毫秒差写成模型能理解的时间感。 */
+    private fun humanAgo(deltaMillis: Long): String =
+        when {
+            deltaMillis < 60_000L -> "刚刚"
+            deltaMillis < 3_600_000L -> "${deltaMillis / 60_000L} 分钟前"
+            deltaMillis < 86_400_000L -> "${deltaMillis / 3_600_000L} 小时前"
+            else -> "${deltaMillis / 86_400_000L} 天前"
+        }
 
     /**
      * 渲染行为约束块。用户规则在上、经验在下——冲突时以用户显式约定为准。
@@ -541,18 +564,7 @@ class AiResponder(
      * 模型名也参与判断是为了覆盖通过第三方代理转发 DeepSeek 的场景；
      * 其余情况等同 AUTO（不发送，由服务端默认行为决定）。
      */
-    internal fun thinkingParam(config: AiConfig): String? {
-        if (config.thinkingMode == ThinkingMode.AUTO) return null
-        val looksLikeDeepSeek =
-            config.baseUrl.contains("deepseek", ignoreCase = true) ||
-                config.model.contains("deepseek", ignoreCase = true)
-        if (!looksLikeDeepSeek) return null
-        return when (config.thinkingMode) {
-            ThinkingMode.DISABLED -> "disabled"
-            ThinkingMode.ENABLED -> "enabled"
-            ThinkingMode.AUTO -> null
-        }
-    }
+    internal fun thinkingParam(config: AiConfig): String? = ThinkingParams.forConfig(config)
 
     /** 清空某个会话的上下文（按人隔离的线程）。 */
     suspend fun clearHistory(message: IncomingMessage) {

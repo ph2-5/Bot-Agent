@@ -211,12 +211,15 @@ class LlmClientTest {
                     )
                 }.exceptionOrNull()
 
-            assertTrue("应抛异常而不是返回 \"null\" 字符串", error is LlmException)
-            assertTrue((error as LlmException).message.orEmpty().contains("没有回复内容"))
+            assertTrue("应是空正文异常", error is EmptyContentException)
+            assertTrue(
+                "应说清是空内容，实际=${error?.message}",
+                error?.message.orEmpty().contains("空内容"),
+            )
         }
 
     @Test
-    fun `推理模型只有 reasoning_content 时取思考过程作答`() =
+    fun `只有 reasoning_content 时不再冒充正文`() =
         runBlocking {
             server.enqueue(
                 MockResponse()
@@ -224,20 +227,30 @@ class LlmClientTest {
                     .setBody(
                         """
                         {"choices":[{"message":{"role":"assistant","content":null,
-                        "reasoning_content":"用户问的是打招呼"}}]}
+                        "reasoning_content":"用户问的是打招呼"},
+                        "finish_reason":"length"}]}
                         """.trimIndent(),
                     ),
             )
 
-            val reply =
-                client.chat(
-                    baseUrl = server.url("/").toString(),
-                    apiKey = "k",
-                    model = "m",
-                    messages = listOf(ChatMessage("user", "hi")),
-                )
+            val error =
+                runCatching {
+                    client.chat(
+                        baseUrl = server.url("/").toString(),
+                        apiKey = "k",
+                        model = "m",
+                        messages = listOf(ChatMessage("user", "hi")),
+                    )
+                }.exceptionOrNull()
 
-            assertEquals("用户问的是打招呼", reply.content)
+            assertTrue("思考过程不能当答案返回", error is EmptyContentException)
+            val empty = error as EmptyContentException
+            assertEquals("用户问的是打招呼", empty.reasoning)
+            assertTrue("应识别为输出被截断", empty.truncated)
+            assertTrue(
+                "报错应说明正文被截断，实际=${empty.message}",
+                empty.message.orEmpty().contains("截断"),
+            )
         }
 
     @Test

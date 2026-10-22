@@ -489,4 +489,41 @@ class AiResponderTest {
             val body = server.takeRequest().body.readUtf8()
             assertFalse("无经验时不应出现经验块，实际=$body", body.contains("从主人反馈中学到的经验"))
         }
+
+    @Test
+    fun `判断提示词带上历史消息与相对时间`() =
+        runBlocking {
+            enqueueAnswer("NO\n两人在私聊")
+            val history =
+                listOf(
+                    RoomMessage(
+                        senderId = "u1",
+                        senderName = "小明",
+                        role = "user",
+                        content = "今晚开黑吗",
+                        timestampMillis = 1_700_000_000_000L - 180_000L,
+                    ),
+                    RoomMessage(
+                        senderId = null,
+                        senderName = null,
+                        role = "assistant",
+                        content = "我不玩",
+                        timestampMillis = 1_700_000_000_000L - 60_000L,
+                    ),
+                )
+            responder.shouldChimeIn(
+                message("你们玩啥").copy(timestampMillis = 1_700_000_000_000L),
+                config(),
+                history,
+                "小白",
+                lastBotSpokeAgoMillis = 60_000L,
+            )
+
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue("应包含历史消息", body.contains("今晚开黑吗"))
+            assertTrue("机器人消息应标为「你」", body.contains("[你 · 1 分钟前]"))
+            assertTrue("用户消息应带相对时间", body.contains("[小明 · 3 分钟前]"))
+            assertTrue("应告知上次发言时间", body.contains("你上次在这个群发言是1 分钟前"))
+            assertTrue("应给出判断方法提示", body.contains("判断前先读上面的对话"))
+        }
 }
