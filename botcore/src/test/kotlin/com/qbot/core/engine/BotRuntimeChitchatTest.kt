@@ -60,6 +60,9 @@ class BotRuntimeChitchatTest {
     /** 判断调用的模型输出；测试里可改（默认 YES + 理由） */
     private var llmVerdict = "YES\n有人在征求意见"
 
+    /** 判断调用的 HTTP 状态，用来模拟限流/服务端错误 */
+    private var llmJudgeStatus = 200
+
     private val sentMessages = CopyOnWriteArrayList<String>()
     private val llmBodies = CopyOnWriteArrayList<String>()
 
@@ -80,18 +83,19 @@ class BotRuntimeChitchatTest {
                             llmBodies += body
                             // 同一个端点承担两件事：插话判断与正式回复。
                             // 用 system 提示词里的特征句区分，避免两套 mock。
-                            val content =
-                                if (body.contains("判断最后这条消息是否需要你接话")) {
-                                    llmVerdict
-                                } else {
-                                    "行啊，带我一个"
-                                }
-                            val escaped =
-                                content.replace("\\", "\\\\")
-                                    .replace("\n", "\\n")
-                                    .replace("\"", "\\\"")
-                            MockResponse()
-                                .setBody("""{"choices":[{"message":{"content":"$escaped"}}]}""")
+                            val isJudge = body.contains("判断最后这条消息是否需要你接话")
+                            if (isJudge && llmJudgeStatus != 200) {
+                                MockResponse().setResponseCode(llmJudgeStatus)
+                                    .setBody("""{"error":{"message":"upstream error"}}""")
+                            } else {
+                                val content = if (isJudge) llmVerdict else "行啊，带我一个"
+                                val escaped =
+                                    content.replace("\\", "\\\\")
+                                        .replace("\n", "\\n")
+                                        .replace("\"", "\\\"")
+                                MockResponse()
+                                    .setBody("""{"choices":[{"message":{"content":"$escaped"}}]}""")
+                            }
                         }
 
                         request.path!!.startsWith("/v2/groups/") -> {
@@ -428,5 +432,24 @@ class BotRuntimeChitchatTest {
                 while (trainer.lessons.single().hits == 0) delay(50)
             }
             assertEquals(1, trainer.lessons.single().hits)
+        }
+
+    @Test
+    fun `判断失败时记下具体原因而不是笼统失败`() =
+        runBlocking {
+            llmJudgeStatus = 500
+            val runtime = prepareRuntime(this, ChitchatConfig(enabled = true, aiJudge = true))
+
+            runtime.onMessage(fullMessage("这个周末有人去爬山吗"))
+            withTimeout(15_000) {
+                while (trainer.decisions.isEmpty()) delay(50)
+            }
+
+            val record = trainer.decisions.single()
+            assertEquals("SILENT", record.action)
+            assertTrue(
+                "原因应带 HTTP 状态，实际=${record.reason}",
+                record.reason.contains("AI 判断失败（HTTP 500）"),
+            )
         }
 }

@@ -409,6 +409,8 @@ class AiResponder(
                 messages = listOf(ChatMessage("system", system), ChatMessage("user", user)),
                 temperature = 0.0,
                 maxTokens = 40,
+                // 判断是即时动作：超时就当作不接，别把消息处理拖住
+                timeoutSeconds = 20L,
                 thinkingType = thinkingParam(config),
             )
         return parseVerdict(reply.content)

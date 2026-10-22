@@ -7,6 +7,7 @@ import com.qbot.core.ai.BehaviorContext
 import com.qbot.core.ai.ChimeDecisionRecord
 import com.qbot.core.ai.ChimeTrainer
 import com.qbot.core.ai.LessonCategories
+import com.qbot.core.ai.LlmException
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.ChitchatGate
 import com.qbot.core.ai.ChitchatPolicy
@@ -440,6 +441,7 @@ class BotRuntime(
                                         config.maxInjectedLessons,
                                     ) ?: emptyList()
                                 }.getOrDefault(emptyList())
+                            var judgeFailure: Throwable? = null
                             val verdict =
                                 runCatching {
                                     responder.shouldChimeIn(
@@ -460,12 +462,15 @@ class BotRuntime(
                                                     },
                                             ),
                                     )
-                                }.getOrNull()
-                            // 判断没跑起来（网络/配置）按不接处理
+                                }.onFailure { judgeFailure = it }.getOrNull()
+                            // 判断没跑起来（网络/限流/服务端错误）按不接处理，
+                            // 但原因必须留下——过去一律吞成"AI 判断失败"，
+                            // 用户和日志都无从判断是超时还是 429。
                             if (verdict == null) {
-                                finalReason = "不接：AI 判断失败"
+                                val why = describeFailure(judgeFailure)
+                                finalReason = "不接：AI 判断失败（$why）"
                                 pipeline.markChitchatDecision(message, finalReason)
-                                log(LogLevel.VERBOSE, TAG, "群聊消息不接：AI 判断失败")
+                                log(LogLevel.WARN, TAG, "群聊消息不接：AI 判断失败（$why）")
                                 return
                             }
                             aiVerdict = if (verdict.should) "YES" else "NO"
@@ -574,6 +579,17 @@ class BotRuntime(
                         ?: if (msg.role == "assistant") botName.ifBlank { "机器人" } else "某人"
                 "[$who] ${msg.content.replace("\n", " ").take(60)}"
             }.take(400)
+
+    /** 把判断失败的原因压成一句人话，写进日志与决策记录。 */
+    private fun describeFailure(error: Throwable?): String {
+        if (error == null) return "原因未知"
+        val detail =
+            when (error) {
+                is LlmException -> error.statusCode?.let { "HTTP $it" } ?: error.message
+                else -> error.message
+            } ?: error::class.simpleName ?: "未知错误"
+        return detail.replace("\n", " ").take(60)
+    }
 
     /** 消息里是否 @ 了机器人（全量模式下 @ 消息也可能从这里进来）。 */
     private fun mentionsBot(
