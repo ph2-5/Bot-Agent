@@ -697,6 +697,32 @@ class BotController(
         return id
     }
 
+    /**
+     * 新建一份「手写人格」：正文是用户自己的系统提示词，完全自由格式。
+     *
+     * 这是和「自动养成」并存的另一条路：AI 不会碰它，除非用户显式交给它。
+     */
+    suspend fun createManualPersona(
+        name: String,
+        prompt: String,
+    ): Long {
+        val id =
+            personaRepository.createProfile(
+                name = name,
+                prompt = prompt,
+                stage = PersonaStage.MANUAL,
+            )
+        personaRepository.activate(id)
+        appendLog(LogLevel.INFO, TAG, "新建手写人格「$name」")
+        return id
+    }
+
+    /** 把人格抢回手里：停止自动成长，正文保持不变。 */
+    suspend fun takeOverPersona(id: Long) {
+        personaRepository.takeOver(id)
+        appendLog(LogLevel.INFO, TAG, "人格已转为手动：以后只按你写的来")
+    }
+
     suspend fun activatePersona(id: Long) {
         personaRepository.activate(id)
         appendLog(LogLevel.INFO, TAG, "已切换人格档案 #$id")

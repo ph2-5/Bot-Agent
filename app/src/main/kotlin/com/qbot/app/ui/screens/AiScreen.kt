@@ -408,7 +408,13 @@ private fun PersonaTab() {
                     onHandOver = {
                         scope.launch {
                             controller.handOverPersonaToGrowth(current.id)
-                            hint = "已交给它自己养：以后按消息量自动微调"
+                            hint = "已交给它自己养：以后它会按群聊自己微调"
+                        }
+                    },
+                    onTakeOver = {
+                        scope.launch {
+                            controller.takeOverPersona(current.id)
+                            hint = "已转为手动：以后只按你写的来，它不会自己改"
                         }
                     },
                 )
@@ -510,11 +516,16 @@ private fun PersonaTab() {
     if (creating) {
         PersonaCreateDialog(
             onDismiss = { creating = false },
-            onConfirm = { name, seed ->
+            onConfirm = { name, seed, manualPrompt ->
                 scope.launch {
-                    controller.createPersonaProfile(name, seed)
+                    if (manualPrompt != null) {
+                        controller.createManualPersona(name, manualPrompt)
+                        hint = "已创建手写人格「$name」：按你写的来，AI 不会改"
+                    } else {
+                        controller.createPersonaProfile(name, seed)
+                        hint = "已创建「$name」，性格种子是「${seed.label}」。攒够消息它就破壳了。"
+                    }
                     creating = false
-                    hint = "已创建「$name」，性格种子是「${seed.label}」。聊够消息它就破壳了。"
                 }
             },
         )
@@ -528,7 +539,12 @@ private fun PersonaTab() {
                 scope.launch {
                     controller.personaRepository.save(persona.copy(name = name, prompt = prompt))
                     editingProfile = null
-                    hint = "已保存。你手改的这版会覆盖它自己长出来的内容"
+                    hint =
+                        if (PersonaSections.parse(prompt) == null) {
+                            "已保存为自由文本人格：和你以前写系统提示词一样，AI 不会改它"
+                        } else {
+                            "已保存。这版会成为它以后自动成长的新基准"
+                        }
                 }
             },
         )
@@ -586,10 +602,17 @@ private fun ActivePersonaCard(
     onFreeze: (Boolean) -> Unit,
     onReseed: () -> Unit,
     onHandOver: () -> Unit,
+    onTakeOver: () -> Unit,
 ) {
-    val sections =
-        PersonaSections.parse(persona.prompt)
-            ?: PersonaSections.parse(PersonaGrowth.embryoSkeleton(persona.seedId))
+    // 三种形态：五段结构（自动成长）/ 自由文本（用户手写）/ 空（EMBRYO，显示骨架）
+    val sections = PersonaSections.parse(persona.prompt)
+    val freeform = persona.prompt.isNotBlank() && sections == null
+    val skeletonPreview =
+        if (persona.prompt.isBlank()) {
+            PersonaSections.parse(PersonaGrowth.embryoSkeleton(persona.seedId))
+        } else {
+            null
+        }
     val seed = PersonaSeed.of(persona.seedId)
 
     Card(
@@ -628,7 +651,24 @@ private fun ActivePersonaCard(
                 )
             }
 
-            sections?.let { PersonaSectionsView(it) }
+            when {
+                sections != null -> PersonaSectionsView(sections)
+                freeform -> {
+                    // 用户手写的自由文本必须原样显示——过去解析失败会 fallback 到骨架，
+                    // 等于把用户写的东西藏起来，看起来就像"人格是空的"。
+                    Text(
+                        "自由文本 · AI 不会自动改写",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Text(
+                        persona.prompt.take(900) +
+                            if (persona.prompt.length > 900) "…" else "",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                else -> skeletonPreview?.let { PersonaSectionsView(it) }
+            }
 
             if (persona.lastNote.isNotBlank()) {
                 Text(
@@ -649,6 +689,8 @@ private fun ActivePersonaCard(
                 }
                 if (persona.stage == PersonaStage.MANUAL) {
                     TextButton(onClick = onHandOver, enabled = !busy) { Text("交给它自己养") }
+                } else {
+                    TextButton(onClick = onTakeOver, enabled = !busy) { Text("改为手动") }
                 }
             }
         }
@@ -761,10 +803,14 @@ private fun OverrideRow(
 @Composable
 private fun PersonaCreateDialog(
     onDismiss: () -> Unit,
-    onConfirm: (String, PersonaSeed) -> Unit,
+    /** 第三参数非空表示"自己写"：直接拿它当人格正文 */
+    onConfirm: (String, PersonaSeed, String?) -> Unit,
 ) {
     var seed by remember { mutableStateOf(PersonaSeed.random()) }
     var name by remember { mutableStateOf(seed.label) }
+    // false = 自动养成（选种子），true = 自己写（旧版系统提示词那种）
+    var manual by remember { mutableStateOf(false) }
+    var manualPrompt by remember { mutableStateOf("") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -774,8 +820,24 @@ private fun PersonaCreateDialog(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = !manual,
+                        onClick = { manual = false },
+                        label = { Text("让它自己长") },
+                    )
+                    FilterChip(
+                        selected = manual,
+                        onClick = { manual = true },
+                        label = { Text("我自己写") },
+                    )
+                }
                 Text(
-                    "不用写提示词。先给它一个性格原点，剩下的从群聊里长。",
+                    if (manual) {
+                        "你写的就是它的系统提示词，和旧版一样。AI 不会自动改，除非你点「交给它自己养」。"
+                    } else {
+                        "不用写提示词。先给它一个性格原点，剩下的从群聊里长。"
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -786,8 +848,19 @@ private fun PersonaCreateDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                if (manual) {
+                    OutlinedTextField(
+                        value = manualPrompt,
+                        onValueChange = { manualPrompt = it },
+                        label = { Text("系统提示词") },
+                        placeholder = { Text("你是一个说话简短、偶尔毒舌的群友……") },
+                        minLines = 8,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                } else {
                 Text("性格种子", style = MaterialTheme.typography.labelMedium)
-                PersonaSeed.entries.forEach { option ->
+                }
+                if (!manual) PersonaSeed.entries.forEach { option ->
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier =
@@ -815,7 +888,14 @@ private fun PersonaCreateDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { onConfirm(name.trim().ifBlank { seed.label }, seed) },
+                onClick = {
+                    onConfirm(
+                        name.trim().ifBlank { if (manual) "手写人格" else seed.label },
+                        seed,
+                        if (manual) manualPrompt.trim() else null,
+                    )
+                },
+                enabled = !manual || manualPrompt.isNotBlank(),
             ) { Text("创建") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
@@ -850,16 +930,22 @@ private fun PersonaBodyDialog(
                 OutlinedTextField(
                     value = prompt,
                     onValueChange = { prompt = it },
-                    label = { Text("人格正文") },
+                    label = { Text("人格正文（等同旧版系统提示词）") },
                     supportingText = {
                         Text(
-                            "保留 [身份][性格][说话方式][兴趣][边界] 五段。" +
-                                "改完这版会成为自动成长的新基准。",
+                            "想自己写就随便写，怎么顺怎么来——这版不会被 AI 改动。" +
+                                "想让它自己接着长，再按下面提示的五段格式写，然后点「交给它自己养」。",
                             style = MaterialTheme.typography.labelSmall,
                         )
                     },
-                    minLines = 8,
+                    minLines = 10,
                     modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "五段格式：[身份] [性格] [说话方式] [兴趣] [边界]。不按这个写也能用，" +
+                        "只是自动成长需要它来比对改动幅度。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         },

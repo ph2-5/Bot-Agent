@@ -9,6 +9,7 @@ import com.qbot.core.ai.KnownPerson
 import com.qbot.core.ai.Persona
 import com.qbot.core.ai.PersonaKind
 import com.qbot.core.ai.PersonaSeed
+import com.qbot.core.ai.PersonaSections
 import com.qbot.core.ai.PersonaSnapshot
 import com.qbot.core.ai.PersonaSnapshotKind
 import com.qbot.core.ai.PersonaStage
@@ -68,6 +69,19 @@ class PersonaRepository(
     override suspend fun save(persona: Persona): Long {
         val now = System.currentTimeMillis()
         val existing = if (persona.id > 0) personaDao.findById(persona.id) else null
+
+        // 自由文本（不是五段结构）不可能被"小步微调"——守卫拿不到可比对的段落，
+        // 下一次成长只能整段重写，等于把用户写的东西冲掉。
+        // 所以只要正文不是五段，就自动转成手动：用户写的永远优先。
+        val freeform =
+            persona.prompt.isNotBlank() && PersonaSections.parse(persona.prompt) == null
+        val stage =
+            if (freeform) {
+                PersonaStage.MANUAL.name
+            } else {
+                existing?.stage ?: persona.stage.name
+            }
+
         return personaDao.upsert(
             PersonaEntity(
                 id = persona.id,
@@ -77,7 +91,7 @@ class PersonaRepository(
                 prompt = persona.prompt,
                 updatedAt = now,
                 kind = existing?.kind ?: persona.kind.name,
-                stage = existing?.stage ?: persona.stage.name,
+                stage = stage,
                 seedId = existing?.seedId ?: persona.seedId,
                 activeSlot = existing?.activeSlot,
                 frozen = existing?.frozen ?: persona.frozen,
@@ -161,6 +175,23 @@ class PersonaRepository(
         }
         personaDao.deleteById(id)
         return true
+    }
+
+    /**
+     * 用户接手：保留当前正文，停止自动成长。
+     *
+     * 和「交给它自己养」互为反向操作。用户随时可以把某份人格抢回手里，
+     * 之后只有他自己改。
+     */
+    suspend fun takeOver(id: Long) {
+        val row = personaDao.findById(id) ?: return
+        personaDao.updateMeta(
+            id = id,
+            stage = PersonaStage.MANUAL.name,
+            seedId = row.seedId,
+            frozen = row.frozen,
+            at = System.currentTimeMillis(),
+        )
     }
 
     /** 冻结 / 解冻自动成长。 */
