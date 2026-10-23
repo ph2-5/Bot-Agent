@@ -19,6 +19,8 @@ import com.qbot.core.ai.InsultDetector
 import com.qbot.core.ai.InnerThought
 import com.qbot.core.ai.InnerThoughtSink
 import com.qbot.core.ai.MemeHarvester
+import com.qbot.core.ai.MemeIntent
+import com.qbot.core.ai.MemeLibrary
 import com.qbot.core.ai.MemeMarker
 import com.qbot.core.ai.MemoryContext
 import com.qbot.core.ai.MemoryPipeline
@@ -153,6 +155,14 @@ class BotRuntime(
      * 为 null 时完全关闭——不发图的机器人行为与接入前一致。
      */
     private val memeHarvester: MemeHarvester? = null,
+    /**
+     * 表情包库。
+     *
+     * 两个用途：用户明确要图时本地直接挑一张（不消耗模型调用）；
+     * 模型通过 send_meme 工具选好图、真正发出去之后累加采用次数。
+     * 为 null 时只保留提示词里的 `[表情:URL]` 约定。
+     */
+    private val memeLibrary: MemeLibrary? = null,
     /** 插话决策引擎；默认实例即可，测试可注入固定时钟 */
     private val chitchatPolicy: ChitchatPolicy = ChitchatPolicy(),
     /** 冒犯检测：被指名辱骂时要按人设反应，不能装没看见 */
@@ -349,6 +359,10 @@ class BotRuntime(
             replyWithRule(message, rule, text)
             return
         }
+
+        // 明确要一张表情包：本地直接挑图，不为此再花一次模型调用。
+        // 库里没有图时返回 false，落到下面的 AI 链路，让它按人设回应。
+        if (MemeIntent.isRequest(text) && replyWithMeme(message, text)) return
 
         if (aiResponder != null && aiConfig != null && aiEnabled &&
             aiResponder.shouldHandle(message, aiConfig, ruleMatched = false)
@@ -608,18 +622,18 @@ class BotRuntime(
                     }
                 val memory = buildMemory(message, text, insult)
                 val answer = responder.replyDetailed(message, aiConfig, memory)
-                if (answer.content.isBlank()) {
+                if (answer.content.isBlank() && answer.memeUrl.isNullOrBlank()) {
                     finalReason = "不接：回复为空"
                     return@runCatching
                 }
-                sendReply(message, answer.content)
+                sendReply(message, answer.content, answer.memeUrl)
                 // 内心戏：说出口的已经发出去了，没说出口的落在这里
                 recordThought(message, answer)
                 chitchatPolicy.markSpoke(groupId)
                 // 机器人这条已由 sendReply 统一写入群上下文
                 pipeline.markChitchatDecision(message, "已接话（$why）")
                 action = ChimeDecisionRecord.ACTION_SPOKE
-                replyText = answer.content
+                replyText = answer.content.ifBlank { "（表情包）" }
                 finalReason = "已接话（$why）"
                 log(LogLevel.INFO, TAG, "群聊插话（$why，${answer.content.length} 字）")
             }.onFailure { t ->
@@ -811,6 +825,31 @@ class BotRuntime(
             logger.e(TAG, "回复失败", t)
             log(LogLevel.ERROR, TAG, "回复失败：${t.message}")
         }
+    }
+
+    /**
+     * 明确索取表情包时，直接由本地图库挑一张。
+     *
+     * 这是「工具调用」之外的快路径：用户说"发个表情包"时，目的已经明确，
+     * 不需要模型再判断一次心情。挑图失败（库空/上传失败）返回 false，
+     * 让调用方回落到 AI——由人设说一句"我这儿没图"也比装死好。
+     */
+    private suspend fun replyWithMeme(
+        message: IncomingMessage,
+        text: String,
+    ): Boolean {
+        val library = memeLibrary ?: return false
+        val url =
+            runCatching { library.pick() }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() }
+                ?: return false
+        if (!sendMeme(message, url)) return false
+        if (isDirectChat(message)) {
+            memoryPipeline?.recordExchange(message, text, "（回了一张表情包）")
+        }
+        log(LogLevel.INFO, TAG, "按明确请求发送了一张表情包")
+        return true
     }
 
     /** 交给 AI 生成回复，失败时按配置的兜底话术应答。 */
@@ -1012,9 +1051,11 @@ class BotRuntime(
         // 所有群内回复的统一记账点：@ 回复、规则回复、指令复述都走这里。
         // 之前只有旁听链路记，导致群上下文里只有"问"没有"答"，
         // 模型判断"我刚说过话没有"时其实是瞎的。
+        // 纯表情包也要留一条非空记录，否则下一轮它只看到自己"什么都没说"。
+        val recorded = body.ifBlank { if (!meme.isNullOrBlank()) "（表情包）" else body }
         when (message.kind) {
             MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE, MessageKind.GUILD ->
-                memoryPipeline?.recordChitchatAnswer(message, body)
+                memoryPipeline?.recordChitchatAnswer(message, recorded)
 
             else -> Unit
         }
@@ -1030,28 +1071,32 @@ class BotRuntime(
     private suspend fun sendMeme(
         message: IncomingMessage,
         imageUrl: String,
-    ) {
-        val target = message.targetId?.takeIf { it.isNotBlank() } ?: return
+    ): Boolean {
+        val target = message.targetId?.takeIf { it.isNotBlank() } ?: return false
         val groupTarget =
             when (message.kind) {
                 MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE, MessageKind.GUILD -> target
-                MessageKind.C2C, MessageKind.DIRECT -> return
+                MessageKind.C2C, MessageKind.DIRECT -> return false
             }
         val fileInfo =
             runCatching { api.uploadGroupImage(groupTarget, imageUrl) }.getOrNull()
         if (fileInfo.isNullOrBlank()) {
             log(LogLevel.WARN, TAG, "表情包上传失败，跳过：${imageUrl.take(80)}")
-            return
+            return false
         }
-        runCatching {
+        return runCatching {
             api.sendGroupMessage(
                 groupOpenId = groupTarget,
                 content = "",
                 msgType = MsgType.MEDIA,
                 mediaFileInfo = fileInfo,
             )
-        }.onFailure { t ->
+            // 发出去了才算一次采用：失败时不能被计数，否则淘汰排序会被脏数据带偏
+            runCatching { memeLibrary?.recordUse(imageUrl) }
+            true
+        }.getOrElse { t ->
             log(LogLevel.WARN, TAG, "表情包发送失败：${t.message}")
+            false
         }
     }
 

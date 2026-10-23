@@ -66,8 +66,10 @@ import com.qbot.core.ai.PersonaStage
 import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.PersonaResolver
 import com.qbot.core.ai.ScoreWeights
+import com.qbot.core.ai.SendMemeTool
 import com.qbot.core.ai.ThinkingMode
 import com.qbot.core.ai.ThinkingParams
+import com.qbot.core.ai.ToolRegistry
 import com.qbot.core.api.OpenApi
 import com.qbot.core.auth.AccessTokenManager
 import com.qbot.core.engine.BotRuntime
@@ -1583,6 +1585,14 @@ class BotController(
                 client = LlmClient(http = http, logger = logger),
                 history = aiHistoryStore,
                 personaResolver = { message -> personaResolver.promptFor(message) },
+                // 表情包：模型在回复里自主决定要不要发、发哪张。
+                // 图必须来自本地库（SendMemeTool 会校验），不能让它编 URL。
+                tools = ToolRegistry(listOf(SendMemeTool(socialStore))),
+                // 历史按当前生效的人设隔离：切换档案后自动新开一条线程，
+                // 新人格不会接着旧人格的语气和话题说话。
+                conversationScopeProvider = { message ->
+                    personaResolver.resolve(message).personaId?.toString()
+                },
             )
 
         // 把应答器的最近用量转发到控制器流上，重建机器人时 UI 无需重新订阅
@@ -1636,6 +1646,8 @@ class BotController(
                 slangLearner = slangLearner,
                 // 表情包：群友发的图捡库，回复时模型可以从库里挑一张配着发
                 memeHarvester = memeHarvester,
+                // 明确被要求发图时本地直接挑一张；工具选中的图也在这里计数
+                memeLibrary = socialStore,
             )
 
         // 把网关状态转发到控制器自己的流上，

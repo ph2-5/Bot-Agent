@@ -420,6 +420,26 @@ private fun PersonaTab() {
                 )
             }
 
+            if (current != null && overrides.isNotEmpty()) {
+                // 覆盖层永远优先：不提示的话，用户会以为"切换全局档案没生效"
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors =
+                        CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                        ),
+                ) {
+                    Text(
+                        "注意：有 ${overrides.size} 条按人/按群覆盖。在它们指定的范围内，" +
+                            "会优先使用覆盖人格，上面这份「${current.name}」不会生效。" +
+                            "可在下方「按人或按群单独设定」里停用或修改。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        modifier = Modifier.padding(10.dp),
+                    )
+                }
+            }
+
             hint?.let {
                 Text(
                     it,
@@ -858,31 +878,32 @@ private fun PersonaCreateDialog(
                         minLines = 8,
                         modifier = Modifier.fillMaxWidth(),
                     )
-                } else {
-                Text("性格种子", style = MaterialTheme.typography.labelMedium)
                 }
-                if (!manual) PersonaSeed.entries.forEach { option ->
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier =
-                            Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    seed = option
-                                    if (name.isBlank() || name == seed.label) name = option.label
-                                }
-                                .padding(vertical = 4.dp),
-                    ) {
-                        RadioButton(selected = seed == option, onClick = {
-                            seed = option
-                            if (name.isBlank()) name = option.label
-                        })
-                        Text(option.label, modifier = Modifier.weight(1f))
-                        Text(
-                            option.traits.take(18) + "…",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                if (!manual) {
+                    Text("性格种子", style = MaterialTheme.typography.labelMedium)
+                    // 名字默认跟随种子；判断时必须拿"切换前"的 seed 比较，
+                    // 否则先赋值再比较永远不成立，名字会和实际人格错位。
+                    fun chooseSeed(option: PersonaSeed) {
+                        if (name.isBlank() || name == seed.label) name = option.label
+                        seed = option
+                    }
+                    PersonaSeed.entries.forEach { option ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier =
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable { chooseSeed(option) }
+                                    .padding(vertical = 4.dp),
+                        ) {
+                            RadioButton(selected = seed == option, onClick = { chooseSeed(option) })
+                            Text(option.label, modifier = Modifier.weight(1f))
+                            Text(
+                                option.traits.take(18) + "…",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 }
             }

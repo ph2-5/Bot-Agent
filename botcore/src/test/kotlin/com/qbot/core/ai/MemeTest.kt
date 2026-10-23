@@ -85,4 +85,19 @@ class MemeTest {
         val counted = many.count { block.contains(it) }
         assertEquals(MemeRender.MAX_PROMPT_MEMES, counted)
     }
+
+    @Test
+    fun `明确的要图请求会被识别`() {
+        assertTrue(MemeIntent.isRequest("发个表情包"))
+        assertTrue(MemeIntent.isRequest("来张图"))
+        assertTrue(MemeIntent.isRequest("斗图吗"))
+    }
+
+    @Test
+    fun `聊图本身的句子不会被当成要图`() {
+        // 这类句子应该交给模型正常接话，而不是被本地直接回一张图
+        assertTrue(!MemeIntent.isRequest("你刚才那个表情包挺好笑的"))
+        assertTrue(!MemeIntent.isRequest("这个表情什么意思"))
+        assertTrue(!MemeIntent.isRequest("今天好累啊"))
+    }
 }

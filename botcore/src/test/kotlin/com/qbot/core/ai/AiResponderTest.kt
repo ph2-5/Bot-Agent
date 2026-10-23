@@ -82,6 +82,34 @@ class AiResponderTest {
         )
     }
 
+    private class FakeMemeLibrary(
+        private val url: String? = "https://a.com/1.jpg",
+    ) : MemeLibrary {
+        var used = 0
+
+        override suspend fun contains(url: String): Boolean = url == this.url
+
+        override suspend fun recordUse(url: String) {
+            used++
+        }
+
+        override suspend fun pick(): String? = url
+    }
+
+    private fun enqueueMemeToolCall(url: String = "https://a.com/1.jpg") {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    {"choices":[{"message":{"role":"assistant","content":null,
+                    "tool_calls":[{"id":"call_1","type":"function",
+                    "function":{"name":"send_meme","arguments":"{\"url\":\"$url\"}"}}]}}]}
+                    """.trimIndent(),
+                ),
+        )
+    }
+
     // ---------- shouldHandle ----------
 
     @Test
@@ -608,5 +636,93 @@ class AiResponderTest {
             assertTrue("应表达想不想而不是该不该", body.contains("想不想"))
             assertTrue("应给出对话对象", body.contains("对「阿远」说的"))
             assertTrue("应说明插别人对话很怪", body.contains("插进去通常很怪"))
+        }
+
+    // ---------- 工具调用 ----------
+
+    @Test
+    fun `工具选中的表情包会随回复带出`() =
+        runBlocking {
+            val library = FakeMemeLibrary()
+            val withTools =
+                AiResponder(
+                    client = client,
+                    history = history,
+                    tools = ToolRegistry(listOf(SendMemeTool(library))),
+                )
+
+            enqueueMemeToolCall()
+            enqueueAnswer("哈哈，给你配一张")
+
+            val reply = withTools.replyDetailed(message("发个表情包"), config())
+
+            assertEquals("哈哈，给你配一张", reply.content)
+            assertEquals("https://a.com/1.jpg", reply.memeUrl)
+            assertTrue("工具选中的图应回到历史里也不算空回复", reply.memeUrl != null)
+
+            val first = server.takeRequest().body.readUtf8()
+            assertTrue("首轮应带 tools，实际=$first", first.contains("\"tools\""))
+            val second = server.takeRequest().body.readUtf8()
+            assertTrue("次轮应回放工具结果，实际=$second", second.contains("\"role\":\"tool\""))
+            assertTrue("工具结果应带调用 id，实际=$second", second.contains("\"tool_call_id\":\"call_1\""))
+        }
+
+    @Test
+    fun `服务商不支持 tools 时自动降级并记住`() =
+        runBlocking {
+            val library = FakeMemeLibrary()
+            val withTools =
+                AiResponder(
+                    client = client,
+                    history = history,
+                    tools = ToolRegistry(listOf(SendMemeTool(library))),
+                )
+
+            // 第一次带 tools 被 400 拒绝，降级重试成功
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(400)
+                    .setBody("""{"error":{"message":"tools is not supported"}}"""),
+            )
+            enqueueAnswer("普通回复")
+
+            assertEquals("普通回复", withTools.reply(message("你好"), config()))
+
+            val declined = server.takeRequest().body.readUtf8()
+            assertTrue("首次应尝试带 tools", declined.contains("\"tools\""))
+            val downgraded = server.takeRequest().body.readUtf8()
+            assertFalse("降级请求不应再带 tools，实际=$downgraded", downgraded.contains("\"tools\""))
+
+            // 第二次对话：直接不带 tools，不再白试一次
+            enqueueAnswer("第二次回复")
+            assertEquals("第二次回复", withTools.reply(message("再来一次"), config()))
+            val later = server.takeRequest().body.readUtf8()
+            assertFalse("应记住服务商不支持 tools，实际=$later", later.contains("\"tools\""))
+            assertEquals("总共只应发起三次请求", 3, server.requestCount)
+        }
+
+    @Test
+    fun `切换人设后不会沿用上一条会话的历史`() =
+        runBlocking {
+            var scope = "persona-1"
+            val switching =
+                AiResponder(
+                    client = client,
+                    history = history,
+                    conversationScopeProvider = { scope },
+                )
+
+            enqueueAnswer("旧人设的回答")
+            switching.reply(message("旧人设的问题"), config())
+
+            scope = "persona-2"
+            enqueueAnswer("新人设的回答")
+            switching.reply(message("新人设的问题"), config())
+
+            server.takeRequest() // 旧人设的请求
+            val second = server.takeRequest().body.readUtf8()
+            assertFalse("新人设不应看到旧人设的对话", second.contains("旧人设的问题"))
+            assertFalse("新人设不应看到旧人设的回答", second.contains("旧人设的回答"))
+            assertTrue("应带上本轮问题", second.contains("新人设的问题"))
         }
 }

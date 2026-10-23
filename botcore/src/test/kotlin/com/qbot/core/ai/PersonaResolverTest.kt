@@ -84,7 +84,8 @@ class PersonaResolverTest {
             val resolved = PersonaResolver(store).resolve(message())
 
             assertEquals(PersonaSource.PROFILE, resolved.source)
-            assertEquals("在用的正文", resolved.prompt)
+            assertTrue("档案名应进入提示词", resolved.prompt.contains("「在用」"))
+            assertTrue(resolved.prompt.contains("在用的正文"))
         }
 
     @Test
@@ -109,7 +110,7 @@ class PersonaResolverTest {
             val resolver =
                 PersonaResolver(store, fallbackProvider = { error("不该走到兜底") })
 
-            assertEquals("在用的正文", resolver.promptFor(message()))
+            assertTrue(resolver.promptFor(message()).contains("在用的正文"))
         }
 
     @Test
