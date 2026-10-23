@@ -15,7 +15,7 @@ import kotlinx.serialization.json.Json
  * - 自动回复规则（按 id 合并，同 id 覆盖）
  * - 人设（按 名称+绑定对象 合并，命中则更新提示词，否则新增）
  * - 成员备注名（身份名录）
- * - 群名片（只导 botName，成员/活跃度等运行数据不导）
+ * - 群档案（群名片 + 在群状态 + 主动发言权限；成员样本与活跃度不导）
  *
  * 不导出：日志、AI 会话历史、人设版本快照、判断决策日志——
  * 这些是短期运行日志（7 天自动过期），搬过去只会带去过期状态。
@@ -64,7 +64,7 @@ data class ConfigBackup(
          * 导入时据此判断备份是否来自更新版本：字段能忽略，但语义不能猜，
          * 所以旧版 App 导入新版备份要明确提示"部分内容未导入"，而不是静默丢掉。
          */
-        const val CURRENT_VERSION = 5
+        const val CURRENT_VERSION = 6
 
         private val json =
             Json {
@@ -195,10 +195,26 @@ data class DisplayNameBackup(
     val source: String,
 )
 
+/**
+ * 一条群档案。
+ *
+ * 6 起除了群名片，还带上「机器人是否还在群里」与「群是否允许主动发言」：
+ * 这两项决定机器人会不会主动开口，换机后靠网关事件重新学习会有一段时间判断错误。
+ *
+ * [active] / [proactiveAllowed] 用可空表示「旧备份没提供」：
+ * 旧版备份反序列化出来是 null，导入时沿用本机值，避免把被移出的群误标成在群。
+ * 群成员样本不导——它是持续滚动更新的运行数据，重新积累即可。
+ */
 @Serializable
 data class GroupBotNameBackup(
     @SerialName("group_id") val groupId: String,
-    @SerialName("bot_name") val botName: String,
+    @SerialName("bot_name") val botName: String? = null,
+    val active: Boolean? = null,
+    @SerialName("proactive_allowed") val proactiveAllowed: Boolean? = null,
+    /** 入群时间；0 = 旧备份未提供 */
+    @SerialName("joined_at") val joinedAt: Long = 0,
+    /** 最近活跃时间；0 = 旧备份未提供 */
+    @SerialName("last_seen_at") val lastSeenAt: Long = 0,
 )
 
 /**

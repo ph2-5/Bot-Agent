@@ -1411,11 +1411,16 @@ class BotController(
                             source = entry.source,
                         )
                     },
+                // 群档案：在群状态与主动发言权限一并带上，否则换机后可能误判能不能主动开口
                 groupBotNames =
-                    groupStore.all().mapNotNull { profile ->
+                    groupStore.all().map { profile ->
                         GroupBotNameBackup(
                             groupId = profile.groupId,
-                            botName = profile.botName ?: return@mapNotNull null,
+                            botName = profile.botName,
+                            active = profile.active,
+                            proactiveAllowed = profile.proactiveAllowed,
+                            joinedAt = profile.joinedAt,
+                            lastSeenAt = profile.lastSeenAt,
                         )
                     },
                 // 关系与梗：都是"养"出来的，换机不该从零开始
@@ -2055,15 +2060,30 @@ class BotController(
         backup.groupBotNames.forEach { dto ->
             runCatching {
                 val current = groupStore.find(dto.groupId)
-                groupStore.upsert(
-                    current?.copy(botName = dto.botName)
-                        ?: GroupProfile(
+                val now = System.currentTimeMillis()
+                val merged =
+                    if (current != null) {
+                        current.copy(
+                            // 备份没写群名片时保留本机值，别把已设的称呼清掉
+                            botName = dto.botName ?: current.botName,
+                            // null = 旧备份没提供，沿用本机判断
+                            active = dto.active ?: current.active,
+                            proactiveAllowed = dto.proactiveAllowed ?: current.proactiveAllowed,
+                            joinedAt = dto.joinedAt.takeIf { it > 0 } ?: current.joinedAt,
+                            // 活跃时间取较新的：同机恢复不该让群列表倒退回旧排序
+                            lastSeenAt = maxOf(dto.lastSeenAt, current.lastSeenAt),
+                        )
+                    } else {
+                        GroupProfile(
                             groupId = dto.groupId,
                             botName = dto.botName,
-                            joinedAt = System.currentTimeMillis(),
-                            lastSeenAt = System.currentTimeMillis(),
-                        ),
-                )
+                            joinedAt = dto.joinedAt.takeIf { it > 0 } ?: now,
+                            lastSeenAt = dto.lastSeenAt.takeIf { it > 0 } ?: now,
+                            active = dto.active ?: true,
+                            proactiveAllowed = dto.proactiveAllowed ?: true,
+                        )
+                    }
+                groupStore.upsert(merged)
                 groupNameCount++
             }
         }
