@@ -57,6 +57,20 @@ jobs:
       - name: 构建 Release APK
         run: ./gradlew assembleRelease --no-daemon
 
+      - name: 校验签名
+        # 配了密钥就必须验签：Secret 错、key 不匹配或回退成未签名包时，直接让流水线失败。
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
+          if [ ! -f qbot-release.jks ]; then
+            echo "未配置密钥，跳过签名校验（产物为未签名包）"
+            exit 0
+          fi
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner -type f | sort -V | tail -n 1)
+          "$APKSIGNER" verify -v --print-certs "$APK"
+          SHA=$("$APKSIGNER" verify --print-certs "$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1)
+          echo "证书 SHA-256：$SHA"
+          test "$SHA" = "d335bf6ec16e9124ed5c27ab75a1e6570d0cda389b76e809b132f911a2c6494e"
+
       - name: 上传 APK
         uses: actions/upload-artifact@v4
         with:
