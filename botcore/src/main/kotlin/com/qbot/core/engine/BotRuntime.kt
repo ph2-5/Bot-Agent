@@ -711,7 +711,7 @@ class BotRuntime(
 
         runCatching {
             sendReply(message, reply)
-            pipeline.recordExchange(message, text, reply)
+            if (isDirectChat(message)) pipeline.recordExchange(message, text, reply)
             log(
                 LogLevel.INFO,
                 TAG,
@@ -734,7 +734,7 @@ class BotRuntime(
 
         runCatching {
             sendReply(message, reply)
-            memoryPipeline?.recordExchange(message, text, reply)
+            if (isDirectChat(message)) memoryPipeline?.recordExchange(message, text, reply)
             log(LogLevel.INFO, TAG, "命中规则「${rule.name}」→ 已回复")
         }.onFailure { t ->
             logger.e(TAG, "回复失败", t)
@@ -770,7 +770,7 @@ class BotRuntime(
             val memory = memoryPipeline?.buildContext(message, botId, text, insult)
             val answer = aiResponder!!.reply(message, config, memory)
             sendReply(message, answer)
-            memoryPipeline?.recordExchange(message, text, answer)
+            if (isDirectChat(message)) memoryPipeline?.recordExchange(message, text, answer)
             // 用量日志：缓存命中不仅省钱，首 token 延迟也大幅降低，
             // 命中率长期为 0 说明 system 提示词不稳定，值得排查。
             val usage = aiResponder.lastUsage.value
@@ -805,6 +805,16 @@ class BotRuntime(
      * 带上原消息 id 作为被动回复，不消耗主动消息配额，
      * 且客户端会展示成"回复某条消息"的样式。
      */
+    /**
+     * 是否为一对一会话。
+     *
+     * 群内问答已经由 `processMessage`（用户那条）+ `sendReply`（机器人那条）记账；
+     * 再调 [MemoryPipeline.recordExchange] 会让一轮 @ 交互落四行，
+     * 200 行窗口实际只剩 100 轮。所以这里只给单聊/私信留口子。
+     */
+    private fun isDirectChat(message: IncomingMessage): Boolean =
+        message.kind == MessageKind.C2C || message.kind == MessageKind.DIRECT
+
     private suspend fun sendReply(
         message: IncomingMessage,
         reply: String,

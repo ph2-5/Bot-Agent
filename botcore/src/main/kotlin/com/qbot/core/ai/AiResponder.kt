@@ -459,7 +459,9 @@ class AiResponder(
                 maxTokens = tokens,
                 // 判断是即时动作：超时就当作不接，别把消息处理拖住
                 timeoutSeconds = 20L,
-                thinkingType = thinkingParam(config),
+                // 和反思/破壳一样是结构化短任务：必须关思考。
+                // 否则思维链会吃掉输出额度，判断必然落空 → 全群静默。
+                thinkingType = ThinkingParams.forConfig(config, forceDisable = true),
             )
 
         // 输出预算跟随设置里的「单次生成上限」，不在代码里另立一套数字

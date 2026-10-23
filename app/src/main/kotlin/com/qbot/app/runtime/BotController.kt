@@ -227,6 +227,14 @@ class BotController(
     /** 引导只跑一次：init 与 start 可能同时触发 */
     private val bootstrapMutex = Mutex()
 
+    /**
+     * 人格成长轮询的 Job。
+     *
+     * 过去 start() 的返回值被直接丢弃，于是点「停止机器人」后它仍在后台
+     * 读库、调模型、写快照——用户以为已经关了。
+     */
+    private var growthJob: kotlinx.coroutines.Job? = null
+
     /** 身份存储（公开给维护端 UI 做备注名 / 忘掉某人）。 */
     fun identityStore(): RoomIdentityStore = identityStore
 
@@ -508,10 +516,15 @@ class BotController(
             }
         }
 
-        // 人格自主成长：每 10 分钟看一次"攒够没有"
-        runCatching { personaGrowthScheduler.start(scope) }.onFailure {
-            appendLog(LogLevel.WARN, TAG, "人格成长调度启动失败：${it.message}")
-        }
+    }
+
+    /** 保证成长轮询在跑；重复调用是幂等的。 */
+    private fun ensureGrowthRunning() {
+        if (growthJob?.isActive == true) return
+        growthJob =
+            runCatching { personaGrowthScheduler.start(scope) }
+                .onFailure { appendLog(LogLevel.WARN, TAG, "人格成长调度启动失败：${it.message}") }
+                .getOrNull()
     }
 
     /** 启动机器人（幂等）。 */
@@ -537,11 +550,14 @@ class BotController(
             val intents = if (powerSaving) Intents.MESSAGES_ONLY else Intents.DEFAULT
             build(credentials.appId, credentials.clientSecret, intents)
             runtime?.start()
+            ensureGrowthRunning()
         }
     }
 
     /** 停止机器人。 */
     fun stop() {
+        growthJob?.cancel()
+        growthJob = null
         runtime?.stop()
         gateway?.stop()
         statusForwardJob?.cancel()
@@ -791,21 +807,28 @@ class BotController(
                         note = "种子骨架（破壳前，不可删除）",
                     )
                 }
-                personaRepository.commitBirth(
-                    id = persona.id,
-                    prompt = draft.prompt,
-                    seedId = seed.name,
-                    cursor = database.roomMessageDao().maxId() ?: 0,
-                    note = draft.note,
-                )
-                personaRepository.addSnapshot(
-                    personaId = persona.id,
-                    name = persona.name,
-                    prompt = draft.prompt,
-                    kind = com.qbot.core.ai.PersonaSnapshotKind.BIRTH,
-                    note = draft.note,
-                )
-                appendLog(LogLevel.INFO, TAG, "手动破壳完成（${seed.label}）")
+                val committed =
+                    personaRepository.commitBirth(
+                        id = persona.id,
+                        prompt = draft.prompt,
+                        seedId = seed.name,
+                        cursor = database.roomMessageDao().maxId() ?: 0,
+                        note = draft.note,
+                    )
+                // 并发时可能已经被定时破壳抢先：没写成就不要留快照，
+                // 否则会出现"快照里有、实际没生效"的幽灵版本。
+                if (committed) {
+                    personaRepository.addSnapshot(
+                        personaId = persona.id,
+                        name = persona.name,
+                        prompt = draft.prompt,
+                        kind = com.qbot.core.ai.PersonaSnapshotKind.BIRTH,
+                        note = draft.note,
+                    )
+                    appendLog(LogLevel.INFO, TAG, "手动破壳完成（${seed.label}）")
+                } else {
+                    appendLog(LogLevel.INFO, TAG, "手动破壳被并发取消（可能已在别处完成）")
+                }
                 return@runCatching draft.prompt
             }
 

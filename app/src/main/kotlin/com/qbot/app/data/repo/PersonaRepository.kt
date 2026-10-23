@@ -216,6 +216,9 @@ class PersonaRepository(
     ) {
         val row = personaDao.findById(id) ?: return
         val now = System.currentTimeMillis()
+        // 旧种子的 INITIAL 必须清掉：换原点后它不再是"最初的样子"，
+        // 否则回滚会还原成上一个种子，新种子则永远没有初始版本。
+        snapshotDao?.deleteInitial(id)
         personaDao.updateMeta(
             id = id,
             stage = PersonaStage.EMBRYO.name,

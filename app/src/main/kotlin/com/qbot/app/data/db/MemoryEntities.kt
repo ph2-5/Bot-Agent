@@ -427,6 +427,15 @@ interface PersonaSnapshotDao {
     @Query("DELETE FROM persona_snapshots WHERE id = :id AND kind != 'INITIAL'")
     suspend fun deleteNonInitial(id: Long)
 
+    /**
+     * 删掉某个目标的初始快照。
+     *
+     * 只在「重抽种子」时用：换了一个性格原点之后，旧骨架不能再当作"最初的样子"，
+     * 否则用户点回滚会还原成上一个种子，而新种子永远没有初始版本。
+     */
+    @Query("DELETE FROM persona_snapshots WHERE personaId IS :personaId AND kind = 'INITIAL'")
+    suspend fun deleteInitial(personaId: Long?)
+
     /** 只保留最近 N 条非初始版本，防止无限增长 */
     @Query(
         "DELETE FROM persona_snapshots WHERE personaId IS :personaId AND kind != 'INITIAL' " +

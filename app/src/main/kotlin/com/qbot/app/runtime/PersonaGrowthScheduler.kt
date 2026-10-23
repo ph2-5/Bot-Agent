@@ -104,6 +104,8 @@ class PersonaGrowthScheduler(
             if (!ai.enabled || !ai.isReady) return false
             val profile = repo.active() ?: return false
             if (profile.kind != PersonaKind.PROFILE || profile.frozen) return false
+            // 手动催过一次也要刷新冷却，否则 10 分钟后的定时任务会再自动长一次
+            lastAskedAt = clock()
             return if (profile.stage == PersonaStage.EMBRYO) {
                 birth(profile, ai)
             } else {
@@ -129,7 +131,9 @@ class PersonaGrowthScheduler(
             } else {
                 GROW_COOLDOWN_MILLIS
             }
-        if (lastAskedAt > 0 && now - lastAskedAt < cooldown) return
+        // delta 为负说明系统时间被回拨过：视为"已过期"，否则会永久停摆
+        val delta = now - lastAskedAt
+        if (lastAskedAt > 0 && delta >= 0 && delta < cooldown) return
 
         val pending = messages.countSince(profile.msgCursor)
         val action =
@@ -165,6 +169,9 @@ class PersonaGrowthScheduler(
     ): Boolean {
         val seed = PersonaSeed.of(profile.seedId)
         val samples = takeSamples(profile.msgCursor)
+        // 游标取在样本之后、模型之前：模型调用那几十秒的新消息既不在样本里，
+        // 也不该被游标越过——留给下一批。
+        val cursorNow = messages.maxId() ?: 0
 
         // 破壳前的骨架永远留一版：用户以后觉得"还不如一开始"，可以回滚到这里
         if (!repo.hasInitialSnapshot(profile.id)) {
@@ -178,7 +185,7 @@ class PersonaGrowthScheduler(
         }
 
         val draft = growth.birth(seed, samples, botName(), ai)
-        val cursor = messages.maxId() ?: 0
+        val cursor = cursorNow
         val ok =
             repo.commitBirth(
                 id = profile.id,
