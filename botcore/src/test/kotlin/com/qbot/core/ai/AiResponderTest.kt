@@ -57,6 +57,7 @@ class AiResponderTest {
         content: String,
         targetId: String = "group-1",
         kind: MessageKind = MessageKind.GROUP_AT,
+        imageUrl: String? = null,
     ) = IncomingMessage(
         kind = kind,
         eventType = "GROUP_AT_MESSAGE_CREATE",
@@ -65,6 +66,7 @@ class AiResponderTest {
         targetId = targetId,
         senderId = "user-1",
         timestampMillis = 1_700_000_000_000,
+        imageUrl = imageUrl,
         raw = buildJsonObject { },
     )
 
@@ -107,6 +109,28 @@ class AiResponderTest {
             responder.shouldHandle(
                 message("你好"),
                 config().copy(apiKey = ""),
+                ruleMatched = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `只发图没写字也要交给 AI`() {
+        // 群里 @ 机器人甩一张图过来，是视觉模型最常见的开场
+        assertTrue(
+            responder.shouldHandle(
+                message("", imageUrl = "https://example.com/a.jpg"),
+                config(),
+                ruleMatched = false,
+            ),
+        )
+        // 但纯空消息仍然不处理
+        assertFalse(responder.shouldHandle(message(""), config(), ruleMatched = false))
+        // 命令模式下纯图也不认：没有 /ai 前缀，不该突然开始计费
+        assertFalse(
+            responder.shouldHandle(
+                message("", imageUrl = "https://example.com/a.jpg"),
+                config(mode = AiMode.COMMAND_ONLY),
                 ruleMatched = false,
             ),
         )

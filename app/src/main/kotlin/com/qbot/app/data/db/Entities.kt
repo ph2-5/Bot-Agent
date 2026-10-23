@@ -142,8 +142,13 @@ interface AiHistoryDao {
         GroupMemberEntity::class,
         ChimeDecisionEntity::class,
         ChimeLessonEntity::class,
+        InnerThoughtEntity::class,
+        AffinityEntity::class,
+        BotMoodEntity::class,
+        SlangEntity::class,
+        MemeEntity::class,
     ],
-    version = 10,
+    version = 13,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -170,6 +175,16 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun chimeDecisionDao(): ChimeDecisionDao
 
     abstract fun chimeLessonDao(): ChimeLessonDao
+
+    abstract fun innerThoughtDao(): InnerThoughtDao
+
+    abstract fun affinityDao(): AffinityDao
+
+    abstract fun botMoodDao(): BotMoodDao
+
+    abstract fun slangDao(): SlangDao
+
+    abstract fun memeDao(): MemeDao
 
     companion object {
         /**
@@ -494,6 +509,110 @@ abstract class AppDatabase : RoomDatabase() {
                             "SELECT id, name, prompt, 'INITIAL', " +
                             "'升级到 2.3.0 之前的版本（自动存档）', updatedAt " +
                             "FROM personas WHERE activeSlot = 1",
+                    )
+                }
+            }
+
+        /**
+         * v10 → v11：内心戏。
+         *
+         * 纯增量，只建新表，不动任何已有数据——老用户的人格、记忆、经验库原样保留。
+         */
+        val MIGRATION_10_11 =
+            object : androidx.room.migration.Migration(10, 11) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        "CREATE TABLE IF NOT EXISTS `inner_thoughts` (" +
+                            "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                            "`groupId` TEXT, " +
+                            "`senderId` TEXT, " +
+                            "`senderName` TEXT, " +
+                            "`spoken` TEXT NOT NULL, " +
+                            "`thought` TEXT NOT NULL, " +
+                            "`createdAt` INTEGER NOT NULL)",
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_inner_thoughts_createdAt` " +
+                            "ON `inner_thoughts` (`createdAt`)",
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_inner_thoughts_groupId` " +
+                            "ON `inner_thoughts` (`groupId`)",
+                    )
+                }
+            }
+
+        /**
+         * v11 → v12：关系、心情、梗库。
+         *
+         * 纯增量，只建新表。老用户的记忆、人格、经验、内心戏全部保留。
+         * 升级后所有关系从零开始——这是对的：之前的行为没有被记录过，
+         * 凭空给一个"熟识 50"反而是假的。
+         */
+        val MIGRATION_11_12 =
+            object : androidx.room.migration.Migration(11, 12) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        "CREATE TABLE IF NOT EXISTS `affinities` (" +
+                            "`userId` TEXT NOT NULL, " +
+                            "`displayName` TEXT, " +
+                            "`familiarity` INTEGER NOT NULL, " +
+                            "`affinity` INTEGER NOT NULL, " +
+                            "`interactionCount` INTEGER NOT NULL, " +
+                            "`lastInteractionAt` INTEGER NOT NULL, " +
+                            "`lastNote` TEXT, " +
+                            "`updatedAt` INTEGER NOT NULL, " +
+                            "PRIMARY KEY(`userId`))",
+                    )
+                    db.execSQL(
+                        "CREATE TABLE IF NOT EXISTS `bot_mood` (" +
+                            "`id` INTEGER NOT NULL, " +
+                            "`value` INTEGER NOT NULL, " +
+                            "`updatedAt` INTEGER NOT NULL, " +
+                            "`reason` TEXT, " +
+                            "PRIMARY KEY(`id`))",
+                    )
+                    db.execSQL(
+                        "CREATE TABLE IF NOT EXISTS `slang_terms` (" +
+                            "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                            "`term` TEXT NOT NULL, " +
+                            "`meaning` TEXT NOT NULL, " +
+                            "`usage` TEXT, " +
+                            "`scopeGroupId` TEXT, " +
+                            "`hits` INTEGER NOT NULL, " +
+                            "`enabled` INTEGER NOT NULL, " +
+                            "`source` TEXT NOT NULL, " +
+                            "`createdAt` INTEGER NOT NULL, " +
+                            "`updatedAt` INTEGER NOT NULL)",
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_slang_terms_scopeGroupId` " +
+                            "ON `slang_terms` (`scopeGroupId`)",
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_slang_terms_hits` " +
+                            "ON `slang_terms` (`hits`)",
+                    )
+                }
+            }
+
+        /**
+         * v12 → v13：表情包库。
+         *
+         * 纯增量，只建新表。老用户升级后图库是空的——
+         * 要等群里有人发表情包才会开始捡，这是对的：
+         * 凭空塞一堆来路不明的图，不如让它从这群人自己的喜好学起。
+         */
+        val MIGRATION_12_13 =
+            object : androidx.room.migration.Migration(12, 13) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        "CREATE TABLE IF NOT EXISTS `meme_images` (" +
+                            "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                            "`url` TEXT NOT NULL, " +
+                            "`source` TEXT NOT NULL, " +
+                            "`hits` INTEGER NOT NULL, " +
+                            "`createdAt` INTEGER NOT NULL)",
                     )
                 }
             }

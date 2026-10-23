@@ -246,7 +246,7 @@ data class PersonaEntity(
     /** 绑定的群/频道 openid；null 表示不绑定到具体群 */
     val scopeId: String?,
     val name: String,
-    /** 五段式人格正文；EMBRYO 阶段为空 */
+    /** 人格正文（六段，老档案为五段）；EMBRYO 阶段为空 */
     val prompt: String,
     val updatedAt: Long,
     /** PROFILE / OVERRIDE */

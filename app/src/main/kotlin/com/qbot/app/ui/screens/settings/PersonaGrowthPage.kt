@@ -113,7 +113,7 @@ fun PersonaGrowthPage(onBack: () -> Unit) {
         SectionHeader("在哪看它长成什么样", null)
         SettingsCard {
             HintText(
-                "「AI → 人设」：五段正文、成长日记、每一版快照都能回滚；" +
+                "「AI → 人设」：分段正文（含「毛病」）、成长日记、每一版快照都能回滚；" +
                     "也能换种子、冻结、或点「立即成长」催它一次。",
             )
             Text(

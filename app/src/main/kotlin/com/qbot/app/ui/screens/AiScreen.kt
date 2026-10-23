@@ -604,7 +604,7 @@ private fun ActivePersonaCard(
     onHandOver: () -> Unit,
     onTakeOver: () -> Unit,
 ) {
-    // 三种形态：五段结构（自动成长）/ 自由文本（用户手写）/ 空（EMBRYO，显示骨架）
+    // 三种形态：分段结构（自动成长）/ 自由文本（用户手写）/ 空（EMBRYO，显示骨架）
     val sections = PersonaSections.parse(persona.prompt)
     val freeform = persona.prompt.isNotBlank() && sections == null
     val skeletonPreview =
@@ -697,12 +697,13 @@ private fun ActivePersonaCard(
     }
 }
 
-/** 五段渲染：身份段加锁标，告诉用户这段改不了。 */
+/** 六段渲染：身份段加锁标，告诉用户这段改不了；老档案没有毛病段就不显示。 */
 @Composable
 private fun PersonaSectionsView(sections: PersonaSections) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         SectionLine("身份", sections.identity, locked = true)
         SectionLine("性格", sections.traits)
+        if (sections.hasQuirks) SectionLine("毛病", sections.quirks)
         SectionLine("说话方式", sections.voice)
         SectionLine("兴趣", sections.interests)
         SectionLine("边界", sections.bounds)
@@ -934,7 +935,7 @@ private fun PersonaBodyDialog(
                     supportingText = {
                         Text(
                             "想自己写就随便写，怎么顺怎么来——这版不会被 AI 改动。" +
-                                "想让它自己接着长，再按下面提示的五段格式写，然后点「交给它自己养」。",
+                                "想让它自己接着长，再按下面提示的六段格式写，然后点「交给它自己养」。",
                             style = MaterialTheme.typography.labelSmall,
                         )
                     },
@@ -942,8 +943,10 @@ private fun PersonaBodyDialog(
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Text(
-                    "五段格式：[身份] [性格] [说话方式] [兴趣] [边界]。不按这个写也能用，" +
-                        "只是自动成长需要它来比对改动幅度。",
+                    "六段格式：[身份] [性格] [毛病] [说话方式] [兴趣] [边界]。不按这个写也能用，" +
+                        "只是自动成长需要它来比对改动幅度。" +
+                        "「毛病」写它会被群友当场指出的具体行为（比如「被夸就顺杆爬」），" +
+                        "别写「太认真」这种把优点说成缺点的。",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

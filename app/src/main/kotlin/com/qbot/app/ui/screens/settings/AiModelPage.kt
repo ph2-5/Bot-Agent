@@ -10,6 +10,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -59,6 +60,8 @@ fun AiModelPage(onBack: () -> Unit) {
     var replyOnError by rememberSaveable { mutableStateOf(initial.replyOnError) }
     var mode by rememberSaveable { mutableStateOf(initial.mode) }
     var thinkingMode by rememberSaveable { mutableStateOf(initial.thinkingMode) }
+    var visionModel by rememberSaveable { mutableStateOf(initial.visionModel) }
+    var webSearch by rememberSaveable { mutableStateOf(initial.webSearch) }
     var tokenBudget by rememberSaveable { mutableFloatStateOf(initial.contextTokenBudget.toFloat()) }
     var maxTokens by rememberSaveable { mutableStateOf(initial.maxTokens) }
     var hint by remember { mutableStateOf<String?>(null) }
@@ -78,6 +81,8 @@ fun AiModelPage(onBack: () -> Unit) {
             replyOnError = replyOnError,
             thinkingMode = thinkingMode,
             contextTokenBudget = tokenBudget.toInt(),
+            visionModel = visionModel.trim(),
+            webSearch = webSearch,
         )
 
     SettingsPageScaffold(
@@ -142,6 +147,42 @@ fun AiModelPage(onBack: () -> Unit) {
             )
         }
 
+        SectionHeader("看图和联网", "收到图片、遇到不懂的说法时的额外能力")
+        SettingsCard {
+            Text("视觉模型", fontWeight = FontWeight.Medium)
+            OutlinedTextField(
+                value = visionModel,
+                onValueChange = { visionModel = it },
+                label = { Text("看图用的模型名（可留空）") },
+                placeholder = { Text("留空则沿用上面的模型名") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            HintText(
+                "群友只发表情包不配文字时，用它来「看」那张图再回答。" +
+                    "上面的主模型不支持图片时（比如 DeepSeek），" +
+                    "把这里换成一个支持图片的模型（取决于你的服务商）。" +
+                    "两张模型是分开计费的，看一次图算一次。",
+            )
+
+            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                Text(
+                    "允许联网搜索",
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f),
+                )
+                Switch(
+                    checked = webSearch,
+                    onCheckedChange = { webSearch = it },
+                )
+            }
+            HintText(
+                "打开后，遇到群里反复出现又看不懂的说法，它会去搜一下什么意思再记住。" +
+                    "按成功请求计费，且只在「遇到可疑词」时触发，不参与每一轮对话。" +
+                    "非 DeepSeek 端点没有搜索接口，开了也会自动跳过。",
+            )
+        }
+
         SectionHeader("触发方式", "决定哪些消息交给 AI")
         SettingsCard {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -194,11 +235,14 @@ fun AiModelPage(onBack: () -> Unit) {
                 when (thinkingMode) {
                     ThinkingMode.DISABLED ->
                         "关闭思考：直接给答案，响应最快（推荐日常使用）。" +
-                            "DeepSeek 默认开启思考，这就是感觉慢的原因。"
+                            "DeepSeek 默认开启思考，这就是感觉慢的原因。" +
+                            "关着的时候不记录「没说出口的话」。"
                     ThinkingMode.ENABLED ->
-                        "开启思考：先输出思维链再作答，更严谨但明显更慢，且 temperature 会失效。"
+                        "开启思考：先输出思维链再作答，更严谨但明显更慢，且 temperature 会失效。" +
+                            "嘴里说的和心里想的都会留下，复盘页能看出它真实的态度。"
                     ThinkingMode.AUTO ->
-                        "自动：不发送该参数，按服务商默认行为（DeepSeek 默认开启思考）。"
+                        "自动：不发送该参数，按服务商默认行为（DeepSeek 默认开启思考）。" +
+                            "有没有内心戏取决于服务商。"
                 },
             )
 

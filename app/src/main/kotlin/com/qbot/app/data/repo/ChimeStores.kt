@@ -4,6 +4,8 @@ import com.qbot.app.data.db.ChimeDecisionDao
 import com.qbot.app.data.db.ChimeDecisionEntity
 import com.qbot.app.data.db.ChimeLessonDao
 import com.qbot.app.data.db.ChimeLessonEntity
+import com.qbot.app.data.db.InnerThoughtDao
+import com.qbot.app.data.db.InnerThoughtEntity
 import com.qbot.core.ai.ChimeDecision
 import com.qbot.core.ai.ChimeDecisionRecord
 import com.qbot.core.ai.ChimeDecisionStore
@@ -11,6 +13,8 @@ import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChimeLessonStore
 import com.qbot.core.ai.ChimeStats
 import com.qbot.core.ai.ChimeTrainer
+import com.qbot.core.ai.InnerThought
+import com.qbot.core.ai.InnerThoughtSink
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
@@ -208,4 +212,46 @@ private fun ChimeLessonEntity.toModel() =
         updatedAt = updatedAt,
         category = category,
         supportCount = supportCount,
+    )
+
+/**
+ * 内心戏的 Room 出口。
+ *
+ * 上限 500 条：一天几十条够回看一周多，再多也没人翻。
+ * 每写一条顺带 trim 一次——单条 DELETE 很轻，不值得为它单独起一个定期任务；
+ * 长期挂机也不会把库撑到几十万行。
+ */
+class RoomInnerThoughtSink(
+    private val dao: InnerThoughtDao,
+    private val keep: Int = 500,
+) : InnerThoughtSink {
+    override suspend fun record(thought: InnerThought) {
+        dao.insert(
+            InnerThoughtEntity(
+                groupId = thought.groupId,
+                senderId = thought.senderId,
+                senderName = thought.senderName,
+                spoken = thought.spoken,
+                thought = thought.thought,
+                createdAt = thought.createdAt,
+            ),
+        )
+        dao.trim(keep)
+    }
+
+    fun observeRecent(limit: Int = 100): Flow<List<InnerThought>> =
+        dao.observeRecent(limit).map { rows -> rows.map { it.toModel() } }
+
+    suspend fun clear() = dao.clear()
+}
+
+private fun InnerThoughtEntity.toModel() =
+    InnerThought(
+        id = id,
+        groupId = groupId,
+        senderId = senderId,
+        senderName = senderName,
+        spoken = spoken,
+        thought = thought,
+        createdAt = createdAt,
     )

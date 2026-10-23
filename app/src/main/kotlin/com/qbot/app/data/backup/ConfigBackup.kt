@@ -22,7 +22,7 @@ import kotlinx.serialization.json.Json
  */
 @Serializable
 data class ConfigBackup(
-    val version: Int = 2,
+    val version: Int = 4,
     @SerialName("exported_at") val exportedAt: Long,
     val credentials: CredentialsBackup? = null,
     val ai: AiBackup? = null,
@@ -37,6 +37,12 @@ data class ConfigBackup(
     @SerialName("chime_lessons") val chimeLessons: List<LessonBackup> = emptyList(),
     /** 2.3.0 新增：人格档案（不含快照历史与游标——运行数据不搬家） */
     @SerialName("persona_profiles") val personaProfiles: List<PersonaProfileBackup> = emptyList(),
+    /** 2.4.0 新增：它是怎么养出来的——对每个人的印象不该因为换机清零 */
+    val relations: List<RelationBackup> = emptyList(),
+    /** 2.4.0 新增：群内说法 */
+    val slang: List<SlangBackup> = emptyList(),
+    /** 2.6.0 新增：表情包库（手动贴的链接 + 群里捡的图） */
+    val memes: List<MemeBackup> = emptyList(),
 ) {
     companion object {
         private val json =
@@ -186,4 +192,31 @@ data class LessonBackup(
     /** 2.1 新增：目录类别与支撑次数；旧备份缺字段按「其他 / 1」导入 */
     val category: String = "OTHER",
     @SerialName("support_count") val supportCount: Int = 1,
+)
+
+@Serializable
+data class RelationBackup(
+    @SerialName("user_id") val userId: String,
+    @SerialName("display_name") val displayName: String? = null,
+    val familiarity: Int = 0,
+    val affinity: Int = 0,
+    @SerialName("interaction_count") val interactionCount: Int = 0,
+    @SerialName("last_interaction_at") val lastInteractionAt: Long = 0,
+    @SerialName("last_note") val lastNote: String? = null,
+)
+
+@Serializable
+data class SlangBackup(
+    val term: String,
+    val meaning: String,
+    val usage: String? = null,
+    @SerialName("scope_group_id") val scopeGroupId: String? = null,
+    val hits: Int = 0,
+)
+
+@Serializable
+data class MemeBackup(
+    val url: String,
+    val source: String = "HARVEST",
+    val hits: Int = 0,
 )

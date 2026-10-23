@@ -82,6 +82,8 @@ class SettingsRepository(private val context: Context) {
         val AI_REPLY_ON_ERROR = stringPreferencesKey("ai_reply_on_error")
         val AI_THINKING_MODE = stringPreferencesKey("ai_thinking_mode")
         val AI_CONTEXT_TOKEN_BUDGET = intPreferencesKey("ai_context_token_budget")
+        val AI_VISION_MODEL = stringPreferencesKey("ai_vision_model")
+        val AI_WEB_SEARCH = booleanPreferencesKey("ai_web_search")
 
         // ---- 记忆系统 ----
         val MEMORY_ENABLED = booleanPreferencesKey("memory_enabled")
@@ -437,6 +439,8 @@ class SettingsRepository(private val context: Context) {
                 }.getOrDefault(defaults.thinkingMode),
             contextTokenBudget =
                 prefs[Keys.AI_CONTEXT_TOKEN_BUDGET] ?: defaults.contextTokenBudget,
+            visionModel = prefs[Keys.AI_VISION_MODEL] ?: defaults.visionModel,
+            webSearch = prefs[Keys.AI_WEB_SEARCH] ?: defaults.webSearch,
         )
     }
 
@@ -463,6 +467,8 @@ class SettingsRepository(private val context: Context) {
                 prefs[Keys.AI_REPLY_ON_ERROR] = config.replyOnError
                 prefs[Keys.AI_THINKING_MODE] = config.thinkingMode.name
                 prefs[Keys.AI_CONTEXT_TOKEN_BUDGET] = config.contextTokenBudget
+                prefs[Keys.AI_VISION_MODEL] = config.visionModel.trim()
+                prefs[Keys.AI_WEB_SEARCH] = config.webSearch
             }
         }
     }

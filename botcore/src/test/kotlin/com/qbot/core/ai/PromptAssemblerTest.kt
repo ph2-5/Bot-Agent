@@ -24,6 +24,7 @@ class PromptAssemblerTest {
         group: GroupDigest? = null,
         quoted: QuotedMessage? = null,
         insult: InsultContext? = null,
+        social: SocialContext? = null,
     ) = MemoryContext(
         senderLabel = label,
         facts = facts,
@@ -31,6 +32,7 @@ class PromptAssemblerTest {
         group = group,
         quoted = quoted,
         insult = insult,
+        social = social,
     )
 
     private fun fact(text: String) = UserFact(senderId = "s", text = text)
@@ -475,5 +477,41 @@ class PromptAssemblerTest {
             "熟人玩笑与陌生人挑衅应有区别",
             block.content.contains("反应程度应当不一样"),
         )
+    }
+
+    @Test
+    fun `有候选图时注入表情包块`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "你是群友",
+                memory =
+                    memory(
+                        social = SocialContext(memes = listOf("https://a.com/1.jpg")),
+                    ),
+                history = emptyList(),
+                question = "在吗",
+                tokenBudget = 10_000,
+            )
+
+        val block = messages.first { it.content.contains("表情包") }
+        assertTrue(block.content.contains("https://a.com/1.jpg"))
+        assertTrue(block.content.contains("[表情:图片地址]"))
+    }
+
+    @Test
+    fun `没有候选图时不提发图这件事`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "你是群友",
+                memory = memory(social = SocialContext(memes = emptyList())),
+                history = emptyList(),
+                question = "在吗",
+                tokenBudget = 10_000,
+            )
+
+        // 没有图可发，提示词里连"能发图"都不该出现——
+        // 否则模型会开始编造图片地址
+        assertFalse(messages.any { it.content.contains("表情包") })
+        assertFalse(messages.any { it.content.contains("表情:") })
     }
 }

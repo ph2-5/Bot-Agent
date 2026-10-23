@@ -76,6 +76,20 @@ data class AiConfig(
      * 同时这也是缓存友好的关键：system 提示词越短越稳定，前缀缓存越容易命中。
      */
     val contextTokenBudget: Int = 3000,
+    /**
+     * 视觉模型名。带图的消息用它；留空则沿用 [model]。
+     *
+     * 单独留一个字段，是因为主模型可能不支持图片：这时把 visionModel
+     * 填成 deepseek-flash 即可，不用为了看图把主模型也换掉。
+     */
+    val visionModel: String = "",
+    /**
+     * 允许联网搜索（DeepSeek 搜索接口，按成功请求计费）。
+     *
+     * 目前只用在「遇到不懂的梗，查一下」这一处，不参与每轮对话——
+     * 否则每条消息都要花一次搜索费，而绝大多数消息根本不需要。
+     */
+    val webSearch: Boolean = true,
 ) {
     /** 配置是否可用。缺任何一项都会让每次请求都白跑一趟，故提前拦住。 */
     val isReady: Boolean
@@ -177,6 +191,13 @@ class InMemoryAiHistoryStore : AiHistoryStore {
 data class BehaviorContext(
     val userRules: List<String> = emptyList(),
     val lessons: List<String> = emptyList(),
+    /**
+     * 这条消息的发送者跟你的关系。
+     *
+     * 只影响"想不想接"：熟人多搭两句，被这个人伤过会犹豫。
+     * 不影响礼数——好感再低，对方说正事也照常回。
+     */
+    val relation: PersonRelation? = null,
 )
 
 /**
@@ -279,7 +300,16 @@ class AiResponder(
         ruleMatched: Boolean,
     ): Boolean {
         if (!config.isReady) return false
-        if (message.content.isBlank()) return false
+        // 只发了图没写字也算有内容：群里 @ 机器人甩一张表情包过来，
+        // 是视觉模型最常见的开场——这里挡住的话，"能看图"就白接了。
+        if (message.content.isBlank() && message.imageUrl.isNullOrBlank()) return false
+        // 纯图消息不可能是 /ai 指令，COMMAND_ONLY 下直接放行只会把它
+        // 当成一句没有文字的提问——所以仍然要求有文字。
+        if (config.mode == AiMode.COMMAND_ONLY &&
+            message.content.isBlank()
+        ) {
+            return false
+        }
 
         return when (config.mode) {
             AiMode.AI_ALWAYS -> true
@@ -315,19 +345,41 @@ class AiResponder(
         config: AiConfig,
         memory: MemoryContext? = null,
         directive: String? = null,
-    ): String {
+    ): String = replyDetailed(message, config, memory, directive).content
+
+    /**
+     * 同 [reply]，但把模型没说出口的那段（思考）一并带出来。
+     *
+     * 思考只在用户开了思考模式时才有；关闭时 [AiReply.reasoning] 为 null。
+     * 调用方自行决定要不要落库（见 [InnerThought]），这里不做任何存储。
+     */
+    suspend fun replyDetailed(
+        message: IncomingMessage,
+        config: AiConfig,
+        memory: MemoryContext? = null,
+        directive: String? = null,
+    ): AiReply {
         val key = ConversationKeys.history(message)
-        val rawQuestion = extractQuestion(message)
+        // 只发了图没写字：给模型一个默认问题，否则它会回"请问你想问什么"——
+        // 对方明明发了图，这么问等于没看见。
+        val rawQuestion =
+            extractQuestion(message).let { question ->
+                if (question.isBlank() && !message.imageUrl.isNullOrBlank()) {
+                    "（对方发来一张图片，没有配文字）"
+                } else {
+                    question
+                }
+            }
         val systemPrompt = personaResolver?.invoke(message) ?: config.systemPrompt
 
         lockFor(key).withLock {
             // 清空指令不调用模型，直接重置上下文
             if (rawQuestion.lowercase() in CLEAR_COMMANDS) {
                 history.clear(key)
-                return "已清空与本会话的上下文，可以开始新对话了。"
+                return AiReply("已清空与本会话的上下文，可以开始新对话了。")
             }
 
-            if (rawQuestion.isBlank()) return "请问你想问什么？"
+            if (rawQuestion.isBlank()) return AiReply("请问你想问什么？")
 
             val historyLimit = (config.contextTurns * 2).coerceIn(2, 40)
             val stored = history.load(key, historyLimit)
@@ -341,22 +393,34 @@ class AiResponder(
 
             val result =
                 try {
-                    callLlm(stored, question, config, memory, systemPrompt)
+                    callLlm(stored, question, config, memory, systemPrompt, message.imageUrl)
                 } catch (e: ContextTooLongException) {
                     // 估算偏差或历史里混进超长消息：砍掉一半历史重试一次，
                     // 仍失败就把异常抛给调用方走兜底话术。
                     val halved = stored.drop(stored.size / 2)
-                    callLlm(halved, question, config, memory, systemPrompt)
+                    callLlm(halved, question, config, memory, systemPrompt, message.imageUrl)
                 }
 
             // 成功后才写入历史：失败的请求不应污染上下文。
             // 记录用户的原始话术而非包装后的任务说明——
             // 否则下一轮历史里会残留「【指令结果】…」这类内部文本。
+            // 表情包标记在进历史前剥掉：历史里只留说出口的话，
+            // 但图地址要带出去给发送链路（见 [AiReply.memeUrl]）。
+            val (spoken, memeUrl) = MemeMarker.parse(result.content)
+            // 纯表情包回复：正文是空的，历史里不能留一条空 assistant 消息——
+            // 下一轮它会看见"自己刚才啥也没说"。留一句只有它看得懂的记号。
+            val forHistory =
+                spoken.ifBlank { memeUrl?.let { "（回了一张表情包）" }.orEmpty() }
             history.append(key, ChatMessage(role = "user", content = rawQuestion))
-            history.append(key, ChatMessage(role = "assistant", content = result.content))
+            history.append(key, ChatMessage(role = "assistant", content = forHistory))
             history.trim(key, historyLimit)
 
-            return truncate(result.content)
+            return AiReply(
+                content = truncate(spoken),
+                // 思考模式关闭时这里恒为 null，不会产生空的内心记录
+                reasoning = result.reasoning?.takeIf { it.isNotBlank() },
+                memeUrl = memeUrl,
+            )
         }
     }
 
@@ -505,8 +569,14 @@ class AiResponder(
             behavior.userRules.map { it.trim() }.filter { it.isNotEmpty() }.take(MAX_USER_RULES)
         val lessons =
             behavior.lessons.map { it.trim() }.filter { it.isNotEmpty() }.take(MAX_LESSONS)
-        if (rules.isEmpty() && lessons.isEmpty()) return ""
+        val relation = behavior.relation
+        if (rules.isEmpty() && lessons.isEmpty() && relation == null) return ""
         return buildString {
+            if (relation != null) {
+                append(RelationPolicy.describe(relation))
+                append("\n这只是倾向：熟人可以多搭一句，不熟就别硬接；")
+                append("好感低也不许冷落、阴阳或翻旧账。\n")
+            }
             if (rules.isNotEmpty()) {
                 append("用户补充规则（优先级最高，必须遵守）：\n")
                 rules.forEach { append("- ").append(it.take(MAX_RULE_CHARS)).append('\n') }
@@ -581,8 +651,9 @@ class AiResponder(
         config: AiConfig,
         memory: MemoryContext?,
         systemPrompt: String,
+        imageUrl: String? = null,
     ): LlmReply {
-        val messages =
+        val assembled =
             assembler.assemble(
                 personaPrompt = systemPrompt,
                 memory = memory,
@@ -590,11 +661,30 @@ class AiResponder(
                 question = question,
                 tokenBudget = config.contextTokenBudget,
             )
+        // 只有本轮带图：历史里的图不再重复送，否则同一张图每轮都要付一次 token。
+        val messages =
+            if (imageUrl.isNullOrBlank()) {
+                assembled
+            } else {
+                val last = assembled.lastOrNull()
+                if (last?.role == "user") {
+                    assembled.dropLast(1) + last.copy(images = listOf(imageUrl))
+                } else {
+                    assembled
+                }
+            }
+        // 带图时优先用视觉模型；没配就沿用主模型（用户可能主模型本来就支持图片）
+        val model =
+            if (!imageUrl.isNullOrBlank() && config.visionModel.isNotBlank()) {
+                config.visionModel
+            } else {
+                config.model
+            }
         val reply =
             client.chat(
                 baseUrl = config.baseUrl,
                 apiKey = config.apiKey,
-                model = config.model,
+                model = model,
                 messages = messages,
                 temperature = config.temperature,
                 maxTokens = config.maxTokens,

@@ -70,7 +70,7 @@ data class Persona(
     val scopeId: String? = null,
     /** 人设名称，如「默认助手」「傲娇猫娘」，仅用于维护端展示 */
     val name: String,
-    /** 五段式人格正文（见 [PersonaSections]）；EMBRYO 阶段为空 */
+    /** 人格正文（六段，见 [PersonaSections]）；EMBRYO 阶段为空 */
     val prompt: String,
     val updatedAt: Long = 0,
     val kind: PersonaKind = PersonaKind.OVERRIDE,

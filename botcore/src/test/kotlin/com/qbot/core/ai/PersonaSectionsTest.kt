@@ -1,16 +1,27 @@
 package com.qbot.core.ai
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** 五段解析、相似度与段落 diff。 */
+/** 六段解析、相似度与段落 diff（五段老档案仍须兼容）。 */
 class PersonaSectionsTest {
     private val sample =
         """
         [身份] 我是群里的老哥。
         [性格] 热心、话多，见人有难处就想帮。
+        [说话方式] 短句，先给结论。
+        [兴趣] 装机、球赛。
+        [边界] 不冒充群友。
+        """.trimIndent()
+
+    private val sampleWithQuirks =
+        """
+        [身份] 我是群里的老哥。
+        [性格] 热心、话多，见人有难处就想帮。
+        [毛病] 别人没问也爱插一嘴给主意，帮完的忙还要提一句。
         [说话方式] 短句，先给结论。
         [兴趣] 装机、球赛。
         [边界] 不冒充群友。
@@ -25,6 +36,55 @@ class PersonaSectionsTest {
         assertEquals("装机、球赛。", sections.interests)
         assertEquals("不冒充群友。", sections.bounds)
         assertTrue(sections.isComplete)
+    }
+
+    @Test
+    fun `解析六段并保留毛病`() {
+        val sections = PersonaSections.parse(sampleWithQuirks)!!
+        assertEquals("别人没问也爱插一嘴给主意，帮完的忙还要提一句。", sections.quirks)
+        assertTrue(sections.hasQuirks)
+        assertTrue(sections.isComplete)
+    }
+
+    @Test
+    fun `缺毛病段仍可解析——老档案不能因为升级而失效`() {
+        val sections = PersonaSections.parse(sample)!!
+        assertFalse("五段老档案不该凭空有毛病段", sections.hasQuirks)
+        assertTrue("老档案仍算完整，否则会被降级成手写文本", sections.isComplete)
+    }
+
+    @Test
+    fun `毛病段缺内容时按空处理而不是整段失败`() {
+        val raw = sampleWithQuirks.replace("[毛病] 别人没问也爱插一嘴给主意，帮完的忙还要提一句。", "[毛病]")
+        val sections = PersonaSections.parse(raw)!!
+        assertFalse(sections.hasQuirks)
+    }
+
+    @Test
+    fun `六段渲染后能再次解析，且毛病排在性格之后`() {
+        val original = PersonaSections.parse(sampleWithQuirks)!!
+        val rendered = original.render()
+        assertEquals(original, PersonaSections.parse(rendered)!!)
+        assertTrue(
+            "毛病应紧贴性格输出",
+            rendered.indexOf("[毛病]") < rendered.indexOf("[说话方式]"),
+        )
+    }
+
+    @Test
+    fun `从无到有补毛病不算改动过大`() {
+        // 旧档案补段是结构性升级；若把新段计入相似度，五段档案会永远补不上
+        val a = PersonaSections.parse(sample)!!
+        val b = a.copy(quirks = "别人没问也爱插一嘴给主意，帮完的忙还要提一句。")
+        assertEquals(1.0, PersonaSections.similarity(a, b), 0.0001)
+        assertEquals(listOf("毛病"), b.changedFrom(a))
+    }
+
+    @Test
+    fun `两边都有毛病时它参与相似度`() {
+        val a = PersonaSections.parse(sampleWithQuirks)!!
+        val b = a.copy(quirks = "完全不同的另一种毛病，跟原来毫无关系。")
+        assertTrue(PersonaSections.similarity(a, b) < 1.0)
     }
 
     @Test

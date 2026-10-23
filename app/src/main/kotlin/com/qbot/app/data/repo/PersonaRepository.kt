@@ -70,9 +70,9 @@ class PersonaRepository(
         val now = System.currentTimeMillis()
         val existing = if (persona.id > 0) personaDao.findById(persona.id) else null
 
-        // 自由文本（不是五段结构）不可能被"小步微调"——守卫拿不到可比对的段落，
+        // 自由文本（不是分段结构）不可能被"小步微调"——守卫拿不到可比对的段落，
         // 下一次成长只能整段重写，等于把用户写的东西冲掉。
-        // 所以只要正文不是五段，就自动转成手动：用户写的永远优先。
+        // 所以只要正文解析不出段落，就自动转成手动：用户写的永远优先。
         val freeform =
             persona.prompt.isNotBlank() && PersonaSections.parse(persona.prompt) == null
         val stage =

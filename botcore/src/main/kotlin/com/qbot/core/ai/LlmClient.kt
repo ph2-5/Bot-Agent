@@ -22,6 +22,13 @@ import java.io.IOException
 data class ChatMessage(
     val role: String,
     val content: String,
+    /**
+     * 本条消息附带的图片 URL。
+     *
+     * 只给**本轮**的 user 消息附图：历史里的图不带，否则每一轮都要为
+     * 同一张图重复付 token，而且图片只允许出现在 user 消息里。
+     */
+    val images: List<String> = emptyList(),
 )
 
 /** LLM 调用失败。 */
@@ -157,7 +164,33 @@ class LlmClient(
                             add(
                                 buildJsonObject {
                                     put("role", msg.role)
-                                    put("content", msg.content)
+                                    if (msg.images.isEmpty()) {
+                                        put("content", msg.content)
+                                    } else {
+                                        // OpenAI 兼容的多模态格式：content 变成块数组
+                                        put(
+                                            "content",
+                                            kotlinx.serialization.json.buildJsonArray {
+                                                add(
+                                                    buildJsonObject {
+                                                        put("type", "text")
+                                                        put("text", msg.content)
+                                                    },
+                                                )
+                                                msg.images.forEach { url ->
+                                                    add(
+                                                        buildJsonObject {
+                                                            put("type", "image_url")
+                                                            put(
+                                                                "image_url",
+                                                                buildJsonObject { put("url", url) },
+                                                            )
+                                                        },
+                                                    )
+                                                }
+                                            },
+                                        )
+                                    }
                                 },
                             )
                         }

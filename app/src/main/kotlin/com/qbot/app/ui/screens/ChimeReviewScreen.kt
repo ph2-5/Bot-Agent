@@ -1,5 +1,6 @@
 package com.qbot.app.ui.screens
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -48,6 +49,7 @@ import com.qbot.core.ai.ChimeDecision
 import com.qbot.core.ai.ChimeDecisionRecord
 import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChimeStats
+import com.qbot.core.ai.InnerThought
 import com.qbot.core.ai.LessonCategories
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -91,6 +93,8 @@ fun ChimeReviewScreen() {
         .collectAsState(initial = emptyList())
     val lessons by controller.observeChimeLessons().collectAsState(initial = emptyList())
     val chitchat by controller.chitchatConfig.collectAsState()
+    val thoughts by controller.observeInnerThoughts(30).collectAsState(initial = emptyList())
+    var showThoughts by rememberSaveable { mutableStateOf(false) }
 
     // 反馈落库后 Flow 会重发，统计随之刷新
     LaunchedEffect(decisions, lessons) {
@@ -130,6 +134,34 @@ fun ChimeReviewScreen() {
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         item(key = "stats") { StatsCard(stats = stats, lessonCount = lessons.size) }
+
+        item(key = "thoughts") {
+            ThoughtsHeader(
+                count = thoughts.size,
+                expanded = showThoughts,
+                onToggle = { showThoughts = !showThoughts },
+            )
+        }
+
+        if (showThoughts) {
+            if (thoughts.isEmpty()) {
+                item(key = "thoughts-empty") {
+                    Text(
+                        "还没有记录。要它先想再说，得在「设置 → AI 与模型」里打开思考模式；" +
+                            "关着的时候这条链路是空的。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                items(thoughts.take(20), key = { "thought-${it.id}" }) { thought ->
+                    ThoughtCard(
+                        thought = thought,
+                        groupName = thought.groupId?.let { groupNames[it] } ?: "单聊",
+                    )
+                }
+            }
+        }
 
         item(key = "filters") {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -371,6 +403,84 @@ private fun StatsCard(stats: ChimeStats, lessonCount: Int) {
                 "经验库 $lessonCount 条",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/** 内心戏入口：默认收起，避免把复盘页顶得太长。 */
+@Composable
+private fun ThoughtsHeader(
+    count: Int,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onToggle),
+        colors =
+            CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            ),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "没说出口的话",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    "$count 条",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    if (expanded) "收起" else "展开",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+            Text(
+                "它开口前会先想一遍。这段只给你看：群友看不到，也不会进下一轮对话。" +
+                    "需要开启「思考模式」。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/** 一条内心戏：心里想的 vs 嘴上说的。 */
+@Composable
+private fun ThoughtCard(thought: InnerThought, groupName: String) {
+    val timeFormat = remember { SimpleDateFormat("MM-dd HH:mm", Locale.CHINA) }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                "$groupName · ${thought.senderName ?: "群友"} · " +
+                    timeFormat.format(Date(thought.createdAt)),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "心里：${thought.thought}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "嘴上：${thought.spoken}",
+                style = MaterialTheme.typography.bodyMedium,
             )
         }
     }

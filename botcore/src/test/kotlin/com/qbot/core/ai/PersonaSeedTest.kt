@@ -14,12 +14,16 @@ import org.junit.Test
  */
 class PersonaSeedTest {
     @Test
-    fun `每个种子都能生成完整五段骨架`() {
+    fun `每个种子都能生成完整六段骨架`() {
         PersonaSeed.entries.forEach { seed ->
             val skeleton = PersonaGrowth.embryoSkeleton(seed.name)
             val sections = PersonaSections.parse(skeleton)
             assertTrue("${seed.name} 的骨架解析失败", sections != null)
             assertTrue("${seed.name} 的骨架有空白段落", sections!!.isComplete)
+            assertTrue(
+                "${seed.name} 的骨架缺少毛病段——只写优点的角色是客服，不是人",
+                sections.hasQuirks,
+            )
             assertEquals(
                 "${seed.name} 的身份段应来自种子",
                 seed.identity,

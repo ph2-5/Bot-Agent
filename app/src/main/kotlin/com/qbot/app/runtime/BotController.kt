@@ -9,8 +9,11 @@ import com.qbot.app.data.backup.DisplayNameBackup
 import com.qbot.app.data.backup.GreetingBackup
 import com.qbot.app.data.backup.GroupBotNameBackup
 import com.qbot.app.data.backup.LessonBackup
+import com.qbot.app.data.backup.MemeBackup
 import com.qbot.app.data.backup.MemoryBackup
 import com.qbot.app.data.backup.PersonaBackup
+import com.qbot.app.data.backup.RelationBackup
+import com.qbot.app.data.backup.SlangBackup
 import com.qbot.app.data.backup.PersonaProfileBackup
 import com.qbot.app.data.backup.RuleBackup
 import com.qbot.app.data.db.AppDatabase
@@ -24,6 +27,9 @@ import com.qbot.app.data.repo.RoomAiHistoryStore
 import com.qbot.app.data.repo.RoomFactStore
 import com.qbot.app.data.repo.RoomGroupStore
 import com.qbot.app.data.repo.RoomIdentityStore
+import com.qbot.app.data.repo.RoomInnerThoughtSink
+import com.qbot.app.data.repo.RoomSocialStore
+import com.qbot.core.api.DeepSeekSearch
 import com.qbot.app.data.repo.RoomSharedContextStore
 import com.qbot.app.data.repo.SettingsRepository
 import com.qbot.app.data.repo.GreetingConfig
@@ -32,6 +38,12 @@ import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.AiResponder
 import com.qbot.core.ai.ChatMessage
 import com.qbot.core.ai.ChimeDecision
+import com.qbot.core.ai.BotMood
+import com.qbot.core.ai.InnerThought
+import com.qbot.core.ai.PersonRelation
+import com.qbot.core.ai.SlangHarvest
+import com.qbot.core.ai.SlangJudge
+import com.qbot.core.ai.SlangTerm
 import com.qbot.core.ai.ChimeDecisionRecord
 import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChimeReflection
@@ -42,6 +54,8 @@ import com.qbot.core.ai.LessonCategories
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.GroupProfile
 import com.qbot.core.ai.LlmClient
+import com.qbot.core.ai.MemeHarvester
+import com.qbot.core.ai.MemeImage
 import com.qbot.core.ai.MemoryConfig
 import com.qbot.core.ai.MemoryPipeline
 import com.qbot.core.ai.Persona
@@ -201,11 +215,37 @@ class BotController(
     private val chimeLessonStore = RoomChimeLessonStore(database.chimeLessonDao())
     private val chimeTrainer = RoomChimeTrainer(chimeDecisionStore, chimeLessonStore)
 
+    /** 内心戏出口：思考模式打开时，模型没说出口的那段话落这里。 */
+    private val innerThoughtSink = RoomInnerThoughtSink(database.innerThoughtDao())
+
+    /** 关系、心情、梗库：既是提示词的数据源，也是互动事件的落库点。 */
+    private val socialStore =
+        RoomSocialStore(
+            affinityDao = database.affinityDao(),
+            moodDao = database.botMoodDao(),
+            slangDao = database.slangDao(),
+            thoughtDao = database.innerThoughtDao(),
+            memeDao = database.memeDao(),
+        )
+
     /** 反思串行化：一次只处理一条反馈，避免并发写入把经验库弄乱 */
     private val reflectionMutex = Mutex()
 
     /** 反思与正式回复共用连接池 */
     private val reflectionClient by lazy { LlmClient(http = http, logger = logger) }
+
+    /** 聊天时学梗：遇到可疑词去搜一下，查到了就入库。 */
+    private val slangLearner =
+        SlangLearnerImpl(
+            store = socialStore,
+            client = reflectionClient,
+            search = DeepSeekSearch(http),
+            config = { settings.aiConfig.value },
+        )
+
+    /** 收表情包：群友发的图顺手捡进库，之后回复时可以配一张。 */
+    private val memeHarvester = MemeHarvester { url -> socialStore.harvestMeme(url) }
+
 
     /**
      * 人格自主成长调度器。
@@ -252,6 +292,94 @@ class BotController(
 
     /** 经验库。 */
     fun observeChimeLessons(): Flow<List<ChimeLesson>> = chimeLessonStore.observeAll()
+
+    /**
+     * 最近说过但没发出去的话。
+     *
+     * 只有开了思考模式才会有记录；关掉时列表恒为空，不是故障。
+     */
+    fun observeInnerThoughts(limit: Int = 100): Flow<List<InnerThought>> =
+        innerThoughtSink.observeRecent(limit)
+
+    suspend fun clearInnerThoughts() = innerThoughtSink.clear()
+
+    /** 对每个人的关系（好感降序）。 */
+    fun observeRelations(limit: Int = 50): Flow<List<PersonRelation>> =
+        socialStore.observeRelations(limit)
+
+    suspend fun currentMood(): BotMood = socialStore.currentMood()
+
+    suspend fun forgetRelation(userId: String) = socialStore.forgetRelation(userId)
+
+    /** 群内梗库。 */
+    fun observeSlang(): Flow<List<SlangTerm>> = socialStore.observeSlang()
+
+    suspend fun addSlang(term: String, meaning: String, usage: String? = null, groupId: String? = null) {
+        if (term.isBlank() || meaning.isBlank()) return
+        socialStore.upsertSlang(
+            SlangTerm(
+                term = term.trim(),
+                meaning = meaning.trim(),
+                usage = usage?.trim()?.takeIf { it.isNotBlank() },
+                scopeGroupId = groupId,
+                hits = 1,
+                source = SlangTerm.SOURCE_MANUAL,
+            ),
+        )
+    }
+
+    suspend fun setSlangEnabled(id: Long, enabled: Boolean) = socialStore.setSlangEnabled(id, enabled)
+
+    suspend fun deleteSlang(id: Long) = socialStore.deleteSlang(id)
+
+    /** 表情包库（群里捡的 + 手动贴的）。 */
+    fun observeMemes(): Flow<List<MemeImage>> = socialStore.observeMemes()
+
+    /** 维护端手动贴一张图；返回 null 表示链接为空。 */
+    suspend fun addMeme(url: String): Boolean {
+        if (url.isBlank()) return false
+        return socialStore.addMeme(url) != null
+    }
+
+    suspend fun deleteMeme(id: Long) = socialStore.deleteMeme(id)
+
+    suspend fun clearMemes() = socialStore.clearMemes()
+
+    /**
+     * 从最近活跃的群里收获梗。
+     *
+     * 本地统计缩小范围 → 模型判断是不是梗 → 入库。返回新增/合并的条数。
+     * 任何一步失败都只是这一轮没收获，不影响别的功能。
+     */
+    suspend fun harvestSlang(): Int {
+        val config = settings.aiConfig.value
+        if (!config.enabled || !config.isReady) return 0
+        val groups =
+            runCatching { groupStore.allActive() }.getOrDefault(emptyList())
+                .sortedByDescending { it.lastSeenAt }
+                .take(3)
+        if (groups.isEmpty()) return 0
+        val judge = SlangJudge(reflectionClient)
+        var touched = 0
+        groups.forEach { group ->
+            val messages =
+                runCatching { memoryPipeline.recentGroupMessages(group.groupId, 300) }
+                    .getOrDefault(emptyList())
+            if (messages.size < 20) return@forEach
+            val names = messages.mapNotNull { it.senderName }.distinct()
+            val candidates = SlangHarvest.candidates(messages, names, minHits = 3, limit = 18)
+            if (candidates.isEmpty()) return@forEach
+            val judged =
+                runCatching { judge.filter(candidates, messages, config) }
+                    .getOrDefault(emptyList())
+            judged.forEach { term ->
+                socialStore.upsertSlang(term.copy(scopeGroupId = group.groupId, hits = 1))
+                touched++
+            }
+        }
+        socialStore.trimSlang(200)
+        return touched
+    }
 
     /** 近 N 天的判断质量统计。 */
     suspend fun chimeStats(days: Int = 7): ChimeStats =
@@ -1013,6 +1141,39 @@ class BotController(
                             botName = profile.botName ?: return@mapNotNull null,
                         )
                     },
+                // 关系与梗：都是"养"出来的，换机不该从零开始
+                relations =
+                    runCatching { socialStore.allRelations() }.getOrDefault(emptyList())
+                        .map { relation ->
+                        RelationBackup(
+                            userId = relation.userId,
+                            displayName = relation.displayName,
+                            familiarity = relation.familiarity,
+                            affinity = relation.affinity,
+                            interactionCount = relation.interactionCount,
+                            lastInteractionAt = relation.lastInteractionAt,
+                            lastNote = relation.lastNote,
+                        )
+                    },
+                slang =
+                    runCatching { socialStore.allSlang() }.getOrDefault(emptyList()).map { term ->
+                            SlangBackup(
+                                term = term.term,
+                                meaning = term.meaning,
+                                usage = term.usage,
+                                scopeGroupId = term.scopeGroupId,
+                                hits = term.hits,
+                            )
+                        },
+                // 表情包库：链接轻量，值得跟着配置走
+                memes =
+                    runCatching { socialStore.allMemes() }.getOrDefault(emptyList()).map { meme ->
+                        MemeBackup(
+                            url = meme.url,
+                            source = meme.source,
+                            hits = meme.hits,
+                        )
+                    },
                 // 训练成果：经验库跟着配置走，换机后不必重新教一遍
                 chimeLessons =
                     chimeLessonStore.all().map { lesson ->
@@ -1233,6 +1394,61 @@ class BotController(
             return id
         }
 
+        if (backup.relations.isNotEmpty()) {
+            backup.relations.forEach { dto ->
+                runCatching {
+                    socialStore.putRelation(
+                        PersonRelation(
+                            userId = dto.userId,
+                            displayName = dto.displayName,
+                            familiarity = dto.familiarity,
+                            affinity = dto.affinity,
+                            interactionCount = dto.interactionCount,
+                            lastInteractionAt = dto.lastInteractionAt,
+                            lastNote = dto.lastNote,
+                        ),
+                    )
+                }
+            }
+            applied++
+        }
+
+        if (backup.slang.isNotEmpty()) {
+            runCatching {
+                socialStore.clearSlang()
+                backup.slang.forEach { dto ->
+                    socialStore.putSlang(
+                        SlangTerm(
+                            term = dto.term,
+                            meaning = dto.meaning,
+                            usage = dto.usage,
+                            scopeGroupId = dto.scopeGroupId,
+                            hits = dto.hits,
+                            source = SlangTerm.SOURCE_HARVEST,
+                        ),
+                    )
+                }
+            }
+            applied++
+        }
+
+        // 旧备份（version < 4）没有 memes 字段，反序列化出空列表，自然跳过
+        if (backup.memes.isNotEmpty()) {
+            runCatching {
+                socialStore.clearMemes()
+                backup.memes.forEach { dto ->
+                    socialStore.putMeme(
+                        MemeImage(
+                            url = dto.url,
+                            source = dto.source,
+                            hits = dto.hits,
+                        ),
+                    )
+                }
+            }
+            applied++
+        }
+
         if (backup.personaProfiles.isNotEmpty()) {
             backup.personaProfiles.forEach { dto ->
                 upsertProfile(
@@ -1412,6 +1628,14 @@ class BotController(
                 personaPromptProvider = { message -> personaResolver.promptFor(message) },
                 // 训练闭环：每条判断结束后落一条结构化记录
                 chimeTrainer = chimeTrainer,
+                // 内心戏：只落库，不进上下文也不发给群友
+                innerThoughtSink = innerThoughtSink,
+                // 关系 / 心情 / 梗：读注入提示词，写来自互动事件
+                socialProvider = socialStore,
+                relationRecorder = socialStore,
+                slangLearner = slangLearner,
+                // 表情包：群友发的图捡库，回复时模型可以从库里挑一张配着发
+                memeHarvester = memeHarvester,
             )
 
         // 把网关状态转发到控制器自己的流上，

@@ -181,6 +181,43 @@ class PromptAssembler {
             remaining -= TokenEstimator.estimate(block)
         }
 
+        // 2.85) 关系与心情：决定「愿不愿意开口」，不决定「说话的态度」。
+        // 放在冒犯之后、群背景之前：它比背景稳定，也不该被背景挤出预算。
+        memory?.social?.let { social ->
+            val lines = mutableListOf<String>()
+            social.relation?.let { lines += RelationPolicy.describe(it) }
+            social.mood?.let { mood -> MoodPolicy.describe(mood)?.let { lines += it } }
+            social.lastThought?.let { thought ->
+                lines +=
+                    "你上次回他时，没说出口的是：「$thought」。" +
+                        "它可以影响你这次的态度，但别把它当成事实讲出来，也别翻旧账。"
+            }
+            if (lines.isNotEmpty()) {
+                val text = lines.joinToString("\n")
+                result += ChatMessage(role = "system", content = text)
+                remaining -= TokenEstimator.estimate(text)
+            }
+        }
+
+        // 2.87) 群内梗：懂就行，别硬用。
+        // 单独立块而不是塞进人设——它会随群变化，而人设要保持前缀缓存稳定。
+        memory?.social?.slang?.let { slang ->
+            SlangRender.block(slang)?.let { text ->
+                result += ChatMessage(role = "system", content = text)
+                remaining -= TokenEstimator.estimate(text)
+            }
+        }
+
+        // 2.89) 表情包：图是配菜不是主食。
+        // 与梗同样的理由：候选图随群变化，不进人设。
+        // 列表为空时整块不注入——没有图可发，就别让模型知道"能发图"这件事。
+        memory?.social?.memes?.takeIf { it.isNotEmpty() }?.let { urls ->
+            MemeRender.block(urls)?.let { text ->
+                result += ChatMessage(role = "system", content = text)
+                remaining -= TokenEstimator.estimate(text)
+            }
+        }
+
         // 3) 群聊背景：动态内容，预算紧张时最先牺牲
         val digest = memory?.roomDigest.orEmpty()
         if (digest.isNotEmpty() && remaining > 0) {

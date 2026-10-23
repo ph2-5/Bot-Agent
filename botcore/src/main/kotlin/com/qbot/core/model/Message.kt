@@ -1,6 +1,7 @@
 package com.qbot.core.model
 
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
@@ -71,6 +72,13 @@ data class IncomingMessage(
      * 这是"指代不明"最有效的解药（「这个人是傻B」+ 被引用的原话）。
      */
     val quotedMessageId: String? = null,
+    /**
+     * 本条消息带的图片地址（`attachments` 里第一张图）。
+     *
+     * 只取第一张：群里绝大多数时候一次发一张，多图一起送进视觉模型
+     * 会让 token 翻几倍，而收益很小。没有图片时为 null。
+     */
+    val imageUrl: String? = null,
     val raw: JsonObject,
 )
 
@@ -225,6 +233,15 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
                 ?.let { it as? JsonObject }
                 ?.stringOrNull("ref_msg_id")
 
+    // 富媒体附件：图片在 attachments 数组里，content_type 形如 image/jpeg。
+    // 语音、视频、文件先不接——它们要么需要转码，要么模型吃不下。
+    val imageUrl =
+        (obj["attachments"] as? JsonArray)
+            ?.filterIsInstance<JsonObject>()
+            ?.firstOrNull { it.stringOrNull("content_type").orEmpty().startsWith("image/") }
+            ?.stringOrNull("url")
+            ?.takeIf { it.isNotBlank() }
+
     return IncomingMessage(
         kind = kind,
         eventType = eventType,
@@ -235,6 +252,7 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
         senderName = senderName,
         timestampMillis = if (timestamp > 1_000_000_000_000L) timestamp else timestamp * 1000,
         quotedMessageId = quotedId,
+        imageUrl = imageUrl,
         raw = obj,
     )
 }

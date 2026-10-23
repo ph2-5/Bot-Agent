@@ -3,6 +3,7 @@ package com.qbot.core.engine
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AddresseeDetector
 import com.qbot.core.ai.AiMode
+import com.qbot.core.ai.AiReply
 import com.qbot.core.ai.AiResponder
 import com.qbot.core.ai.BehaviorContext
 import com.qbot.core.ai.ChimeDecisionRecord
@@ -15,10 +16,21 @@ import com.qbot.core.ai.ChitchatPolicy
 import com.qbot.core.ai.CommandOutcome
 import com.qbot.core.ai.InsultContext
 import com.qbot.core.ai.InsultDetector
+import com.qbot.core.ai.InnerThought
+import com.qbot.core.ai.InnerThoughtSink
+import com.qbot.core.ai.MemeHarvester
+import com.qbot.core.ai.MemeMarker
+import com.qbot.core.ai.MemoryContext
 import com.qbot.core.ai.MemoryPipeline
 import com.qbot.core.ai.PersonaBias
+import com.qbot.core.ai.PraiseDetector
+import com.qbot.core.ai.RelationEvent
+import com.qbot.core.ai.RelationRecorder
+import com.qbot.core.ai.SlangLearner
+import com.qbot.core.ai.SocialContextProvider
 import com.qbot.core.ai.RoomMessage
 import com.qbot.core.ai.describe
+import com.qbot.core.api.MsgType
 import com.qbot.core.api.OpenApi
 import com.qbot.core.gateway.GatewayClient
 import com.qbot.core.gateway.SimpleGatewayListener
@@ -116,6 +128,31 @@ class BotRuntime(
      * 行为与 1.9.x 一致（测试与「不落库」模式用）。
      */
     private val chimeTrainer: ChimeTrainer? = null,
+    /**
+     * 内心戏出口。
+     *
+     * 思考模式打开时，模型会先说一段没说出口的话。它**不进对话上下文**、
+     * 不发给群友，只用于复盘与未来的情绪建模；为 null 时完全关闭。
+     */
+    private val innerThoughtSink: InnerThoughtSink? = null,
+    /** 社交上下文：对这个人什么关系、自己什么心情、群里最近怎么说 */
+    private val socialProvider: SocialContextProvider? = null,
+    /** 关系事件写入口：@ / 被夸 / 被骂 / 回了一句 */
+    private val relationRecorder: RelationRecorder? = null,
+    /**
+     * 遇到没见过的说法时去查一下。
+     *
+     * 异步执行，不阻塞这一轮回复——它答得快比答得懂重要，
+     * 这一轮不懂就先按人设处理（"这是啥意思"本身也很像人）。
+     */
+    private val slangLearner: SlangLearner? = null,
+    /**
+     * 收表情包：群友发的图顺手捡进库，之后回复时可以配一张。
+     *
+     * 与学梗一样丢后台：这一轮回什么，不该被"捡图"拖慢。
+     * 为 null 时完全关闭——不发图的机器人行为与接入前一致。
+     */
+    private val memeHarvester: MemeHarvester? = null,
     /** 插话决策引擎；默认实例即可，测试可注入固定时钟 */
     private val chitchatPolicy: ChitchatPolicy = ChitchatPolicy(),
     /** 冒犯检测：被指名辱骂时要按人设反应，不能装没看见 */
@@ -126,6 +163,9 @@ class BotRuntime(
     companion object {
         private const val TAG = "Runtime"
         private val TIME_FORMAT = SimpleDateFormat("HH:mm:ss", Locale.CHINA)
+
+        /** 内心戏留存上限：足够看出态度，又不至于让一条记录吃掉几 KB */
+        private const val MAX_THOUGHT_CHARS = 600
     }
 
     /** 机器人自身 openid，用于剥离消息里的 @ 前缀。 */
@@ -227,6 +267,18 @@ class BotRuntime(
         message: IncomingMessage,
         text: String,
     ) {
+        // 学梗：丢到后台，不占这轮回复的时间
+        slangLearner?.let { learner ->
+            scope.launch { runCatching { learner.maybeLearn(message, text) } }
+        }
+
+        // 收表情包：群友发的图捡进库，之后回消息时可以用。
+        // 自己的图不收——机器人发出去的原样存回来没有意义。
+        val imageUrl = message.imageUrl
+        if (!imageUrl.isNullOrBlank() && memeHarvester != null && message.senderId != botId) {
+            scope.launch { runCatching { memeHarvester.harvest(imageUrl) } }
+        }
+
         // 群内普通消息（非 @）走单独的"旁听"链路：
         // 先记进群记忆，再由插话策略决定要不要接一句。
         // 它不进入指令、规则、默认 AI 回复路径——否则群里每句话都会被回。
@@ -261,6 +313,11 @@ class BotRuntime(
         // 群昵称线索：@ 消息的 mentions 里可能带着机器人自己的 username，
         // 那往往就是群名片——这是除「叫你X」外唯一的来源。
         learnBotName(message, botId)
+
+        // 关系记账：被 @ 与被夸。放在这里而不是回复成功后——
+        // 被骂了但没回，同样改变关系。
+        noteRelation(message, text)
+        noteInsult(message, text)
 
         // 记忆/群管理指令（我的记忆 / 忘掉X / 我是谁 / 叫你X / 群里都有谁）
         // 优先于规则与 AI：副作用是本地数据库操作，不依赖 AI 开关，
@@ -323,7 +380,8 @@ class BotRuntime(
 
         // 自己的消息不处理
         if (message.senderId == selfId) return
-        if (text.isBlank()) return
+        // 只有图片、没有文字也要处理：群里发张图配个表情，是常见表达
+        if (text.isBlank() && message.imageUrl == null) return
         if (isMessageSeen(message.messageId)) return
         rememberMessage(message.messageId)
 
@@ -373,6 +431,11 @@ class BotRuntime(
                 insultDetector.isInsult(text, extraInsultWords) &&
                 insultDetector.targetsBot(text, names, extraInsultWords)
         val talkingToOthers = insultDetector.talksToOthers(mentionIds, selfId)
+        if (insulted) {
+            // 旁听链路的冒犯由这里记：入口的 noteInsult 只处理 @ / 私聊，
+            // 两边都记会重复扣分。
+            runCatching { relationRecorder?.record(message, RelationEvent.INSULTED, "他在群里骂了你") }
+        }
 
         // 这句话大概率是对谁说的：人说话是有对象的，
         // 「两人互道晚安」和「有人吗」该不该接完全不同。
@@ -459,6 +522,10 @@ class BotRuntime(
                                         config.maxInjectedLessons,
                                     ) ?: emptyList()
                                 }.getOrDefault(emptyList())
+                            // 关系会影响"想不想接"：熟人多搭两句，被伤过会犹豫。
+                            // 查不到就当没有——判断不能因为关系表抖动而停摆。
+                            val social =
+                                runCatching { socialProvider?.provide(message) }.getOrNull()
                             var judgeFailure: Throwable? = null
                             val verdict =
                                 runCatching {
@@ -479,6 +546,7 @@ class BotRuntime(
                                                     lessons.map {
                                                         "【${LessonCategories.label(it.category)}】${it.text}"
                                                     },
+                                                relation = social?.relation,
                                             ),
                                     )
                                 }.onFailure { judgeFailure = it }.getOrNull()
@@ -538,20 +606,22 @@ class BotRuntime(
                     } else {
                         null
                     }
-                val memory = pipeline.buildContext(message, selfId, text, insult)
-                val answer = responder.reply(message, aiConfig, memory)
-                if (answer.isBlank()) {
+                val memory = buildMemory(message, text, insult)
+                val answer = responder.replyDetailed(message, aiConfig, memory)
+                if (answer.content.isBlank()) {
                     finalReason = "不接：回复为空"
                     return@runCatching
                 }
-                sendReply(message, answer)
+                sendReply(message, answer.content)
+                // 内心戏：说出口的已经发出去了，没说出口的落在这里
+                recordThought(message, answer)
                 chitchatPolicy.markSpoke(groupId)
                 // 机器人这条已由 sendReply 统一写入群上下文
                 pipeline.markChitchatDecision(message, "已接话（$why）")
                 action = ChimeDecisionRecord.ACTION_SPOKE
-                replyText = answer
+                replyText = answer.content
                 finalReason = "已接话（$why）"
-                log(LogLevel.INFO, TAG, "群聊插话（$why，${answer.length} 字）")
+                log(LogLevel.INFO, TAG, "群聊插话（$why，${answer.content.length} 字）")
             }.onFailure { t ->
                 finalReason = "不接：回复失败"
                 pipeline.markChitchatDecision(message, finalReason)
@@ -691,17 +761,18 @@ class BotRuntime(
             runCatching {
                 // 复述同样要吃记忆上下文：人设提示词 + 关于此人的事实 +
                 // 群画像，模型才知道「对方是谁、这群什么情况」。
-                val memory = pipeline.buildContext(message, botId, text)
+                val memory = buildMemory(message, text)
                 val answer =
-                    responder.reply(
+                    responder.replyDetailed(
                         message,
                         aiConfig,
                         memory,
                         directive = outcome.directive,
                     )
-                if (answer.isNotBlank()) {
-                    reply = answer
+                if (answer.content.isNotBlank()) {
+                    reply = answer.content
                     viaAi = true
+                    recordThought(message, answer)
                 }
             }.onFailure { t ->
                 logger.e(TAG, "指令人设复述失败，改用兜底文案", t)
@@ -767,10 +838,13 @@ class BotRuntime(
                     null
                 }
             // 组装这条消息的记忆上下文：展示名 / 关于此人的事实 / 所在范围的近期对话
-            val memory = memoryPipeline?.buildContext(message, botId, text, insult)
-            val answer = aiResponder!!.reply(message, config, memory)
-            sendReply(message, answer)
-            if (isDirectChat(message)) memoryPipeline?.recordExchange(message, text, answer)
+            val memory = buildMemory(message, text, insult)
+            val answer = aiResponder!!.replyDetailed(message, config, memory)
+            sendReply(message, answer.content, answer.memeUrl)
+            recordThought(message, answer)
+            if (isDirectChat(message)) {
+                memoryPipeline?.recordExchange(message, text, answer.content)
+            }
             // 用量日志：缓存命中不仅省钱，首 token 延迟也大幅降低，
             // 命中率长期为 0 说明 system 提示词不稳定，值得排查。
             val usage = aiResponder.lastUsage.value
@@ -779,12 +853,12 @@ class BotRuntime(
                 log(
                     LogLevel.INFO,
                     TAG,
-                    "AI 已回复（${answer.length} 字）｜prompt ${usage.promptTokens} tokens" +
+                    "AI 已回复（${answer.content.length} 字）｜prompt ${usage.promptTokens} tokens" +
                         "（缓存命中 ${usage.cacheHitTokens}，${hitPercent.toInt()}%）" +
                         "｜completion ${usage.completionTokens} tokens",
                 )
             } else {
-                log(LogLevel.INFO, TAG, "AI 已回复（${answer.length} 字）")
+                log(LogLevel.INFO, TAG, "AI 已回复（${answer.content.length} 字）")
             }
         }.onFailure { t ->
             logger.e(TAG, "AI 回复失败", t)
@@ -815,9 +889,90 @@ class BotRuntime(
     private fun isDirectChat(message: IncomingMessage): Boolean =
         message.kind == MessageKind.C2C || message.kind == MessageKind.DIRECT
 
+    /**
+     * 组装记忆上下文，并附上社交层（关系 / 心情 / 梗）。
+     *
+     * 社交层查库失败不影响回复：宁可这一轮说话"没有态度"，
+     * 也不能因为关系表出错就整条不回。
+     */
+    private suspend fun buildMemory(
+        message: IncomingMessage,
+        text: String,
+        insult: InsultContext? = null,
+    ): MemoryContext? {
+        val pipeline = memoryPipeline ?: return null
+        val base = pipeline.buildContext(message, botId, text, insult)
+        val social = runCatching { socialProvider?.provide(message) }.getOrNull() ?: return base
+        return base.copy(social = social)
+    }
+
+    /**
+     * 关系记账：被 @ / 被夸。
+     *
+     * 放在消息入口而不是回复成功后——"被骂了但没回"同样改变关系，
+     * 只记成功的那部分会让它对恶意毫无记忆。
+     */
+    private suspend fun noteRelation(message: IncomingMessage, text: String) {
+        val recorder = relationRecorder ?: return
+        val directed =
+            message.kind == MessageKind.GROUP_AT ||
+                message.kind == MessageKind.C2C ||
+                message.kind == MessageKind.DIRECT
+        if (!directed) return
+        runCatching { recorder.record(message, RelationEvent.MENTIONED, null) }
+        if (PraiseDetector.isPraise(text, isDirected = true)) {
+            runCatching { recorder.record(message, RelationEvent.PRAISED, "他夸了你一句") }
+        }
+    }
+
+    /** 被指名冒犯也记一笔。群旁听消息由 [handleChitchat] 自己记，避免重复扣分。 */
+    private suspend fun noteInsult(message: IncomingMessage, text: String) {
+        val recorder = relationRecorder ?: return
+        if (message.kind == MessageKind.GROUP_MESSAGE) return
+        val extra = chitchatConfigProvider?.invoke()?.insultExtraWords ?: emptyList()
+        val names = listOfNotNull(botName.takeIf { it.isNotBlank() })
+        if (insultDetector.isInsult(text, extra) &&
+            insultDetector.targetsBot(text, names, extra)
+        ) {
+            runCatching { recorder.record(message, RelationEvent.INSULTED, "他骂了你") }
+        }
+    }
+
+    /**
+     * 记一条"没说出口的话"。
+     *
+     * 思考常常几千字，只留开头一段——够复盘看出态度，也不至于把库撑大。
+     * 存储失败不影响回复主链路，吞掉并记日志。
+     */
+    private suspend fun recordThought(message: IncomingMessage, reply: AiReply) {
+        val thought = reply.reasoning?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        val sink = innerThoughtSink ?: return
+        runCatching {
+            sink.record(
+                InnerThought(
+                    groupId = message.targetId?.takeIf { it.isNotBlank() },
+                    senderId = message.senderId?.takeIf { it.isNotBlank() },
+                    senderName = message.senderName?.takeIf { it.isNotBlank() },
+                    spoken = reply.content,
+                    thought = excerpt(thought, MAX_THOUGHT_CHARS),
+                    createdAt = System.currentTimeMillis(),
+                ),
+            )
+        }.onFailure { logger.w(TAG, "内心戏写入失败：${it.message}") }
+    }
+
+    /** 按句末截断，别把一句话切成两半。 */
+    private fun excerpt(text: String, max: Int): String {
+        if (text.length <= max) return text
+        val head = text.take(max)
+        val cut = head.lastIndexOfAny(charArrayOf('。', '！', '？', '\n'))
+        return if (cut > max / 2) head.take(cut + 1) + "…" else head + "…"
+    }
+
     private suspend fun sendReply(
         message: IncomingMessage,
         reply: String,
+        memeUrl: String? = null,
     ) {
         val target = message.targetId
         if (target.isNullOrBlank()) {
@@ -825,24 +980,78 @@ class BotRuntime(
             return
         }
 
-        when (message.kind) {
-            MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE ->
-                api.sendGroupMessage(target, reply, replyMessageId = message.messageId)
-            MessageKind.C2C -> api.sendUserMessage(target, reply, replyMessageId = message.messageId)
-            MessageKind.GUILD ->
-                // 频道消息沿用频道 openid 发送，此处退化为按 group 通道处理
-                api.sendGroupMessage(target, reply, replyMessageId = message.messageId)
+        // 表情包标记：AI 链路已在 AiResponder 里剥过一次（memeUrl 有值），
+        // 这里再解析是给规则回复、指令复述等非 AI 链路兜底——
+        // 它们在提示词里同样看得到"能发图"，只是没有结构化出口。
+        val (body, parsedMeme) = MemeMarker.parse(reply)
+        val meme = memeUrl ?: parsedMeme
 
-            MessageKind.DIRECT -> api.sendUserMessage(target, reply, replyMessageId = message.messageId)
+        // 纯表情包（正文被标记占满）时不发文字，只发图
+        if (body.isNotBlank()) {
+            when (message.kind) {
+                MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE ->
+                    api.sendGroupMessage(target, body, replyMessageId = message.messageId)
+                MessageKind.C2C -> api.sendUserMessage(target, body, replyMessageId = message.messageId)
+                MessageKind.GUILD ->
+                    // 频道消息沿用频道 openid 发送，此处退化为按 group 通道处理
+                    api.sendGroupMessage(target, body, replyMessageId = message.messageId)
+
+                MessageKind.DIRECT -> api.sendUserMessage(target, body, replyMessageId = message.messageId)
+            }
         }
+
+        // 图随后到：文字带 msg_id 是回复，图不带——两条连发看起来就是"说了句配个图"
+        if (!meme.isNullOrBlank()) {
+            sendMeme(message, meme)
+        }
+
+        // 关系记账：所有回复都走这里，一处覆盖 @、规则、指令复述与旁听。
+        // 失败不影响主链路——回都回了，关系没记上只是少一点印象分。
+        runCatching { relationRecorder?.record(message, RelationEvent.SPOKE, null) }
 
         // 所有群内回复的统一记账点：@ 回复、规则回复、指令复述都走这里。
         // 之前只有旁听链路记，导致群上下文里只有"问"没有"答"，
         // 模型判断"我刚说过话没有"时其实是瞎的。
         when (message.kind) {
             MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE, MessageKind.GUILD ->
-                memoryPipeline?.recordChitchatAnswer(message, reply)
+                memoryPipeline?.recordChitchatAnswer(message, body)
+
             else -> Unit
+        }
+    }
+
+    /**
+     * 发一张表情包：先上传换 file_info，再走富媒体通道（msg_type=7）。
+     *
+     * 两条降级路径：上传失败或发送失败都只记日志——
+     * 图是配菜，不能因为它把整条回复搞砸，更不该让群里看到一条报错。
+     * C2C / 单聊暂不支持：文件上传接口的路径与群不同，等有场景再接。
+     */
+    private suspend fun sendMeme(
+        message: IncomingMessage,
+        imageUrl: String,
+    ) {
+        val target = message.targetId?.takeIf { it.isNotBlank() } ?: return
+        val groupTarget =
+            when (message.kind) {
+                MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE, MessageKind.GUILD -> target
+                MessageKind.C2C, MessageKind.DIRECT -> return
+            }
+        val fileInfo =
+            runCatching { api.uploadGroupImage(groupTarget, imageUrl) }.getOrNull()
+        if (fileInfo.isNullOrBlank()) {
+            log(LogLevel.WARN, TAG, "表情包上传失败，跳过：${imageUrl.take(80)}")
+            return
+        }
+        runCatching {
+            api.sendGroupMessage(
+                groupOpenId = groupTarget,
+                content = "",
+                msgType = MsgType.MEDIA,
+                mediaFileInfo = fileInfo,
+            )
+        }.onFailure { t ->
+            log(LogLevel.WARN, TAG, "表情包发送失败：${t.message}")
         }
     }
 

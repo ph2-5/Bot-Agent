@@ -3,6 +3,8 @@ package com.qbot.app.ui.screens.settings
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Backup
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.EmojiEmotions
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Memory
@@ -85,6 +87,20 @@ private fun builtinEntries(onRequestBatteryWhitelist: () -> Unit): List<Settings
             icon = Icons.Filled.Memory,
             subtitle = { MemorySubtitle() },
         ) { onBack -> MemoryPage(onBack = onBack) },
+        SettingsEntry(
+            id = "relation",
+            group = "智能",
+            title = "关系与梗",
+            icon = Icons.Filled.Favorite,
+            subtitle = { RelationSubtitle() },
+        ) { onBack -> RelationPage(onBack = onBack) },
+        SettingsEntry(
+            id = "meme",
+            group = "智能",
+            title = "表情包库",
+            icon = Icons.Filled.EmojiEmotions,
+            subtitle = { MemeSubtitle() },
+        ) { onBack -> MemePage(onBack = onBack) },
         SettingsEntry(
             id = "chitchat",
             group = "智能",
@@ -186,6 +202,23 @@ private fun MemorySubtitle(): String {
     }
     val pair = counts
     return if (pair == null) "…" else "已认识 ${pair.first} 人 · ${pair.second} 条事实"
+}
+
+@Composable
+private fun RelationSubtitle(): String {
+    val context = LocalContext.current
+    val app = context.applicationContext as BotApplication
+    val relations by app.controller.observeRelations(50).collectAsState(initial = emptyList())
+    val slang by app.controller.observeSlang().collectAsState(initial = emptyList())
+    return "认识 ${relations.size} 人 · ${slang.size} 条群内说法"
+}
+
+@Composable
+private fun MemeSubtitle(): String {
+    val context = LocalContext.current
+    val app = context.applicationContext as BotApplication
+    val memes by app.controller.observeMemes().collectAsState(initial = emptyList())
+    return if (memes.isEmpty()) "空的，群里有人发表情包后会自动捡" else "${memes.size} 张可用"
 }
 
 @Composable

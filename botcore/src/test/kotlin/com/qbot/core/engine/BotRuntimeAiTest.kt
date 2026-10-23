@@ -44,6 +44,12 @@ class BotRuntimeAiTest {
     /** 记录实际发出的消息体，供断言 */
     private val sentMessages = CopyOnWriteArrayList<String>()
 
+    /** 记录上传表情包的请求体（url 上传），供断言 */
+    private val uploadedImages = CopyOnWriteArrayList<String>()
+
+    /** 置 true 时上传接口返回 500，验证"发不出图不影响文字" */
+    private var uploadShouldFail = false
+
     private var llmStatusCode = 200
     private var llmBody = """{"choices":[{"message":{"content":"AI 的回答"}}]}"""
 
@@ -51,6 +57,7 @@ class BotRuntimeAiTest {
     fun setUp() {
         llmStatusCode = 200
         llmBody = """{"choices":[{"message":{"content":"AI 的回答"}}]}"""
+        uploadShouldFail = false
         server = MockWebServer()
         server.dispatcher =
             object : Dispatcher() {
@@ -61,6 +68,16 @@ class BotRuntimeAiTest {
 
                         request.path == "/v1/chat/completions" ->
                             MockResponse().setResponseCode(llmStatusCode).setBody(llmBody)
+
+                        // 富媒体上传：走 URL，平台自己转存
+                        request.path!!.startsWith("/v2/groups/") && request.path!!.endsWith("/files") -> {
+                            uploadedImages += request.body.readUtf8()
+                            if (uploadShouldFail) {
+                                MockResponse().setResponseCode(500).setBody("""{"code":500}""")
+                            } else {
+                                MockResponse().setBody("""{"file_info":"FILE123"}""")
+                            }
+                        }
 
                         request.path!!.startsWith("/v2/groups/") -> {
                             sentMessages += request.body.readUtf8()
@@ -96,11 +113,26 @@ class BotRuntimeAiTest {
             raw = buildJsonObject { },
         )
 
+    /** 带图的消息（ attachments 里第一张图的地址）。 */
+    private fun imageMessage(url: String) =
+        IncomingMessage(
+            kind = MessageKind.GROUP_AT,
+            eventType = "GROUP_AT_MESSAGE_CREATE",
+            messageId = "msg-img",
+            content = "",
+            targetId = "group-openid",
+            senderId = "user-openid",
+            timestampMillis = 1_700_000_000_000,
+            imageUrl = url,
+            raw = buildJsonObject { },
+        )
+
     private fun buildRuntime(
         scope: CoroutineScope,
         config: AiConfig,
         rules: List<Rule> = emptyList(),
         logSink: LogSink? = null,
+        memeHarvester: com.qbot.core.ai.MemeHarvester? = null,
     ): BotRuntime {
         val auth =
             AccessTokenManager(
@@ -133,6 +165,7 @@ class BotRuntimeAiTest {
                     history = InMemoryAiHistoryStore(),
                 ),
             aiConfigProvider = { config },
+            memeHarvester = memeHarvester,
         )
     }
 
@@ -262,6 +295,161 @@ class BotRuntimeAiTest {
 
             assertEquals(1, sentMessages.size)
             assertTrue(sentMessages[0].contains("AI 开小差了"))
+        }
+
+    @Test
+    fun `回复带表情标记时先发文字再发图`() =
+        runBlocking {
+            llmBody =
+                """{"choices":[{"message":{"content":"笑死 [表情:https://example.com/a.jpg]"}}]}"""
+
+            val logs = CopyOnWriteArrayList<LogEntry>()
+            val runtime =
+                buildRuntime(
+                    scope = this,
+                    config =
+                        AiConfig(
+                            enabled = true,
+                            baseUrl = server.url("/").toString(),
+                            apiKey = "sk-test",
+                            model = "deepseek-chat",
+                        ),
+                    logSink = capturingSink(logs),
+                )
+
+            runtime.onMessage(message("看这个"))
+            awaitOutcome(logs, "AI 已回复")
+            // 发图在文字之后，等它也落地
+            awaitOutcome(logs, "AI 已回复")
+            while (sentMessages.size < 2) {
+                delay(50)
+            }
+
+            // 第一条：纯文字，且标记已被剥掉
+            assertTrue("标记不该出现在文字里", !sentMessages[0].contains("[表情:"))
+            assertTrue(sentMessages[0].contains("笑死"))
+            assertTrue("文字仍带被动回复 id", sentMessages[0].contains("msg-1"))
+            // 第二条：富媒体，file_info 来自上传返回值
+            assertTrue(sentMessages[1].contains("\"msg_type\":7"))
+            assertTrue(sentMessages[1].contains("\"file_info\":\"FILE123\""))
+            // 上传走的是 URL 通道，不是把图读进内存
+            assertTrue(uploadedImages.isNotEmpty())
+            assertTrue(uploadedImages[0].contains("https://example.com/a.jpg"))
+        }
+
+    @Test
+    fun `纯表情包回复只发图不发文字`() =
+        runBlocking {
+            llmBody = """{"choices":[{"message":{"content":"[表情:https://example.com/b.jpg]"}}]}"""
+
+            val logs = CopyOnWriteArrayList<LogEntry>()
+            val runtime =
+                buildRuntime(
+                    scope = this,
+                    config =
+                        AiConfig(
+                            enabled = true,
+                            baseUrl = server.url("/").toString(),
+                            apiKey = "sk-test",
+                            model = "deepseek-chat",
+                        ),
+                    logSink = capturingSink(logs),
+                )
+
+            runtime.onMessage(message("来个表情"))
+            awaitOutcome(logs, "AI 已回复")
+            while (uploadedImages.isEmpty()) {
+                delay(50)
+            }
+            delay(300)
+
+            // 只有一条媒体消息，没有空文字消息
+            assertEquals(1, sentMessages.size)
+            assertTrue(sentMessages[0].contains("\"msg_type\":7"))
+        }
+
+    @Test
+    fun `表情包上传失败时文字照常发出`() =
+        runBlocking {
+            uploadShouldFail = true
+            llmBody =
+                """{"choices":[{"message":{"content":"不倒这个 [表情:https://example.com/c.jpg]"}}]}"""
+
+            val logs = CopyOnWriteArrayList<LogEntry>()
+            val runtime =
+                buildRuntime(
+                    scope = this,
+                    config =
+                        AiConfig(
+                            enabled = true,
+                            baseUrl = server.url("/").toString(),
+                            apiKey = "sk-test",
+                            model = "deepseek-chat",
+                        ),
+                    logSink = capturingSink(logs),
+                )
+
+            runtime.onMessage(message("讲个笑话"))
+            awaitOutcome(logs, "AI 已回复")
+            delay(300)
+
+            // 文字照常，图被静默放弃
+            assertEquals(1, sentMessages.size)
+            assertTrue(sentMessages[0].contains("不倒这个"))
+        }
+
+    @Test
+    fun `带图的消息会被收进表情包库`() =
+        runBlocking {
+            val harvested = CopyOnWriteArrayList<String>()
+            val logs = CopyOnWriteArrayList<LogEntry>()
+            val runtime =
+                buildRuntime(
+                    scope = this,
+                    config =
+                        AiConfig(
+                            enabled = true,
+                            baseUrl = server.url("/").toString(),
+                            apiKey = "sk-test",
+                            model = "deepseek-chat",
+                        ),
+                    logSink = capturingSink(logs),
+                    memeHarvester = { url -> harvested += url },
+                )
+
+            runtime.onMessage(imageMessage("https://example.com/group-meme.jpg"))
+            awaitOutcome(logs, "AI 已回复")
+
+            while (harvested.isEmpty()) {
+                delay(50)
+            }
+            assertEquals(listOf("https://example.com/group-meme.jpg"), harvested)
+        }
+
+    @Test
+    fun `没图的消息不会触发收图`() =
+        runBlocking {
+            val harvested = CopyOnWriteArrayList<String>()
+            val logs = CopyOnWriteArrayList<LogEntry>()
+            val runtime =
+                buildRuntime(
+                    scope = this,
+                    config =
+                        AiConfig(
+                            enabled = true,
+                            baseUrl = server.url("/").toString(),
+                            apiKey = "sk-test",
+                            model = "deepseek-chat",
+                        ),
+                    logSink = capturingSink(logs),
+                    memeHarvester = { url -> harvested += url },
+                )
+
+            runtime.onMessage(message("今天天气如何"))
+            awaitOutcome(logs, "AI 已回复")
+            delay(300)
+
+            assertTrue(harvested.isEmpty())
         }
 
     private fun countRequestsTo(path: String): Int =

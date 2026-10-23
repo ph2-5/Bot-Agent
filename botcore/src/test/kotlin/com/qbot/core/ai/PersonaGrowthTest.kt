@@ -65,7 +65,15 @@ class PersonaGrowthTest {
         voice: String = base.voice,
         interests: String = base.interests,
         bounds: String = base.bounds,
-    ) = PersonaSections(identity, traits, voice, interests, bounds).render()
+        quirks: String = base.quirks,
+    ) = PersonaSections(
+        identity = identity,
+        traits = traits,
+        voice = voice,
+        interests = interests,
+        bounds = bounds,
+        quirks = quirks,
+    ).render()
 
     @Test
     fun `破壳保留种子身份并给出成长日记`() =
@@ -218,6 +226,56 @@ class PersonaGrowthTest {
 
     private fun stats() =
         GrowthStats(pendingMessages = 180, daysSinceLastGrowth = 2, growthCount = 3)
+
+    @Test
+    fun `破壳漏写毛病段时用种子补上而不是整次失败`() =
+        runBlocking {
+            // 模型只给了五段：不能为了一段扔掉一整次出生
+            enqueue(
+                PersonaSections(
+                    identity = PersonaSeed.NERD.identity,
+                    traits = "较真、爱查证。",
+                    voice = "先说「严格讲」。",
+                    interests = "历史细节、语言源流。",
+                    bounds = "不冒充群友；不知道就说不知道；不用 Markdown。",
+                ).render(),
+            )
+            val result = growth.birth(PersonaSeed.NERD, emptyList(), null, config())
+            assertEquals(PersonaSeed.NERD.flaw, PersonaSections.parse(result.prompt)!!.quirks)
+        }
+
+    @Test
+    fun `毛病写成太认真这类假缺点必须放弃`() =
+        runBlocking {
+            enqueue(draftOf(quirks = "我有时候太认真，对自己要求高，容易钻牛角尖。"))
+            val error =
+                runCatching { growth.grow(current, emptyList(), stats(), config()) }
+                    .exceptionOrNull()
+            assertTrue("假缺点必须拦下", error is IllegalArgumentException)
+            assertTrue(
+                "报错要点明是假缺点，实际=${error!!.message}",
+                error.message.orEmpty().contains("优点"),
+            )
+        }
+
+    @Test
+    fun `微调漏写毛病段时保留原来的，不当作删除`() =
+        runBlocking {
+            enqueue(
+                PersonaSections(
+                    identity = base.identity,
+                    traits = base.traits,
+                    voice = base.voice,
+                    interests = base.interests,
+                    bounds = base.bounds,
+                ).render(),
+            )
+            val result = growth.grow(current, emptyList(), stats(), config())!!
+            assertTrue(
+                "漏写不等于想删；毛病段删了就长不回来了",
+                PersonaSections.parse(result.prompt)!!.hasQuirks,
+            )
+        }
 
     @Test
     fun `模型说没什么可学时不产出新版本`() =

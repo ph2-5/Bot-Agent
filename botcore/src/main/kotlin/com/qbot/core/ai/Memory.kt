@@ -288,6 +288,13 @@ data class MemoryContext(
     val group: GroupDigest? = null,
     val quoted: QuotedMessage? = null,
     val insult: InsultContext? = null,
+    /**
+     * 社交上下文：对这个人什么关系、我自己什么心情、群里最近怎么说。
+     *
+     * 由 BotRuntime 在 [buildContext] 之后填入——它需要查关系表和梗库，
+     * 而 MemoryPipeline 只管记忆，不该背这两个依赖。
+     */
+    val social: SocialContext? = null,
 )
 
 /**

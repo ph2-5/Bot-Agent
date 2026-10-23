@@ -9,6 +9,9 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -110,9 +113,11 @@ class OpenApi(
         replyMessageId: String? = null,
         eventId: String? = null,
         msgType: Int = MsgType.TEXT,
+        /** 富媒体消息的 file_info；非空时忽略 content，走 msg_type=7 */
+        mediaFileInfo: String? = null,
     ): SendResult {
         require(groupOpenId.isNotBlank()) { "groupOpenId 不能为空" }
-        val payload = buildSendBody(content, replyMessageId, eventId, msgType)
+        val payload = buildSendBody(content, replyMessageId, eventId, msgType, mediaFileInfo)
         val body =
             withContext(Dispatchers.IO) {
                 call("POST", "/v2/groups/$groupOpenId/messages", payload, retryOnAuthError = true)
@@ -153,13 +158,48 @@ class OpenApi(
         replyMessageId: String?,
         eventId: String?,
         msgType: Int,
+        mediaFileInfo: String? = null,
     ): RequestBody =
         buildJsonObject {
-            put("content", content)
-            put("msg_type", msgType)
+            if (mediaFileInfo.isNullOrBlank()) {
+                put("content", content)
+                put("msg_type", msgType)
+            } else {
+                // 富媒体：content 必须为空，由 media.file_info 承载
+                put("msg_type", MsgType.MEDIA)
+                put("media", buildJsonObject { put("file_info", mediaFileInfo) })
+            }
             replyMessageId?.let { put("msg_id", it) }
             eventId?.let { put("event_id", it) }
         }.toString().toRequestBody(jsonMediaType)
+
+    /**
+     * 上传一张网络图片到群聊，返回 file_info（供 msg_type=7 使用）。
+     *
+     * 走 URL 上传：平台自己去下载转存，我们不用把图读进内存。
+     * 失败返回 null——发不出图只是少个表情，不该影响文字回复。
+     */
+    suspend fun uploadGroupImage(
+        groupOpenId: String,
+        imageUrl: String,
+    ): String? {
+        if (groupOpenId.isBlank() || imageUrl.isBlank()) return null
+        val payload =
+            buildJsonObject {
+                put("file_type", 1) // 1 = 图片
+                put("url", imageUrl)
+                put("srv_send_msg", false)
+            }.toString().toRequestBody(jsonMediaType)
+        val body =
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    call("POST", "/v2/groups/$groupOpenId/files", payload, retryOnAuthError = true)
+                }.getOrNull()
+            } ?: return null
+        return runCatching {
+            json.parseToJsonElement(body).jsonObject["file_info"]?.jsonPrimitive?.contentOrNull
+        }.getOrNull()?.takeIf { it.isNotBlank() }
+    }
 
     /**
      * 执行一次带鉴权的 HTTP 调用。

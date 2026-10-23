@@ -97,7 +97,7 @@ class PersonaResolverTest {
 
             assertEquals(PersonaSource.PROFILE, resolved.source)
             assertEquals(PersonaStage.GROWING, resolved.stage)
-            assertTrue("骨架必须含五段标记", resolved.prompt.contains("[身份]"))
+            assertTrue("骨架必须含身份段标记", resolved.prompt.contains("[身份]"))
             assertTrue("应使用档案自己的种子", resolved.prompt.contains("话最少"))
         }
 
@@ -130,7 +130,7 @@ class PersonaResolverTest {
             assertEquals(PersonaSource.EMBRYO, resolved.source)
             assertFalse("空 system 会让模型退化成客服腔", resolved.prompt.isBlank())
             assertTrue(
-                "骨架必须能被解析成完整五段",
+                "骨架必须能被解析成完整人格",
                 PersonaSections.parse(resolved.prompt)?.isComplete == true,
             )
         }
