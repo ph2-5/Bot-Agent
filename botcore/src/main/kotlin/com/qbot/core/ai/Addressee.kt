@@ -124,12 +124,24 @@ object AddresseeDetector {
 
     private fun startsWithName(head: String, name: String): Boolean {
         if (name.isBlank()) return false
-        return head.startsWith(name) ||
-            head.startsWith("@$name") ||
-            head.startsWith("$name，") ||
-            head.startsWith("$name,") ||
-            head.startsWith("$name：") ||
-            head.startsWith("$name:")
+        // 群友很少叫全名：设定「过去的阿远」，群里只喊「阿远」。
+        // 这里与 BotNameMatcher 用同一套后缀规则（最短 2 字），
+        // 否则「阿远你个傻福」会被判成"对全群说"（审计：叫简称识别不到）。
+        val candidates =
+            buildList {
+                add(name)
+                for (len in name.length - 1 downTo BotNameMatcher.MIN_SUFFIX) {
+                    add(name.takeLast(len))
+                }
+            }
+        return candidates.any { candidate ->
+            head.startsWith(candidate) ||
+                head.startsWith("@$candidate") ||
+                head.startsWith("$candidate，") ||
+                head.startsWith("$candidate,") ||
+                head.startsWith("$candidate：") ||
+                head.startsWith("$candidate:")
+        }
     }
 
     private fun nameLookup(recent: List<RoomMessage>): Map<String, String> =

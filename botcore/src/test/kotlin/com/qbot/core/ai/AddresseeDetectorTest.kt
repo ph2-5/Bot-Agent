@@ -114,6 +114,31 @@ class AddresseeDetectorTest {
     }
 
     @Test
+    fun `开头喊机器人简称时认为是对机器人说的`() {
+        // 群里没有人叫这个全名，群友只喊后两个字；过去会被判成"对全群说"
+        val addressee =
+            AddresseeDetector.infer(
+                message("阿远你个傻福"),
+                recent,
+                botNames = listOf("过去的阿远"),
+                selfId = "bot-1",
+            )
+        assertEquals(AddresseeKind.BOT, addressee.kind)
+    }
+
+    @Test
+    fun `名字后缀不会把普通词误判成叫机器人`() {
+        val addressee =
+            AddresseeDetector.infer(
+                message("远远不够啊"),
+                recent,
+                botNames = listOf("过去的阿远"),
+                selfId = "bot-1",
+            )
+        assertEquals(AddresseeKind.GROUP, addressee.kind)
+    }
+
+    @Test
     fun `上一条不是提问时不做对话对象猜测`() {
         val addressee =
             AddresseeDetector.infer(
