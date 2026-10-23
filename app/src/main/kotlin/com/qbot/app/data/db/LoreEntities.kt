@@ -110,6 +110,10 @@ interface LoreDao {
 
     @Query("DELETE FROM persona_lore WHERE personaId IS :personaId")
     suspend fun clearPersona(personaId: Long?)
+
+    /** 导入备份前整表清空：备份里是完整设定集，不清会残留上一份的旧梗/旧人。 */
+    @Query("DELETE FROM persona_lore")
+    suspend fun clearAll()
 }
 
 @Dao

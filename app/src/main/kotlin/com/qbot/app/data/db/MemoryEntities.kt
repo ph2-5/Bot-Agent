@@ -196,6 +196,23 @@ interface RoomMessageDao {
         externalId: String,
     ): Int
 
+    /**
+     * 导入备份时去重（机器人自己的发言）。
+     *
+     * 这类消息没有平台 id，只能按「同一会话 + 同一时间 + 同样内容」判断是不是同一条，
+     * 否则重复导入同一份备份会让群背景翻倍。
+     */
+    @Query(
+        "SELECT COUNT(*) FROM room_messages WHERE scopeKey = :scopeKey " +
+            "AND role = :role AND content = :content AND timestampMillis = :at",
+    )
+    suspend fun countSame(
+        scopeKey: String,
+        role: String,
+        content: String,
+        at: Long,
+    ): Int
+
     @Query(
         """
         DELETE FROM room_messages
@@ -378,6 +395,19 @@ interface PersonaDao {
         seedId: String?,
         frozen: Boolean,
         at: Long,
+    )
+
+    /**
+     * 导入备份时恢复成长次数。
+     *
+     * 只恢复计数，不恢复 `msgCursor` / `birthAt` / `lastGrownAt`：
+     * 成长节奏属于"这台设备上长到哪儿了"，搬过去会让节奏错乱；
+     * 而"已经成长过几次"是人格履历，换机后应当保留。
+     */
+    @Query("UPDATE personas SET growthCount = :count WHERE id = :id")
+    suspend fun setGrowthCount(
+        id: Long,
+        count: Int,
     )
 
     /**

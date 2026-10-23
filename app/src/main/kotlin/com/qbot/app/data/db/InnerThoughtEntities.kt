@@ -74,6 +74,23 @@ interface InnerThoughtDao {
     )
     suspend fun trim(keep: Int)
 
+    /**
+     * 导入备份时去重：同一次内心（同一会话、同一个人、同一时间点、同一句话）。
+     *
+     * 内心戏没有平台消息 id，只能靠这四个字段判断；
+     * 不加这一步，重复导入同一份备份会把"忍过谁"翻倍。
+     */
+    @Query(
+        "SELECT COUNT(*) FROM inner_thoughts WHERE groupId IS :groupId " +
+            "AND senderId IS :senderId AND spoken = :spoken AND createdAt = :at",
+    )
+    suspend fun countSame(
+        groupId: String?,
+        senderId: String?,
+        spoken: String,
+        at: Long,
+    ): Int
+
     @Query("DELETE FROM inner_thoughts")
     suspend fun clear()
 }

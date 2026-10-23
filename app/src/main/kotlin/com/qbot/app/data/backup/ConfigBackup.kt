@@ -25,7 +25,7 @@ import kotlinx.serialization.json.Json
  */
 @Serializable
 data class ConfigBackup(
-    val version: Int = 5,
+    val version: Int = CURRENT_VERSION,
     @SerialName("exported_at") val exportedAt: Long,
     val credentials: CredentialsBackup? = null,
     val ai: AiBackup? = null,
@@ -58,6 +58,14 @@ data class ConfigBackup(
     @SerialName("inner_thoughts") val innerThoughts: List<InnerThoughtBackup> = emptyList(),
 ) {
     companion object {
+        /**
+         * 当前备份格式版本。
+         *
+         * 导入时据此判断备份是否来自更新版本：字段能忽略，但语义不能猜，
+         * 所以旧版 App 导入新版备份要明确提示"部分内容未导入"，而不是静默丢掉。
+         */
+        const val CURRENT_VERSION = 5
+
         private val json =
             Json {
                 ignoreUnknownKeys = true

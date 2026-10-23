@@ -1556,6 +1556,10 @@ class BotController(
 
         var applied = 0
 
+        // 备份来自更新版本时字段会被 ignoreUnknownKeys 静默忽略，
+        // 但语义猜不了（比如新版本把某字段换成了另一种含义），必须明确提示。
+        val newerVersion = backup.version > ConfigBackup.CURRENT_VERSION
+
         backup.credentials?.takeIf { it.appId.isNotBlank() }?.let {
             settings.saveCredentials(it.appId, it.clientSecret)
             applied++
@@ -1676,6 +1680,7 @@ class BotController(
             seedId: String?,
             frozen: Boolean,
             isActive: Boolean,
+            growthCount: Int = 0,
         ): Long {
             val stage =
                 runCatching { PersonaStage.valueOf(stageName) }
@@ -1699,6 +1704,9 @@ class BotController(
                     profileNew++
                     created
                 }
+            if (growthCount > 0) {
+                runCatching { personaRepository.restoreGrowthCount(id, growthCount) }
+            }
             if (isActive) personaRepository.activate(id)
             return id
         }
@@ -1750,6 +1758,7 @@ class BotController(
                     seedId = dto.seedId,
                     frozen = dto.frozen,
                     isActive = dto.isActive,
+                    growthCount = dto.growthCount,
                 )
             }
             applied++
@@ -1807,13 +1816,13 @@ class BotController(
             runCatching {
                 val names = personaRepository.all().associateBy { it.name }
                 val dao = database.loreDao()
-                dao.clearPersona(null)
+                // 备份里是完整设定集：整表替换，避免恢复后还残留旧人格的梗/旧认识的人
+                dao.clearAll()
                 backup.lore.forEach { dto ->
                     val personaId = dto.personaName?.let { names[it]?.id }
-                    val old = dao.find(personaId, dto.kind, dto.name, dto.scopeGroupId)
                     dao.upsert(
                         LoreEntity(
-                            id = old?.id ?: 0,
+                            id = 0,
                             personaId = personaId,
                             kind = dto.kind,
                             name = dto.name,
@@ -1821,7 +1830,7 @@ class BotController(
                             scopeGroupId = dto.scopeGroupId,
                             enabled = dto.enabled,
                             source = dto.source,
-                            createdAt = old?.createdAt ?: System.currentTimeMillis(),
+                            createdAt = System.currentTimeMillis(),
                             updatedAt = System.currentTimeMillis(),
                         ),
                     )
@@ -1876,9 +1885,14 @@ class BotController(
                     val scopeKey = dto.scopeKey.trim()
                     val content = dto.content
                     if (scopeKey.isEmpty() || content.isBlank()) return@forEach
-                    // 平台消息 id 去重；没有 id 的（机器人自己的发言）只能照单插入
+                    // 平台消息 id 去重；没有 id 的（机器人自己的发言）靠内容+时间兜底
                     val externalId = dto.externalId?.takeIf { it.isNotBlank() }
                     if (externalId != null && dao.countByExternalId(scopeKey, externalId) > 0) {
+                        return@forEach
+                    }
+                    val timestamp = dto.timestampMillis.takeIf { it > 0 } ?: System.currentTimeMillis()
+                    val role = dto.role.takeIf { it == "assistant" } ?: "user"
+                    if (externalId == null && dao.countSame(scopeKey, role, content, timestamp) > 0) {
                         return@forEach
                     }
                     dao.insert(
@@ -1886,10 +1900,9 @@ class BotController(
                             scopeKey = scopeKey,
                             senderId = dto.senderId,
                             senderName = dto.senderName,
-                            role = dto.role.takeIf { it == "assistant" } ?: "user",
+                            role = role,
                             content = content,
-                            timestampMillis =
-                                dto.timestampMillis.takeIf { it > 0 } ?: System.currentTimeMillis(),
+                            timestampMillis = timestamp,
                             isAt = dto.isAt,
                             externalId = externalId,
                             decision = dto.decision,
@@ -1908,6 +1921,11 @@ class BotController(
                 val dao = database.innerThoughtDao()
                 backup.innerThoughts.forEach { dto ->
                     if (dto.spoken.isBlank() && dto.thought.isBlank()) return@forEach
+                    val createdAt = dto.createdAt.takeIf { it > 0 } ?: System.currentTimeMillis()
+                    // 内心戏没有平台 id，按会话+人+时间+原话去重，重复导入不翻倍
+                    if (dao.countSame(dto.groupId, dto.senderId, dto.spoken, createdAt) > 0) {
+                        return@forEach
+                    }
                     dao.insert(
                         InnerThoughtEntity(
                             groupId = dto.groupId,
@@ -1915,7 +1933,7 @@ class BotController(
                             senderName = dto.senderName,
                             spoken = dto.spoken,
                             thought = dto.thought.take(600),
-                            createdAt = dto.createdAt.takeIf { it > 0 } ?: System.currentTimeMillis(),
+                            createdAt = createdAt,
                             personaId = dto.personaName?.let { personaIdsForMemory[it] },
                         ),
                     )
@@ -2060,7 +2078,9 @@ class BotController(
                 "记忆 $factCount 条、最近对话 $messageCount 条、内心戏 $thoughtCount 条、" +
                 "配置项 $applied",
         )
-        return "导入完成：规则 $ruleCount 条，人格档案新增 $profileNew、更新 $profileUpdated，" +
+        return (if (newerVersion) "提示：备份格式版本 ${backup.version} 高于本机支持的 " +
+            "${ConfigBackup.CURRENT_VERSION}，部分新内容可能未导入。\n" else "") +
+            "导入完成：规则 $ruleCount 条，人格档案新增 $profileNew、更新 $profileUpdated，" +
             "人设覆盖新增 $personaNew、更新 $personaUpdated，" +
             "备注名 $nameCount，群名片 $groupNameCount，经验 $lessonCount 条，" +
             "人设设定 $loreCount 条，说话约束 $styleCount 条，" +

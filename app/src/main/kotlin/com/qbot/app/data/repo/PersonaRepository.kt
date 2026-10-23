@@ -278,6 +278,14 @@ class PersonaRepository(
         personaDao.updateMeta(id, stage.name, seedId, frozen, System.currentTimeMillis())
     }
 
+    /** 导入备份时恢复成长次数（成长节奏相关的游标/时间不恢复）。 */
+    suspend fun restoreGrowthCount(
+        id: Long,
+        count: Int,
+    ) {
+        personaDao.setGrowthCount(id, count.coerceAtLeast(0))
+    }
+
     /** 模型判定"没有值得吸收的"时，只把游标推过去，等下一批消息。 */
     suspend fun advanceCursor(
         id: Long,
