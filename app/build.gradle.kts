@@ -40,6 +40,11 @@ android {
                 storePassword = props.getProperty("STORE_PASSWORD").orEmpty()
                 keyAlias = props.getProperty("KEY_ALIAS").orEmpty()
                 keyPassword = props.getProperty("KEY_PASSWORD").orEmpty()
+                // 与历史发布包保持一致：只启 v2。
+                // 若交给 AGP 默认值，CI 可能额外写入 v1/v3，与已注册的签名方案不一致。
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = false
             }
         }
     }
