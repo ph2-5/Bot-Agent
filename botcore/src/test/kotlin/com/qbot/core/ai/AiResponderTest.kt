@@ -638,6 +638,82 @@ class AiResponderTest {
             assertTrue("应说明插别人对话很怪", body.contains("插进去通常很怪"))
         }
 
+    @Test
+    fun `看图时 DeepSeek 端点自动使用视觉模型`() {
+        // 默认主模型 deepseek-chat 不接受图片，留空 visionModel 时必须自动换
+        assertEquals(
+            "deepseek-flash",
+            AiConfig(baseUrl = "https://api.deepseek.com").modelForImage(),
+        )
+        // 用户显式配置优先
+        assertEquals(
+            "my-vl",
+            AiConfig(baseUrl = "https://api.deepseek.com", visionModel = "my-vl").modelForImage(),
+        )
+        // 非 DeepSeek 端点不能瞎猜，沿用主模型
+        assertEquals(
+            "gpt-4o",
+            AiConfig(baseUrl = "https://api.openai.com", model = "gpt-4o").modelForImage(),
+        )
+    }
+
+    @Test
+    fun `看图前会先把图片转成 data URL`() =
+        runBlocking {
+            val inlining =
+                AiResponder(
+                    client = client,
+                    history = history,
+                    imageInliner = ImageInliner { "data:image/png;base64,AAAA" },
+                )
+
+            enqueueAnswer("看到了")
+            inlining.reply(
+                message("这是什么", imageUrl = "https://gchat.qpic.cn/tmp.jpg"),
+                config(),
+            )
+
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue("应带内联图片，实际=$body", body.contains("data:image/png;base64,AAAA"))
+            assertFalse("不应再把临时链接交给模型", body.contains("gchat.qpic.cn"))
+        }
+
+    @Test
+    fun `看图 400 不会被误判成工具不兼容`() =
+        runBlocking {
+            val library = FakeMemeLibrary()
+            val withTools =
+                AiResponder(
+                    client = client,
+                    history = history,
+                    tools = ToolRegistry(listOf(SendMemeTool(library))),
+                )
+
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(400)
+                    .setBody("""{"error":{"message":"this model does not support image input"}}"""),
+            )
+
+            val error =
+                runCatching {
+                    withTools.reply(
+                        message("这是什么", imageUrl = "https://a.com/1.jpg"),
+                        config(),
+                    )
+                }.exceptionOrNull()
+            assertTrue(error is LlmException)
+
+            // 下一轮纯文字对话仍应带 tools：一次看图失败不能把表情包能力永久关掉
+            enqueueMemeToolCall()
+            enqueueAnswer("好")
+            withTools.replyDetailed(message("发个表情包"), config())
+
+            server.takeRequest() // 看图的 400 请求
+            val textRequest = server.takeRequest().body.readUtf8()
+            assertTrue("工具不应因看图失败被永久禁用，实际=$textRequest", textRequest.contains("\"tools\""))
+        }
+
     // ---------- 工具调用 ----------
 
     @Test

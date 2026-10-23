@@ -95,6 +95,19 @@ data class AiConfig(
     val isReady: Boolean
         get() = enabled && apiKey.isNotBlank() && model.isNotBlank() && baseUrl.isNotBlank()
 
+    /**
+     * 带图时实际使用的模型名。
+     *
+     * 用户填了 [visionModel] 就用它；没填时，DeepSeek 官方端点退回
+     * `deepseek-flash`——默认的 `deepseek-chat` 不接受图片，若沿用它会直接 400，
+     * 表现就是「机器人完全看不见图」。其他服务商仍沿用主模型，
+     * 因为无法假设它们也有同名视觉模型。
+     */
+    fun modelForImage(): String =
+        visionModel.ifBlank {
+            if (baseUrl.contains("deepseek", ignoreCase = true)) "deepseek-flash" else model
+        }
+
     companion object {
         /**
          * 2.2.0 及更早版本的出厂默认提示词。
@@ -254,6 +267,13 @@ class AiResponder(
      * 避免新人设继续沿用旧人设的语气与话题。
      */
     private val conversationScopeProvider: (suspend (IncomingMessage) -> String?)? = null,
+    /**
+     * 图片内联：把 QQ 的临时图片链接下载后转成 data URL。
+     *
+     * 默认原样返回地址（不下载），这样纯测试/外部调用路径不发额外网络请求。
+     * Android 侧传入 [RemoteImageLoader]，避免链接过期或防盗链导致模型看不到图。
+     */
+    private val imageInliner: ImageInliner = ImageInliner { it },
 ) {
     /**
      * 服务商不支持 tools 时置位，后续请求不再携带，避免每条消息都白试一次。
@@ -412,6 +432,12 @@ class AiResponder(
                 }
             }
         val systemPrompt = personaResolver?.invoke(message) ?: config.systemPrompt
+        // 先本地下载再交图：QQ 图片链接带签名、会过期，也有防盗链；
+        // 直接让模型去抓，失败时用户只看到"看图失败"。下载失败则回退原地址。
+        val imageUrl =
+            message.imageUrl?.let { raw ->
+                runCatching { imageInliner.inline(raw) }.getOrNull() ?: raw
+            }
 
         lockFor(key).withLock {
             // 清空指令不调用模型，直接重置上下文
@@ -434,12 +460,12 @@ class AiResponder(
 
             val result =
                 try {
-                    callLlmWithTools(stored, question, config, memory, systemPrompt, message.imageUrl)
+                    callLlmWithTools(stored, question, config, memory, systemPrompt, imageUrl)
                 } catch (e: ContextTooLongException) {
                     // 估算偏差或历史里混进超长消息：砍掉一半历史重试一次，
                     // 仍失败就把异常抛给调用方走兜底话术。
                     val halved = stored.drop(stored.size / 2)
-                    callLlmWithTools(halved, question, config, memory, systemPrompt, message.imageUrl)
+                    callLlmWithTools(halved, question, config, memory, systemPrompt, imageUrl)
                 }
 
             // 成功后才写入历史：失败的请求不应污染上下文。
@@ -723,13 +749,9 @@ class AiResponder(
         imageUrl: String?,
         useTools: Boolean,
     ): LlmReply {
-        // 带图时优先用视觉模型；没配就沿用主模型（用户可能主模型本来就支持图片）
+        // 带图时优先用视觉模型；没填时 DeepSeek 端点会自动退回 deepseek-flash
         val model =
-            if (!imageUrl.isNullOrBlank() && config.visionModel.isNotBlank()) {
-                config.visionModel
-            } else {
-                config.model
-            }
+            if (!imageUrl.isNullOrBlank()) config.modelForImage() else config.model
         val sendTools = useTools && !toolsUnsupported && !tools.isEmpty
 
         suspend fun call(withTools: Boolean): LlmReply =
@@ -750,7 +772,19 @@ class AiResponder(
             } catch (e: LlmException) {
                 // 一些 OpenAI 兼容端点不认识 tools，会直接 400。
                 // 只降级一次并记住，后续请求不再带工具；上下文超限另走裁剪逻辑。
-                if (sendTools && e.statusCode == 400 && e !is ContextTooLongException) {
+                //
+                // 但 400 不一定怪 tools：带图时也可能是「模型不支持图片」。
+                // 只有报文明确提到 tools/function，或本轮根本没带图时，
+                // 才认定是工具不兼容——否则一次看图失败会让表情包工具永久失效。
+                val looksLikeTools =
+                    e.message.orEmpty().lowercase().let {
+                        it.contains("tool") || it.contains("function")
+                    }
+                if (sendTools &&
+                    e.statusCode == 400 &&
+                    e !is ContextTooLongException &&
+                    (looksLikeTools || imageUrl.isNullOrBlank())
+                ) {
                     toolsUnsupported = true
                     call(false)
                 } else {

@@ -65,11 +65,13 @@ import com.qbot.core.ai.PersonaSeed
 import com.qbot.core.ai.PersonaStage
 import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.PersonaResolver
+import com.qbot.core.ai.RemoteImageLoader
 import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.SendMemeTool
 import com.qbot.core.ai.ThinkingMode
 import com.qbot.core.ai.ThinkingParams
 import com.qbot.core.ai.ToolRegistry
+import com.qbot.core.ai.WebSearchTool
 import com.qbot.core.api.OpenApi
 import com.qbot.core.auth.AccessTokenManager
 import com.qbot.core.engine.BotRuntime
@@ -236,12 +238,15 @@ class BotController(
     /** 反思与正式回复共用连接池 */
     private val reflectionClient by lazy { LlmClient(http = http, logger = logger) }
 
+    /** 聊天时学梗与主对话的 web_search 工具共用同一个搜索实现。 */
+    private val deepSeekSearch by lazy { DeepSeekSearch(http) }
+
     /** 聊天时学梗：遇到可疑词去搜一下，查到了就入库。 */
     private val slangLearner =
         SlangLearnerImpl(
             store = socialStore,
             client = reflectionClient,
-            search = DeepSeekSearch(http),
+            search = deepSeekSearch,
             config = { settings.aiConfig.value },
         )
 
@@ -1587,12 +1592,28 @@ class BotController(
                 personaResolver = { message -> personaResolver.promptFor(message) },
                 // 表情包：模型在回复里自主决定要不要发、发哪张。
                 // 图必须来自本地库（SendMemeTool 会校验），不能让它编 URL。
-                tools = ToolRegistry(listOf(SendMemeTool(socialStore))),
+                tools =
+                    ToolRegistry(
+                        listOf(
+                            SendMemeTool(socialStore),
+                            // 联网搜索：只有需要时效信息时模型才调用；
+                            // 开关关闭或非 DeepSeek 端点会直接拒绝，不产生费用。
+                            WebSearchTool(
+                                config = { settings.aiConfig.value },
+                                search = { query, cfg ->
+                                    deepSeekSearch.search(query, cfg.apiKey, cfg.baseUrl, 5)
+                                },
+                            ),
+                        ),
+                    ),
                 // 历史按当前生效的人设隔离：切换档案后自动新开一条线程，
                 // 新人格不会接着旧人格的语气和话题说话。
                 conversationScopeProvider = { message ->
                     personaResolver.resolve(message).personaId?.toString()
                 },
+                // QQ 图片链接带签名、会过期，先本地下载转 base64 再给视觉模型；
+                // 下载失败时回退原地址，行为与接入前一致。
+                imageInliner = RemoteImageLoader(http),
             )
 
         // 把应答器的最近用量转发到控制器流上，重建机器人时 UI 无需重新订阅
