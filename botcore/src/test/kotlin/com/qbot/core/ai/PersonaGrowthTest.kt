@@ -6,6 +6,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -153,7 +154,7 @@ class PersonaGrowthTest {
         runBlocking {
             enqueue(draftOf(interests = base.interests + " 还有外卖踩雷。"))
 
-            val result = growth.grow(current, emptyList(), stats(), config())
+            val result = growth.grow(current, emptyList(), stats(), config())!!
             assertEquals(listOf("兴趣"), result.changed)
             assertTrue("成长日记应点名兴趣段", result.note.contains("兴趣"))
         }
@@ -163,7 +164,7 @@ class PersonaGrowthTest {
         runBlocking {
             enqueue("```markdown\n" + draftOf() + "\n```")
 
-            val result = growth.grow(current, emptyList(), stats(), config())
+            val result = growth.grow(current, emptyList(), stats(), config())!!
             assertTrue("围栏应被清掉", result.prompt.startsWith("[身份]"))
         }
 
@@ -217,4 +218,12 @@ class PersonaGrowthTest {
 
     private fun stats() =
         GrowthStats(pendingMessages = 180, daysSinceLastGrowth = 2, growthCount = 3)
+
+    @Test
+    fun `模型说没什么可学时不产出新版本`() =
+        runBlocking {
+            enqueue("NO_CHANGE")
+            val result = growth.grow(current, emptyList(), stats(), config())
+            assertNull("应返回 null，表示这批消息没有值得吸收的", result)
+        }
 }

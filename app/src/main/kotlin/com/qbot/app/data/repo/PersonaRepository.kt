@@ -244,6 +244,14 @@ class PersonaRepository(
         personaDao.updateMeta(id, stage.name, seedId, frozen, System.currentTimeMillis())
     }
 
+    /** 模型判定"没有值得吸收的"时，只把游标推过去，等下一批消息。 */
+    suspend fun advanceCursor(
+        id: Long,
+        cursor: Long,
+    ) {
+        personaDao.advanceCursor(id, cursor)
+    }
+
     /** 破壳写回；返回 false 表示期间已经破过壳（并发保护）。 */
     suspend fun commitBirth(
         id: Long,

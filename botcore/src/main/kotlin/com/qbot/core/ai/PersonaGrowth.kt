@@ -381,7 +381,7 @@ class PersonaGrowth(private val client: LlmClient) {
         samples: List<RoomMessage>,
         stats: GrowthStats,
         config: AiConfig,
-    ): PersonaDraft {
+    ): PersonaDraft? {
         val transcript = renderSamples(samples)
         val system =
             "你是人格微调器。除 [身份] 外可以调整，[身份] 必须逐字保留。\n" +
@@ -391,8 +391,10 @@ class PersonaGrowth(private val client: LlmClient) {
                 "3. 只允许「把模糊的说法变具体」「补上还没提到的场景边界」，" +
                 "禁止新增身份、价值观或与原型冲突的性格；\n" +
                 "4. 不许把群友的说话风格写成自己的，也不要模仿某个具体的人；\n" +
-                "5. 宁可少改。没有值得吸收的东西就原样输出当前人格；\n" +
-                "6. 只输出五段正文，不要解释。"
+                "5. 宁可少改；\n" +
+                "6. **如果这批对话没有提供任何新东西**（全是闲聊复读、或人格里已经写过），" +
+                "只输出 NO_CHANGE 四个字，不要输出人格；\n" +
+                "7. 否则只输出五段正文，不要解释。"
         val user =
             buildString {
                 append("当前人格：\n---\n").append(current).append("\n---\n\n")
@@ -406,9 +408,11 @@ class PersonaGrowth(private val client: LlmClient) {
                     append("群聊样本（只参考语气与话题，不要照抄内容）：\n")
                     append(transcript).append("\n\n")
                 }
-                append("请输出（可能只是原样返回的）五段人格。")
+                append("这批对话值得吸收就输出五段人格，不值得就只输出 NO_CHANGE。")
             }
         val reply = ask(config, system, user, temperature = 0.4)
+        // 模型认为没什么可学：不写库、不写快照，只把游标推过去，等下一批
+        if (reply.trim().uppercase().startsWith("NO_CHANGE")) return null
         return PersonaGuard.guard(current, reply, requireSimilarity = true)
     }
 

@@ -50,6 +50,12 @@ class PersonaGrowthScheduler(
         /** 检查频率：不追求实时，十分钟一次足够 */
         const val TICK_MILLIS = 10 * 60_000L
 
+        /** 破壳前的询问冷却：半小时 */
+        private const val BIRTH_COOLDOWN_MILLIS = 30 * 60_000L
+
+        /** 成长期的询问冷却：一小时。节奏交给模型，这里只防止短时间反复烧 token */
+        private const val GROW_COOLDOWN_MILLIS = 60 * 60_000L
+
         /** 取样覆盖几个群 */
         private const val SAMPLE_SCOPES = 3
 
@@ -59,6 +65,14 @@ class PersonaGrowthScheduler(
 
     private val mutex = Mutex()
     private val growth = PersonaGrowth(client)
+
+    /**
+     * 上次真正询问模型的时间。
+     *
+     * 刻意放内存：重启后重新计时无所谓，但能保证"十次 tick 不会问十次"。
+     * 不落库是避免为一个纯节流值再加一列。
+     */
+    private var lastAskedAt = 0L
 
     fun start(scope: CoroutineScope): Job =
         scope.launch {
@@ -112,6 +126,16 @@ class PersonaGrowthScheduler(
         val profile = repo.active() ?: return
         if (profile.kind != PersonaKind.PROFILE || profile.frozen) return
 
+        // 冷却：tick 每十分钟一次，但不能每十分钟都去问模型
+        val now = clock()
+        val cooldown =
+            if (profile.stage == PersonaStage.EMBRYO) {
+                BIRTH_COOLDOWN_MILLIS
+            } else {
+                GROW_COOLDOWN_MILLIS
+            }
+        if (lastAskedAt > 0 && now - lastAskedAt < cooldown) return
+
         val pending = messages.countSince(profile.msgCursor)
         val action =
             PersonaGrowthPolicy.next(
@@ -124,14 +148,19 @@ class PersonaGrowthScheduler(
                         lastGrownAt = profile.lastGrownAt,
                     ),
                 pendingMessages = pending,
-                now = clock(),
                 config = config,
             )
 
         when (action) {
             GrowthAction.NONE -> Unit
-            GrowthAction.BIRTH -> birth(profile, ai)
-            GrowthAction.GROW -> grow(profile, pending, ai)
+            GrowthAction.BIRTH -> {
+                lastAskedAt = now
+                birth(profile, ai)
+            }
+            GrowthAction.GROW -> {
+                lastAskedAt = now
+                grow(profile, pending, ai)
+            }
         }
     }
 
@@ -192,8 +221,16 @@ class PersonaGrowthScheduler(
                     },
                 growthCount = profile.growthCount,
             )
-        val draft = growth.grow(profile.prompt, samples, stats, ai)
-        val cursor = messages.maxId() ?: 0
+        val cursorNow = messages.maxId() ?: 0
+        val draft =
+            growth.grow(profile.prompt, samples, stats, ai)
+                ?: run {
+                    // 模型认为这批对话没有新东西：推进游标，等下一批，不写快照
+                    repo.advanceCursor(profile.id, cursorNow)
+                    log("人格检查：这批消息没有值得吸收的，跳过")
+                    return false
+                }
+        val cursor = cursorNow
         val nextStage =
             if (profile.growthCount + 1 >= PersonaGrowthPolicy.MATURE_GROWTHS) {
                 PersonaStage.MATURE

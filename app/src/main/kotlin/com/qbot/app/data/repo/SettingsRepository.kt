@@ -285,32 +285,14 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
-    private fun readPersonaGrowthConfig(prefs: Preferences): PersonaGrowthConfig {
-        val defaults = PersonaGrowthConfig()
-        return PersonaGrowthConfig.normalize(
-            enabled = prefs[Keys.PERSONA_GROWTH_ENABLED] ?: defaults.enabled,
-            birthMessages = prefs[Keys.PERSONA_BIRTH_MESSAGES] ?: defaults.birthMessages,
-            growMessages = prefs[Keys.PERSONA_GROW_MESSAGES] ?: defaults.growMessages,
-            growIntervalHours =
-                prefs[Keys.PERSONA_GROW_INTERVAL] ?: defaults.growIntervalHours,
-        )
-    }
+    private fun readPersonaGrowthConfig(prefs: Preferences): PersonaGrowthConfig =
+        PersonaGrowthConfig(enabled = prefs[Keys.PERSONA_GROWTH_ENABLED] ?: true)
 
     fun savePersonaGrowthConfig(config: PersonaGrowthConfig) {
-        val normalized =
-            PersonaGrowthConfig.normalize(
-                enabled = config.enabled,
-                birthMessages = config.birthMessages,
-                growMessages = config.growMessages,
-                growIntervalHours = config.growIntervalHours,
-            )
-        _personaGrowthConfig.value = normalized
+        _personaGrowthConfig.value = config
         scope.launch {
             context.dataStore.edit { prefs ->
-                prefs[Keys.PERSONA_GROWTH_ENABLED] = normalized.enabled
-                prefs[Keys.PERSONA_BIRTH_MESSAGES] = normalized.birthMessages
-                prefs[Keys.PERSONA_GROW_MESSAGES] = normalized.growMessages
-                prefs[Keys.PERSONA_GROW_INTERVAL] = normalized.growIntervalHours
+                prefs[Keys.PERSONA_GROWTH_ENABLED] = config.enabled
             }
         }
     }

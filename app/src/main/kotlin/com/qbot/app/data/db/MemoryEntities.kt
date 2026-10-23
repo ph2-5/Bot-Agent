@@ -318,6 +318,18 @@ interface PersonaDao {
     @Query("DELETE FROM personas WHERE id = :id AND activeSlot IS NULL")
     suspend fun deleteIfInactive(id: Long): Int
 
+    /**
+     * 只推进游标，不动人格。
+     *
+     * 模型看完这批消息说「没什么可学的」时用它：既避免同样的消息被反复送去问，
+     * 又不会因为一次 NO_CHANGE 就假装"成长过"（growthCount 与 lastGrownAt 都不变）。
+     */
+    @Query("UPDATE personas SET msgCursor = :cursor WHERE id = :id")
+    suspend fun advanceCursor(
+        id: Long,
+        cursor: Long,
+    )
+
     /** 冻结 / 解冻、重抽种子、转手动等元数据更新 */
     @Query(
         "UPDATE personas SET stage = :stage, seedId = :seedId, frozen = :frozen, " +

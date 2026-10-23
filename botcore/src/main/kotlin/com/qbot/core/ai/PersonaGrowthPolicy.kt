@@ -1,44 +1,18 @@
 package com.qbot.core.ai
 
-/** 人格成长的用户可调参数（设置 → 智能 → 人格成长）。 */
+/**
+ * 人格成长的用户可调参数。
+ *
+ * 2.3.1 起只剩一个开关：**节奏交给模型自己判断**。
+ *
+ * 过去这里有三个滑杆（破壳消息数 / 成长消息数 / 最小间隔），
+ * 让用户去猜"多少条才够"，实际上没人知道答案，而且数字一设死，
+ * 冷清群永远不长、热闹群天天改。现在改成：有新消息就把它交给模型，
+ * 由模型判断"这批对话里有没有值得吸收的东西"——没有就回 NO_CHANGE。
+ */
 data class PersonaGrowthConfig(
     val enabled: Boolean = true,
-    /** 破壳所需消息数 */
-    val birthMessages: Int = 60,
-    /** 一次成长所需的新增消息数 */
-    val growMessages: Int = 150,
-    /**
-     * 两次成长的最小间隔（小时）。
-     *
-     * 这就是频率上限本身——不再额外叠"每天最多一次"的硬限，
-     * 否则用户把间隔调到 12 小时也永远触发不了。
-     * 默认 12 小时 ≈ 一天最多两次，每次改动不超过 15%，不会越改越花。
-     */
-    val growIntervalHours: Int = 12,
-) {
-    companion object {
-        const val MIN_BIRTH_MESSAGES = 20
-        const val MAX_BIRTH_MESSAGES = 200
-        const val MIN_GROW_MESSAGES = 50
-        const val MAX_GROW_MESSAGES = 500
-        const val MIN_INTERVAL_HOURS = 1
-        const val MAX_INTERVAL_HOURS = 72
-
-        fun normalize(
-            enabled: Boolean,
-            birthMessages: Int,
-            growMessages: Int,
-            growIntervalHours: Int,
-        ): PersonaGrowthConfig =
-            PersonaGrowthConfig(
-                enabled = enabled,
-                birthMessages = birthMessages.coerceIn(MIN_BIRTH_MESSAGES, MAX_BIRTH_MESSAGES),
-                growMessages = growMessages.coerceIn(MIN_GROW_MESSAGES, MAX_GROW_MESSAGES),
-                growIntervalHours =
-                    growIntervalHours.coerceIn(MIN_INTERVAL_HOURS, MAX_INTERVAL_HOURS),
-            )
-    }
-}
+)
 
 /** 判定成长所需的人格状态切片（只保留判定需要的字段）。 */
 data class PersonaGrowthState(
@@ -61,53 +35,37 @@ enum class GrowthAction {
 /**
  * 成长节奏的纯函数判定。
  *
- * 放在 botcore 而不是调度器里，是为了能脱离 Android / Room 直接单测边界值。
+ * 只回答一个问题：**这批新消息够不够触发一次"问模型"**。
+ * 真正的"要不要改"由模型决定（见 [PersonaGrowth.grow] 的 NO_CHANGE）；
+ * 两次询问之间的冷却在调度器里（内存计时，不落库）。
  */
 object PersonaGrowthPolicy {
-    /** 破壳的快速通道：消息不算多但已经等了一会儿 */
-    const val BIRTH_MIN_AGE_MILLIS = 30 * 60_000L
+    /** 破壳所需的最低消息量：太少会写出一个只会复读的假人格 */
+    const val BIRTH_MIN_MESSAGES = 20
 
-    /** 快速通道的最低消息量 */
-    const val BIRTH_FALLBACK_MESSAGES = 20
+    /** 成长期：有点新东西就可以问一次模型 */
+    const val GROW_MIN_MESSAGES = 10
 
-    /** 长时间没动静时的兜底：攒够这些就长一次，避免"没人聊天永远不长" */
-    const val IDLE_MESSAGES = 40
-    const val IDLE_INTERVAL_MILLIS = 7L * 24 * 3600 * 1000
+    /** 成熟期：间隔翻倍的效果落在消息量上，少打扰 */
+    const val MATURE_MIN_MESSAGES = 20
 
-    /** 成长到这个次数后进入 MATURE，间隔翻倍 */
+    /** 成长到这个次数后进入 MATURE */
     const val MATURE_GROWTHS = 8
 
     fun next(
         state: PersonaGrowthState,
         pendingMessages: Int,
-        now: Long,
         config: PersonaGrowthConfig = PersonaGrowthConfig(),
     ): GrowthAction {
         if (!config.enabled || state.frozen) return GrowthAction.NONE
 
         return when (state.stage) {
-            PersonaStage.EMBRYO -> {
-                val enough = pendingMessages >= config.birthMessages
-                val quick =
-                    pendingMessages >= BIRTH_FALLBACK_MESSAGES &&
-                        state.birthAt > 0 &&
-                        now - state.birthAt >= BIRTH_MIN_AGE_MILLIS
-                if (enough || quick) GrowthAction.BIRTH else GrowthAction.NONE
-            }
-
-            PersonaStage.GROWING, PersonaStage.MATURE -> {
-                val since =
-                    if (state.lastGrownAt <= 0) Long.MAX_VALUE else now - state.lastGrownAt
-                val base = config.growIntervalHours.coerceIn(1, 72) * 3_600_000L
-                val interval = if (state.stage == PersonaStage.MATURE) base * 2 else base
-                when {
-                    pendingMessages >= config.growMessages && since >= interval -> GrowthAction.GROW
-                    pendingMessages >= IDLE_MESSAGES && since >= IDLE_INTERVAL_MILLIS ->
-                        GrowthAction.GROW
-                    else -> GrowthAction.NONE
-                }
-            }
-
+            PersonaStage.EMBRYO ->
+                if (pendingMessages >= BIRTH_MIN_MESSAGES) GrowthAction.BIRTH else GrowthAction.NONE
+            PersonaStage.GROWING ->
+                if (pendingMessages >= GROW_MIN_MESSAGES) GrowthAction.GROW else GrowthAction.NONE
+            PersonaStage.MATURE ->
+                if (pendingMessages >= MATURE_MIN_MESSAGES) GrowthAction.GROW else GrowthAction.NONE
             // 用户手写的人设不参与自动成长
             PersonaStage.MANUAL -> GrowthAction.NONE
         }

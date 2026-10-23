@@ -158,11 +158,7 @@ private fun PersonaGrowthSubtitle(): String {
     val context = LocalContext.current
     val app = context.applicationContext as BotApplication
     val config by app.settings.personaGrowthConfig.collectAsState()
-    return if (config.enabled) {
-        "自动成长 开 · 每 ${config.growMessages} 条 / ${config.growIntervalHours} 小时"
-    } else {
-        "自动成长已关闭"
-    }
+    return if (config.enabled) "自动成长 开 · 由它自己判断" else "自动成长已关闭"
 }
 
 @Composable

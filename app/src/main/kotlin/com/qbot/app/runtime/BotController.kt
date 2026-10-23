@@ -953,12 +953,7 @@ class BotController(
                         },
                 personaGrowth =
                     settings.personaGrowthConfig.value.let { growth ->
-                        PersonaGrowthBackup(
-                            enabled = growth.enabled,
-                            birthMessages = growth.birthMessages,
-                            growMessages = growth.growMessages,
-                            growIntervalHours = growth.growIntervalHours,
-                        )
+                        PersonaGrowthBackup(enabled = growth.enabled)
                     },
                 displayNames =
                     database.identityDao().recent(1000).map { entry ->
@@ -1233,13 +1228,9 @@ class BotController(
         }
 
         backup.personaGrowth?.let { growth ->
+            // 2.3.1 起节奏由模型判断，旧备份里的三个数字不再生效，只保留开关
             settings.savePersonaGrowthConfig(
-                com.qbot.core.ai.PersonaGrowthConfig.normalize(
-                    enabled = growth.enabled,
-                    birthMessages = growth.birthMessages,
-                    growMessages = growth.growMessages,
-                    growIntervalHours = growth.growIntervalHours,
-                ),
+                com.qbot.core.ai.PersonaGrowthConfig(enabled = growth.enabled),
             )
             applied++
         }

@@ -235,6 +235,19 @@ class BotRuntime(
             return
         }
 
+        // @ 与频道消息同样要进群上下文。
+        //
+        // 过去只有"旁听"链路会写 room_messages，于是 @ 过机器人、最终却没回成的消息
+        // 在后续判断与回复的上下文里**完全不存在**——群聊语境总是缺一块。
+        // 用户看到的现象就是"它好像没看见别人刚刚叫过它"。
+        if (message.kind == MessageKind.GROUP_AT || message.kind == MessageKind.GUILD) {
+            memoryPipeline?.recordChitchat(
+                message = message,
+                cleanText = text,
+                isAt = message.kind == MessageKind.GROUP_AT,
+            )
+        }
+
         // 先认出是谁：群聊里每个人有独立的记忆线程与展示名。
         // 解析失败（无记忆管线/未启用）时回退到 senderId 尾段，日志里始终能区分人。
         val label = memoryPipeline?.resolveLabel(message, text)
@@ -533,8 +546,7 @@ class BotRuntime(
                 }
                 sendReply(message, answer)
                 chitchatPolicy.markSpoke(groupId)
-                // 用户那条已经由 recordChitchat 写过，这里只补机器人这一条
-                pipeline.recordChitchatAnswer(message, answer)
+                // 机器人这条已由 sendReply 统一写入群上下文
                 pipeline.markChitchatDecision(message, "已接话（$why）")
                 action = ChimeDecisionRecord.ACTION_SPOKE
                 replyText = answer
@@ -812,6 +824,15 @@ class BotRuntime(
                 api.sendGroupMessage(target, reply, replyMessageId = message.messageId)
 
             MessageKind.DIRECT -> api.sendUserMessage(target, reply, replyMessageId = message.messageId)
+        }
+
+        // 所有群内回复的统一记账点：@ 回复、规则回复、指令复述都走这里。
+        // 之前只有旁听链路记，导致群上下文里只有"问"没有"答"，
+        // 模型判断"我刚说过话没有"时其实是瞎的。
+        when (message.kind) {
+            MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE, MessageKind.GUILD ->
+                memoryPipeline?.recordChitchatAnswer(message, reply)
+            else -> Unit
         }
     }
 

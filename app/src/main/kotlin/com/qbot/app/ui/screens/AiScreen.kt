@@ -593,6 +593,9 @@ private fun ActivePersonaCard(
     val seed = PersonaSeed.of(persona.seedId)
 
     Card(
+        // 整张卡片可点：过去只有底部「编辑」按钮能点，用户点卡片没反应，
+        // 会以为"手动设定"这个状态卡死了。
+        onClick = onEdit,
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
     ) {
