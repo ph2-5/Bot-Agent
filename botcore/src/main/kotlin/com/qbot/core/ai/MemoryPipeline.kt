@@ -46,6 +46,18 @@ data class MemoryConfig(
     val personalThreadEnabled: Boolean = true,
     /** 注入提示词的私人对话条数 */
     val personalThreadSize: Int = 12,
+    /**
+     * 是否按人设分开记忆。
+     *
+     * 关闭（默认）时，机器人换人设只是换语气：群里的对话、私人线程、
+     * 好感都还是同一份，像同一个人在不同场合说话。
+     *
+     * 开启后，机器人自己的发言会记下当时的人格，回复/判断时只保留
+     * 「群友说的」+「当前人格说的」——换人设等于换一个人，
+     * 不会接着旧人格的话茬说，也不会继承旧人格攒下的关系与经验。
+     * 群友说过的事实始终共享（那是关于他们自己的信息，不该随人设丢失）。
+     */
+    val personaScoped: Boolean = false,
 )
 
 /**
@@ -137,6 +149,13 @@ class MemoryPipeline(
     private val groupStore: GroupStore? = null,
     /** 机器人全局名（READY 下发的 username），回答「你叫什么」时兜底 */
     private val botNameProvider: (() -> String?)? = null,
+    /**
+     * 逐消息解析「当前生效的人格档案 id」。
+     *
+     * 只有 [MemoryConfig.personaScoped] 打开时才参与记忆过滤与标记；
+     * 关闭时连调用都不发生，避免无谓的数据库查询。
+     */
+    private val personaIdProvider: (suspend (com.qbot.core.model.IncomingMessage) -> Long?)? = null,
 ) {
     companion object {
         /** 查看自己记忆的指令 */
@@ -209,9 +228,12 @@ class MemoryPipeline(
 
         val personFacts = facts.facts(senderId).take(config.factsPerPerson)
 
+        // 开启按人设分开记忆时，别人格的 assistant 行不算「你和他的过往」。
+        val personaId = scopedPersonaId(message, config)
+
         val digest =
             if (config.roomContextEnabled) {
-                roomContext.recent(ConversationKeys.room(message), config.roomContextSize)
+                roomContext.recent(ConversationKeys.room(message), config.roomContextSize, personaId)
             } else {
                 emptyList()
             }
@@ -221,7 +243,7 @@ class MemoryPipeline(
         val personalDigest =
             if (config.personalThreadEnabled) {
                 personThreadKey(message)?.let {
-                    roomContext.recent(it, config.personalThreadSize)
+                    roomContext.recent(it, config.personalThreadSize, personaId)
                 }.orEmpty()
             } else {
                 emptyList()
@@ -234,7 +256,7 @@ class MemoryPipeline(
         val quoted =
             if (config.roomContextEnabled) {
                 message.quotedMessageId?.let { id ->
-                    roomContext.recent(ConversationKeys.room(message), 200)
+                    roomContext.recent(ConversationKeys.room(message), 200, personaId)
                         .lastOrNull { it.externalId == id }
                         ?.let { QuotedMessage(senderName = it.senderName, content = it.content) }
                 }
@@ -362,6 +384,7 @@ class MemoryPipeline(
 
         val now = clock()
         val key = ConversationKeys.room(message)
+        val personaId = scopedPersonaId(message, config)
         val userRow =
             RoomMessage(
                 senderId = message.senderId,
@@ -380,6 +403,7 @@ class MemoryPipeline(
                 role = "assistant",
                 content = answer,
                 timestampMillis = now,
+                personaId = personaId,
             )
         roomContext.append(key, userRow)
         roomContext.append(key, botRow)
@@ -470,6 +494,7 @@ class MemoryPipeline(
                 role = "assistant",
                 content = answer,
                 timestampMillis = clock(),
+                personaId = scopedPersonaId(message, config),
             )
         roomContext.append(key, row)
         roomContext.trim(key, retention(config))
@@ -496,6 +521,22 @@ class MemoryPipeline(
         val senderId = message.senderId?.takeIf { it.isNotBlank() } ?: return null
         if (message.targetId.isNullOrBlank()) return null
         return ConversationKeys.personThread(ConversationKeys.room(message), senderId)
+    }
+
+    /**
+     * 当前消息生效的人格 id（供接话判断、好感、内心戏共用）。
+     *
+     * 关闭「按人设分开记忆」时恒为 null——调用方据此退回全局存储。
+     */
+    suspend fun currentPersonaId(message: IncomingMessage): Long? =
+        scopedPersonaId(message, configProvider())
+
+    private suspend fun scopedPersonaId(
+        message: IncomingMessage,
+        config: MemoryConfig,
+    ): Long? {
+        if (!config.enabled || !config.personaScoped) return null
+        return personaIdProvider?.invoke(message)
     }
 
     /**
@@ -532,7 +573,8 @@ class MemoryPipeline(
         // 接话判断必须有上下文才谈得上语境，否则等于闭着眼睛决定说不说话。
         if (!config.enabled) return emptyList()
         if (message.targetId.isNullOrBlank()) return emptyList()
-        return roomContext.recent(ConversationKeys.room(message), limit)
+        val personaId = scopedPersonaId(message, config)
+        return roomContext.recent(ConversationKeys.room(message), limit, personaId)
     }
 
     /** 按群 id 读最近对话（人设进化取样等场景，手上没有消息对象）。 */

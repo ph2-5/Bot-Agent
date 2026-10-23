@@ -86,6 +86,14 @@ fun MemoryPage(onBack: () -> Unit) {
                 onCheckedChange = { update(config.copy(personaRewrite = it)) },
                 enabled = config.enabled,
             )
+            SwitchRow(
+                title = "按人设分开记忆",
+                desc = "开启后每个档案各自积累对话、接话经验、关系与内心戏；" +
+                    "关闭则换人设只换语气，记忆仍是同一份",
+                checked = config.personaScoped,
+                onCheckedChange = { update(config.copy(personaScoped = it)) },
+                enabled = config.enabled,
+            )
         }
 
         SectionHeader("容量", "记太多会稀释相关性，记太少又不够用")

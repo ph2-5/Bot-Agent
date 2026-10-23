@@ -15,9 +15,16 @@ import kotlinx.coroutines.flow.Flow
  * 两个维度见 [com.qbot.core.ai.PersonRelation]：熟识只涨不跌（认识就是认识），
  * 好感可升可降且会回归中性（不记一辈子仇）。
  */
-@Entity(tableName = "affinities")
+@Entity(tableName = "affinities", primaryKeys = ["personaId", "userId"])
 data class AffinityEntity(
-    @PrimaryKey val userId: String,
+    /**
+     * 归属人格；0 表示「不分人设」的共用关系。
+     *
+     * 默认（记忆隔离开关关闭）下所有互动都写 0，与旧版本行为一致；
+     * 开启后按当前人格各存一份，换人设不会继承旧人格攒下的好感。
+     */
+    val personaId: Long = 0,
+    val userId: String,
     val displayName: String? = null,
     /** 0..100 */
     val familiarity: Int = 0,
@@ -71,20 +78,37 @@ data class SlangEntity(
 
 @Dao
 interface AffinityDao {
-    @Query("SELECT * FROM affinities WHERE userId = :userId")
-    suspend fun find(userId: String): AffinityEntity?
+    @Query("SELECT * FROM affinities WHERE personaId = :personaId AND userId = :userId")
+    suspend fun find(
+        personaId: Long,
+        userId: String,
+    ): AffinityEntity?
 
-    @Query("SELECT * FROM affinities ORDER BY affinity DESC, familiarity DESC LIMIT :limit")
-    fun observeTop(limit: Int = 50): Flow<List<AffinityEntity>>
+    /** 某个视角下的关系排行；[personaId] = 0 即不分人设。 */
+    @Query(
+        "SELECT * FROM affinities WHERE personaId = :personaId " +
+            "ORDER BY affinity DESC, familiarity DESC LIMIT :limit",
+    )
+    fun observeTop(
+        personaId: Long,
+        limit: Int = 50,
+    ): Flow<List<AffinityEntity>>
 
+    /** 全部视角的原始行（备份导出用）。 */
     @Query("SELECT * FROM affinities")
     suspend fun all(): List<AffinityEntity>
+
+    @Query("SELECT * FROM affinities WHERE personaId = :personaId")
+    suspend fun allFor(personaId: Long): List<AffinityEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(entity: AffinityEntity)
 
-    @Query("DELETE FROM affinities WHERE userId = :userId")
-    suspend fun delete(userId: String)
+    @Query("DELETE FROM affinities WHERE personaId = :personaId AND userId = :userId")
+    suspend fun delete(
+        personaId: Long,
+        userId: String,
+    )
 
     @Query("DELETE FROM affinities")
     suspend fun clear()

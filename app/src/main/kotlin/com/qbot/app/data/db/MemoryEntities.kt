@@ -135,14 +135,33 @@ data class RoomMessageEntity(
     val externalId: String? = null,
     /** 处理结论：已回复 / 冷却中 / 概率未命中 / AI 判断不接 */
     val decision: String? = null,
+    /**
+     * 写这条消息时的人格；只有 assistant（机器人自己）行会被标记。
+     *
+     * 群友说的话永远属于公共背景（谁说的就是谁说的），不该随人设消失；
+     * 机器人自己的发言则要记下"当时是谁在说"，开启隔离后新人格
+     * 不会接着旧人格的话茬继续聊。
+     */
+    val personaId: Long? = null,
 )
 
 @Dao
 interface RoomMessageDao {
-    @Query("SELECT * FROM room_messages WHERE scopeKey = :scopeKey ORDER BY id DESC LIMIT :limit")
+    /**
+     * 取某个会话最近的背景消息。
+     *
+     * [personaId] 非空（开启人设隔离）时，机器人自己的旧发言只保留
+     * 属于当前人格的那些；群友发言始终保留——那是公共对话。
+     */
+    @Query(
+        "SELECT * FROM room_messages WHERE scopeKey = :scopeKey " +
+            "AND (:personaId IS NULL OR role != 'assistant' OR personaId = :personaId) " +
+            "ORDER BY id DESC LIMIT :limit",
+    )
     suspend fun recent(
         scopeKey: String,
         limit: Int,
+        personaId: Long?,
     ): List<RoomMessageEntity>
 
     /**

@@ -148,10 +148,11 @@ class RoomSharedContextStore(
     override suspend fun recent(
         scopeKey: String,
         limit: Int,
+        personaId: Long?,
     ): List<RoomMessage> =
         // 查询是倒序取的，转回正序才是真实的时间顺序
         dao
-            .recent(scopeKey, limit)
+            .recent(scopeKey, limit, personaId)
             .asReversed()
             .map { it.toRoomMessage() }
 
@@ -170,6 +171,7 @@ class RoomSharedContextStore(
                 isAt = message.isAt,
                 externalId = message.externalId,
                 decision = message.decision,
+                personaId = message.personaId,
             ),
         )
     }
@@ -208,5 +210,6 @@ class RoomSharedContextStore(
             isAt = isAt,
             externalId = externalId,
             decision = decision,
+            personaId = personaId,
         )
 }

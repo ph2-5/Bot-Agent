@@ -136,9 +136,10 @@ class OpenApi(
         replyMessageId: String? = null,
         eventId: String? = null,
         msgType: Int = MsgType.TEXT,
+        mediaFileInfo: String? = null,
     ): SendResult {
         require(userOpenId.isNotBlank()) { "userOpenId 不能为空" }
-        val payload = buildSendBody(content, replyMessageId, eventId, msgType)
+        val payload = buildSendBody(content, replyMessageId, eventId, msgType, mediaFileInfo)
         val body =
             withContext(Dispatchers.IO) {
                 call("POST", "/v2/users/$userOpenId/messages", payload, retryOnAuthError = true)
@@ -182,8 +183,24 @@ class OpenApi(
     suspend fun uploadGroupImage(
         groupOpenId: String,
         imageUrl: String,
+    ): String? = uploadImage("/v2/groups/$groupOpenId/files", groupOpenId, imageUrl)
+
+    /**
+     * 上传一张网络图片到单聊，返回 file_info（供 msg_type=7 使用）。
+     *
+     * 与群聊同一套上传协议，只是路径不同：`/v2/users/{openid}/files`。
+     */
+    suspend fun uploadUserImage(
+        userOpenId: String,
+        imageUrl: String,
+    ): String? = uploadImage("/v2/users/$userOpenId/files", userOpenId, imageUrl)
+
+    private suspend fun uploadImage(
+        path: String,
+        targetId: String,
+        imageUrl: String,
     ): String? {
-        if (groupOpenId.isBlank() || imageUrl.isBlank()) return null
+        if (targetId.isBlank() || imageUrl.isBlank()) return null
         val payload =
             buildJsonObject {
                 put("file_type", 1) // 1 = 图片
@@ -193,7 +210,7 @@ class OpenApi(
         val body =
             withContext(Dispatchers.IO) {
                 runCatching {
-                    call("POST", "/v2/groups/$groupOpenId/files", payload, retryOnAuthError = true)
+                    call("POST", path, payload, retryOnAuthError = true)
                 }.getOrNull()
             } ?: return null
         return runCatching {

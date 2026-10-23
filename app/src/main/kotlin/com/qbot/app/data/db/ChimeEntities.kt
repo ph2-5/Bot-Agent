@@ -48,6 +48,8 @@ data class ChimeDecisionEntity(
     /** 这句话大概率对谁说的：BOT / MEMBER / GROUP / UNKNOWN */
     val addresseeKind: String? = null,
     val addresseeName: String? = null,
+    /** 做出判断时扮演的人格；null = 未开隔离 */
+    val personaId: Long? = null,
     /** null = 未反馈；1 = 正确；0 = 错误 */
     val feedback: Boolean? = null,
     /** SHOULD_SPEAK / SHOULD_SILENT（仅错误时） */
@@ -82,6 +84,13 @@ data class ChimeLessonEntity(
     @ColumnInfo(defaultValue = "OTHER") val category: String = "OTHER",
     /** 被多少条反馈支撑：同类相似反馈累加，用于排序与淘汰 */
     @ColumnInfo(defaultValue = "1") val supportCount: Int = 1,
+    /**
+     * 归属人格；null 表示通用经验。
+     *
+     * 开启记忆隔离后，A 人设学到的「别抢话」不该作用到 B 人设——
+     * 两者的性格与判定标准本来就不同。
+     */
+    val personaId: Long? = null,
 )
 
 @Dao
@@ -154,22 +163,35 @@ interface ChimeLessonDao {
     /**
      * 注入用：本群专属排在前、全局排在后，各自按更新时间倒序。
      * SQLite 里布尔表达式返回 0/1，直接用来排序即可。
+     *
+     * [personaId] 为 null（未开隔离）时不过滤人格；非空时只取
+     * 「归属该人格 + 通用」的经验。多取几倍由仓储侧做衰减与类别配额。
      */
     @Query(
         "SELECT * FROM chime_lessons WHERE enabled = 1 " +
             "AND (scopeGroupId IS NULL OR scopeGroupId = :groupId) " +
+            "AND (:personaId IS NULL OR personaId IS NULL OR personaId = :personaId) " +
             "ORDER BY (scopeGroupId IS NOT NULL) DESC, supportCount DESC, updatedAt DESC " +
             "LIMIT :limit",
     )
-    suspend fun promptLessons(groupId: String, limit: Int): List<ChimeLessonEntity>
+    suspend fun promptLessons(
+        groupId: String,
+        limit: Int,
+        personaId: Long?,
+    ): List<ChimeLessonEntity>
 
-    /** 同一作用域 + 同一类别：入库前用它做合并判断 */
+    /** 同一作用域 + 同一类别 + 同一人格：入库前用它做合并判断 */
     @Query(
         "SELECT * FROM chime_lessons WHERE category = :category AND " +
-            "((:groupId IS NULL AND scopeGroupId IS NULL) OR scopeGroupId = :groupId) " +
+            "((:groupId IS NULL AND scopeGroupId IS NULL) OR scopeGroupId = :groupId) AND " +
+            "personaId IS :personaId " +
             "ORDER BY supportCount DESC, updatedAt DESC",
     )
-    suspend fun sameCategory(groupId: String?, category: String): List<ChimeLessonEntity>
+    suspend fun sameCategory(
+        groupId: String?,
+        category: String,
+        personaId: Long?,
+    ): List<ChimeLessonEntity>
 
     @Query("SELECT * FROM chime_lessons WHERE id = :id")
     suspend fun find(id: Long): ChimeLessonEntity?

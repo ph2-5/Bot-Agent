@@ -121,45 +121,51 @@ class PersonaGrowthScheduler(
         val ai = aiConfig()
         if (!ai.enabled || !ai.isReady) return
 
-        val profile = repo.active() ?: return
-        if (profile.kind != PersonaKind.PROFILE || profile.frozen) return
-
-        // 冷却：tick 每十分钟一次，但不能每十分钟都去问模型
+        // 所有「允许成长」的人格都要跑，而不只是当前激活档案：
+        // 覆盖层人设（某个群/某个人专用）如果被设为成长期，过去永远长不了（审计 M5）。
+        // MANUAL 是用户手写的人设，PersonaGrowthPolicy 本身也会拒绝，这里先筛掉省一次查询。
+        val candidates =
+            repo.all().filter {
+                !it.frozen && it.stage != PersonaStage.MANUAL
+            }
         val now = clock()
-        val cooldown =
-            if (profile.stage == PersonaStage.EMBRYO) {
-                BIRTH_COOLDOWN_MILLIS
-            } else {
-                GROW_COOLDOWN_MILLIS
-            }
-        // delta 为负说明系统时间被回拨过：视为"已过期"，否则会永久停摆
-        val last = lastAskedAt[profile.id] ?: 0L
-        val delta = now - last
-        if (last > 0 && delta >= 0 && delta < cooldown) return
+        candidates.forEach { profile ->
+            // 冷却：tick 每十分钟一次，但不能每十分钟都去问模型
+            val cooldown =
+                if (profile.stage == PersonaStage.EMBRYO) {
+                    BIRTH_COOLDOWN_MILLIS
+                } else {
+                    GROW_COOLDOWN_MILLIS
+                }
+            // delta 为负说明系统时间被回拨过：视为"已过期"，否则会永久停摆
+            val last = lastAskedAt[profile.id] ?: 0L
+            val delta = now - last
+            if (last > 0 && delta >= 0 && delta < cooldown) return@forEach
 
-        val pending = messages.countSince(profile.msgCursor)
-        val action =
-            PersonaGrowthPolicy.next(
-                state =
-                    PersonaGrowthState(
-                        stage = profile.stage,
-                        frozen = profile.frozen,
-                        growthCount = profile.growthCount,
-                        birthAt = profile.birthAt,
-                        lastGrownAt = profile.lastGrownAt,
-                    ),
-                pendingMessages = pending,
-            )
+            val pending = messages.countSince(profile.msgCursor)
+            val action =
+                PersonaGrowthPolicy.next(
+                    state =
+                        PersonaGrowthState(
+                            stage = profile.stage,
+                            frozen = profile.frozen,
+                            growthCount = profile.growthCount,
+                            birthAt = profile.birthAt,
+                            lastGrownAt = profile.lastGrownAt,
+                        ),
+                    pendingMessages = pending,
+                )
 
-        when (action) {
-            GrowthAction.NONE -> Unit
-            GrowthAction.BIRTH -> {
-                lastAskedAt[profile.id] = now
-                birth(profile, ai)
-            }
-            GrowthAction.GROW -> {
-                lastAskedAt[profile.id] = now
-                grow(profile, pending, ai)
+            when (action) {
+                GrowthAction.NONE -> Unit
+                GrowthAction.BIRTH -> {
+                    lastAskedAt[profile.id] = now
+                    birth(profile, ai)
+                }
+                GrowthAction.GROW -> {
+                    lastAskedAt[profile.id] = now
+                    grow(profile, pending, ai)
+                }
             }
         }
     }

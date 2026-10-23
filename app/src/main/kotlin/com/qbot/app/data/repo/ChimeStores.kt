@@ -15,6 +15,7 @@ import com.qbot.core.ai.ChimeStats
 import com.qbot.core.ai.ChimeTrainer
 import com.qbot.core.ai.InnerThought
 import com.qbot.core.ai.InnerThoughtSink
+import com.qbot.core.ai.LessonSelection
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
@@ -62,14 +63,35 @@ class RoomChimeDecisionStore(
 /** 经验库的 Room 实现。 */
 class RoomChimeLessonStore(
     private val dao: ChimeLessonDao,
+    /**
+     * 当前人格（开启隔离后用于合并同类经验、忽略其它人格的旧经验）。
+     *
+     * 返回 null 表示未开启隔离：经验是共用的，行为与旧版本一致。
+     */
+    private val personaIdProvider: (suspend () -> Long?)? = null,
+    private val now: () -> Long = System::currentTimeMillis,
 ) : ChimeLessonStore {
     override fun observeAll(): Flow<List<ChimeLesson>> =
         dao.observeAll().map { rows -> rows.map { it.toModel() } }
 
     override suspend fun all(): List<ChimeLesson> = dao.all().map { it.toModel() }
 
-    override suspend fun promptLessons(groupId: String, limit: Int): List<ChimeLesson> =
-        dao.promptLessons(groupId, limit).map { it.toModel() }
+    override suspend fun promptLessons(
+        groupId: String,
+        limit: Int,
+        personaId: Long?,
+    ): List<ChimeLesson> {
+        // SQL 只做粗筛（启用 / 作用域 / 人格）并多取几倍，
+        // 时间衰减与「每类最多 3 条」的配额统一由 LessonSelection 决定——
+        // 过去配额只在内存实现里，生产链路其实没生效（见审计 B1）。
+        val rows =
+            dao.promptLessons(
+                groupId = groupId,
+                limit = (limit * 4).coerceAtLeast(limit).coerceAtMost(MAX_SCAN),
+                personaId = personaId,
+            ).map { it.toModel() }
+        return LessonSelection.pick(rows, limit, groupId, personaId, now())
+    }
 
     override suspend fun insert(lesson: ChimeLesson): Long = dao.insert(lesson.toEntity())
 
@@ -94,8 +116,13 @@ class RoomChimeLessonStore(
         dao.deleteMany(ids.toList())
     }
 
-    override suspend fun sameCategory(groupId: String?, category: String): List<ChimeLesson> =
-        dao.sameCategory(groupId, category).map { it.toModel() }
+    override suspend fun sameCategory(
+        groupId: String?,
+        category: String,
+        personaId: Long?,
+    ): List<ChimeLesson> =
+        // 调用方给了人格就按它查；没给则沿用存储侧的当前视角
+        dao.sameCategory(groupId, category, personaId ?: personaIdProvider?.invoke()).map { it.toModel() }
 
     override suspend fun bumpHits(ids: Collection<Long>) {
         if (ids.isEmpty()) return
@@ -104,6 +131,11 @@ class RoomChimeLessonStore(
 
     override suspend fun trim(keep: Int) {
         dao.trimTo(keep)
+    }
+
+    companion object {
+        /** SQL 粗筛上限：再大也不会一次注入这么多，只为给配额留出选择空间。 */
+        private const val MAX_SCAN = 200
     }
 }
 
@@ -122,8 +154,11 @@ class RoomChimeTrainer(
         decisions.record(record)
     }
 
-    override suspend fun lessonsForPrompt(groupId: String, limit: Int): List<ChimeLesson> =
-        lessons.promptLessons(groupId, limit)
+    override suspend fun lessonsForPrompt(
+        groupId: String,
+        limit: Int,
+        personaId: Long?,
+    ): List<ChimeLesson> = lessons.promptLessons(groupId, limit, personaId)
 
     override suspend fun bumpHits(ids: Collection<Long>) {
         lessons.bumpHits(ids)
@@ -151,6 +186,7 @@ private fun ChimeDecisionRecord.toEntity() =
         insulted = insulted,
         addresseeKind = addresseeKind,
         addresseeName = addresseeName,
+        personaId = personaId,
         createdAt = createdAt,
     )
 
@@ -175,6 +211,7 @@ private fun ChimeDecisionEntity.toModel() =
                 insulted = insulted,
                 addresseeKind = addresseeKind,
                 addresseeName = addresseeName,
+                personaId = personaId,
                 externalId = externalId,
                 createdAt = createdAt,
             ),
@@ -197,6 +234,7 @@ private fun ChimeLesson.toEntity() =
         updatedAt = updatedAt,
         category = category,
         supportCount = supportCount,
+        personaId = personaId,
     )
 
 private fun ChimeLessonEntity.toModel() =
@@ -212,6 +250,7 @@ private fun ChimeLessonEntity.toModel() =
         updatedAt = updatedAt,
         category = category,
         supportCount = supportCount,
+        personaId = personaId,
     )
 
 /**
@@ -234,6 +273,7 @@ class RoomInnerThoughtSink(
                 spoken = thought.spoken,
                 thought = thought.thought,
                 createdAt = thought.createdAt,
+                personaId = thought.personaId,
             ),
         )
         dao.trim(keep)
@@ -254,4 +294,5 @@ private fun InnerThoughtEntity.toModel() =
         spoken = spoken,
         thought = thought,
         createdAt = createdAt,
+        personaId = personaId,
     )

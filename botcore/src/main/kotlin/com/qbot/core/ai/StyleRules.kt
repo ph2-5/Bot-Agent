@@ -1,5 +1,8 @@
 package com.qbot.core.ai
 
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+
 /**
  * 「去 AI 味」的说话约束。
  *
@@ -7,6 +10,7 @@ package com.qbot.core.ai
  * - [StyleRuleSource.BUILTIN]：系统内置（从角色卡的「群聊铁律 / 说话方式 / AI 味黑名单」
  *   提炼而成），所有角色共用，可逐条停用；
  * - [StyleRuleSource.USER]：维护端自己加的约束（例如「别用问句结尾」）；
+ * - [StyleRuleSource.PERSONA]：从人设正文里自动提取的约束（可重新提取，不会覆盖手写规则）；
  * - [StyleRuleSource.PLUGIN]：插件提供的约束，未来插件系统接这里。
  *
  * 与 [Persona] 的分工：人设写「我是谁、什么性格」，这里写「话怎么说」。
@@ -15,6 +19,7 @@ package com.qbot.core.ai
 enum class StyleRuleSource {
     BUILTIN,
     USER,
+    PERSONA,
     PLUGIN,
 }
 
@@ -147,6 +152,14 @@ interface StyleRuleStore {
 
     /** 清空用户自定义（保留内置规则的启停状态） */
     suspend fun clearUserRules()
+
+    /**
+     * 清空某个来源的规则。
+     *
+     * 主要用于「从人设重新提取」：先删掉上一批 [StyleRuleSource.PERSONA]，
+     * 再写入新的一批，避免人设改短后残留旧规则。
+     */
+    suspend fun clearSource(source: StyleRuleSource) = Unit
 }
 
 /** 插件贡献语气约束的接口；插件系统接入时实现它即可。 */
@@ -155,10 +168,10 @@ fun interface StyleRulePlugin {
 }
 
 /**
- * 把三路规则合成一份最终注入列表。
+ * 把四路规则合成一份最终注入列表。
  *
- * 顺序：用户规则 > 插件规则 > 内置规则。重复文本只留一条——
- * 用户把内置规则抄一遍时不该出现两遍同样的句子。
+ * 顺序：用户规则 > 人设提取 > 插件规则 > 内置规则。重复文本只留一条——
+ * 用户把内置规则抄一遍、或人设里恰好写了同一条时，不该出现两遍同样的句子。
  */
 class StyleRuleComposer(
     private val store: StyleRuleStore? = null,
@@ -192,10 +205,15 @@ class StyleRuleComposer(
             }
         val fromPlugins = pluginRules.map { it.copy(source = StyleRuleSource.PLUGIN) }
         val userRules = saved.filter { it.source == StyleRuleSource.USER }
-        return (userRules + fromPlugins + effectiveBuiltins)
+        val personaRules = saved.filter { it.source == StyleRuleSource.PERSONA }
+        return (userRules + personaRules + fromPlugins + effectiveBuiltins)
             .filter { it.text.isNotBlank() }
-            .distinctBy { it.text.trim() }
+            .distinctBy { normalize(it.text) }
     }
+
+    /** 去重用的归一化：忽略空白与句尾标点，避免“同一句话换个写法”重复注入。 */
+    private fun normalize(text: String): String =
+        text.filterNot { it.isWhitespace() }.trimEnd('。', '.', '！', '!', '；', ';')
 
     /** 合并后的「最终注入列表」 */
     fun activeRules(
@@ -255,5 +273,98 @@ class InMemoryStyleRuleStore(
 
     override suspend fun clearUserRules() {
         rows.values.removeAll { it.source == StyleRuleSource.USER }
+    }
+
+    override suspend fun clearSource(source: StyleRuleSource) {
+        rows.values.removeAll { it.source == source }
+    }
+}
+
+/**
+ * 从人设正文里自动提取「怎么说话」的约束。
+ *
+ * 与 [PersonaLoreExtractor] 分工：那边抽「认识谁、什么梗」，这边抽「话该怎么说」。
+ * 产物以 [StyleRuleSource.PERSONA] 落库，可以整批重抽，不会覆盖用户手写的规则。
+ *
+ * 提取范围刻意收窄：只收可执行的指令（长度、语气、格式、黑名单、身份边界），
+ * 不收性格形容词、世界观设定、背景故事——那些留在人设正文里就行。
+ */
+class PersonaStyleExtractor(private val client: LlmClient) {
+    private val json = Json { ignoreUnknownKeys = true }
+
+    suspend fun extract(
+        personaPrompt: String,
+        config: AiConfig,
+        now: Long = System.currentTimeMillis(),
+    ): List<StyleRule> {
+        val prompt = personaPrompt.trim()
+        if (prompt.isEmpty()) return emptyList()
+        val system =
+            "你在把一张角色卡里的「说话方式要求」整理成一份可执行的风格清单。\n" +
+                "只抽取对「怎么说话」的硬性要求：句子长度、消息节奏、语气、称呼、" +
+                "排版格式、必须避免的 AI 套话 / 句式、身份与边界。\n" +
+                "不要抽取性格描述、背景故事、世界观设定、人际关系；" +
+                "不要编造原文里没有的要求；一条只讲一件事。\n" +
+                "category 只能从这五个里选：LENGTH（长度与节奏）、TONE（语气与称呼）、" +
+                "FORMAT（排版格式）、ECHO（要避免的套话/句式）、BOUNDARY（身份与边界）。\n" +
+                "只输出 JSON，不要解释、不要代码块：\n" +
+                "{\"rules\":[{\"text\":\"一句可执行的指令\",\"category\":\"LENGTH\"}]}\n" +
+                "限制：最多 12 条；每条不超过 60 字；没有就输出 []。"
+        val user = "角色卡正文：\n" + prompt.take(6000)
+        val reply =
+            client.chat(
+                baseUrl = config.baseUrl,
+                apiKey = config.apiKey,
+                model = config.model,
+                messages = listOf(ChatMessage("system", system), ChatMessage("user", user)),
+                temperature = 0.1,
+                maxTokens = GenerationLimits.forConfig(config),
+                thinkingType = ThinkingParams.forConfig(config, forceDisable = true),
+            )
+        return parse(reply.content, now)
+    }
+
+    internal fun parse(
+        raw: String,
+        now: Long,
+    ): List<StyleRule> {
+        val start = raw.indexOf('{')
+        val end = raw.lastIndexOf('}')
+        if (start < 0 || end <= start) return emptyList()
+        val body = raw.substring(start, end + 1)
+        val payload =
+            runCatching { json.decodeFromString<RawStyleRules>(body) }.getOrNull()
+                ?: return emptyList()
+        return payload.rules
+            .filter { it.text.isNotBlank() }
+            .map { it.text.trim().take(StyleRender.MAX_ONE_RULE) to parseCategory(it.category) }
+            .distinctBy { (text, _) -> text.filterNot { ch -> ch.isWhitespace() } }
+            .take(MAX_EXTRACTED)
+            .map { (text, category) ->
+                StyleRule(
+                    id = "persona.${text.hashCode().toUInt().toString(16)}",
+                    text = text,
+                    category = category,
+                    source = StyleRuleSource.PERSONA,
+                    enabled = true,
+                )
+            }
+    }
+
+    private fun parseCategory(raw: String): StyleRuleCategory =
+        runCatching { StyleRuleCategory.valueOf(raw.trim().uppercase()) }
+            .getOrDefault(StyleRuleCategory.TONE)
+
+    @Serializable
+    private data class RawStyleRules(val rules: List<RawRule> = emptyList())
+
+    @Serializable
+    private data class RawRule(
+        val text: String = "",
+        val category: String = "TONE",
+    )
+
+    companion object {
+        const val MAX_EXTRACTED = 12
     }
 }

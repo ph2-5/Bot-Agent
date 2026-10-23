@@ -150,7 +150,7 @@ interface AiHistoryDao {
         LoreEntity::class,
         StyleRuleEntity::class,
     ],
-    version = 14,
+    version = 15,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -654,6 +654,55 @@ abstract class AppDatabase : RoomDatabase() {
                             PRIMARY KEY(`id`))
                         """.trimIndent(),
                     )
+                }
+            }
+        /**
+         * v14 → v15：人设记忆隔离。
+         *
+         * 三张表加 personaId：
+         * - `room_messages`：只标记机器人自己的发言（群友的永远公共）；
+         * - `chime_lessons`：经验归属人格，换人设后不继承旧偏好；
+         * - `inner_thoughts`：内心戏归属人格。
+         *
+         * `affinities` 的主键从 userId 改成 (personaId, userId)：
+         * SQLite 不支持改主键，只能建新表搬数据。
+         * 旧行统一落在 personaId = 0（「不分人设」的共用关系），
+         * 与升级前的行为完全一致；开启隔离后各人格从 0 开始攒。
+         */
+        val MIGRATION_14_15 =
+            object : androidx.room.migration.Migration(14, 15) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL("ALTER TABLE `room_messages` ADD COLUMN `personaId` INTEGER")
+                    db.execSQL("ALTER TABLE `chime_lessons` ADD COLUMN `personaId` INTEGER")
+                    db.execSQL("ALTER TABLE `inner_thoughts` ADD COLUMN `personaId` INTEGER")
+                    // 判断快照也要记下当时扮演的人格：由它反思出的经验要归到同一人格
+                    db.execSQL("ALTER TABLE `chime_decisions` ADD COLUMN `personaId` INTEGER")
+
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS `affinities_new` (
+                            `personaId` INTEGER NOT NULL,
+                            `userId` TEXT NOT NULL,
+                            `displayName` TEXT,
+                            `familiarity` INTEGER NOT NULL,
+                            `affinity` INTEGER NOT NULL,
+                            `interactionCount` INTEGER NOT NULL,
+                            `lastInteractionAt` INTEGER NOT NULL,
+                            `lastNote` TEXT,
+                            `updatedAt` INTEGER NOT NULL,
+                            PRIMARY KEY(`personaId`, `userId`))
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        "INSERT INTO `affinities_new` (" +
+                            "`personaId`, `userId`, `displayName`, `familiarity`, `affinity`, " +
+                            "`interactionCount`, `lastInteractionAt`, `lastNote`, `updatedAt`) " +
+                            "SELECT 0, `userId`, `displayName`, `familiarity`, `affinity`, " +
+                            "`interactionCount`, `lastInteractionAt`, `lastNote`, `updatedAt` " +
+                            "FROM `affinities`",
+                    )
+                    db.execSQL("DROP TABLE `affinities`")
+                    db.execSQL("ALTER TABLE `affinities_new` RENAME TO `affinities`")
                 }
             }
     }

@@ -113,6 +113,8 @@ class RoomStyleRuleStore(
     override suspend fun delete(id: String) = dao.delete(id)
 
     override suspend fun clearUserRules() = dao.clearUserRules()
+
+    override suspend fun clearSource(source: StyleRuleSource) = dao.clearSource(source.name)
 }
 
 internal fun LoreEntity.toModel() =

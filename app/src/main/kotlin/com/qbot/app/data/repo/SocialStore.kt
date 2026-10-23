@@ -21,6 +21,8 @@ import com.qbot.core.ai.SlangTerm
 import com.qbot.core.ai.SocialContext
 import com.qbot.core.ai.SocialContextProvider
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -43,17 +45,45 @@ class RoomSocialStore(
     private val memeDao: MemeDao? = null,
     /** 人设设定：角色卡里写死的「认识的人 / 说法」，与聊天中学到的梗互补 */
     private val loreDao: com.qbot.app.data.db.LoreDao? = null,
-    /** 当前生效的人格档案 id：设定按人格隔离，切换档案后不会串 */
-    private val personaIdProvider: (suspend () -> Long?)? = null,
+    /**
+     * 逐消息解析「当前是哪个人格」；传 null 表示问「当前激活的是谁」。
+     *
+     * 必须是逐消息的：某个群 / 某个人挂了覆盖层人设时，提示词用的是覆盖层，
+     * 而过去这里只取 `active()`——设定、关系与人格会对不上（见审计 A1）。
+     */
+    private val personaIdProvider: (suspend (IncomingMessage?) -> Long?)? = null,
+    /**
+     * 是否按人设隔离「关系 / 内心戏」。
+     *
+     * 关闭时一律落到共用视角 0：换人设只换语气，认识的人还是同一批。
+     * 开启后各人格各攒各的印象。人设设定（lore）不受这个开关影响——
+     * 设定本身就是人格的一部分，必须跟着本条消息实际扮演的人格走。
+     */
+    private val isolateMemories: () -> Boolean = { false },
     private val clock: () -> Long = System::currentTimeMillis,
 ) : SocialContextProvider, RelationRecorder, MemeLibrary {
     /** 读-改-写要串行，否则并发两条消息会把彼此的增量覆盖掉 */
     private val mutex = Mutex()
 
+    /** 这条消息视角下的人格；null = 解析失败 / 无人格 */
+    private suspend fun personaFor(message: IncomingMessage?): Long? =
+        runCatching { personaIdProvider?.invoke(message) }.getOrNull()
+
+    /**
+     * 关系主键里的视角：未开隔离时固定 0（共用关系），
+     * 开启后拿不到人格也落到 0，避免把数据写到不存在的人设上。
+     *
+     * 0 不是一个真实人格的 id（自增从 1 开始），因此不会与档案冲突。
+     */
+    private suspend fun personaKey(message: IncomingMessage? = null): Long =
+        if (!isolateMemories()) 0L else personaFor(message) ?: 0L
+
     override suspend fun provide(message: IncomingMessage): SocialContext {
         val now = clock()
         val userId = message.senderId?.takeIf { it.isNotBlank() }
-        val relation = userId?.let { loadRelation(it, now) }
+        val personaId = personaFor(message)
+        val scopeId = if (isolateMemories()) personaId ?: 0L else 0L
+        val relation = userId?.let { loadRelation(it, now, scopeId) }
         val mood = loadMood(now)
         val groupId = message.targetId?.takeIf { it.isNotBlank() }
         val slang =
@@ -63,21 +93,25 @@ class RoomSocialStore(
         val memes =
             runCatching { memeDao?.promptImages(8)?.map { it.url } ?: emptyList() }
                 .getOrDefault(emptyList())
-        // 上一次对这个人的内心：让"我忍过你"成为关系的一部分
+        // 上一次对这个人的内心：让"我忍过你"成为关系的一部分。
+        // 看共用视角还是人格视角，跟关系表保持一致。
         val lastThought =
             if (userId == null) {
                 null
             } else {
-                runCatching { thoughtDao?.lastFor(userId)?.thought?.take(120) }.getOrNull()
+                runCatching { thoughtDao?.lastFor(userId, scopeId.takeIf { isolateMemories() })?.thought?.take(120) }
+                    .getOrNull()
             }
-        // 人设设定（认识的人 / 雷点 / 特殊说法）：只取当前人格 + 当前群可用的
+        // 人设设定（认识的人 / 雷点 / 特殊说法）：按本条消息解析出的人格取，
+        // 与提示词里实际扮演的角色同源，覆盖层人设也能拿到自己的设定。
+        // 这里不受隔离开关影响：设定是人格的一部分。
         val dao = loreDao
         val lore =
             if (dao == null) {
                 emptyList()
             } else {
                 runCatching {
-                    dao.forPersona(personaIdProvider?.invoke(), groupId).map { it.toModel() }
+                    dao.forPersona(personaId, groupId).map { it.toModel() }
                 }.getOrDefault(emptyList())
             }
         return SocialContext(
@@ -90,12 +124,18 @@ class RoomSocialStore(
         )
     }
 
-    private suspend fun loadRelation(userId: String, now: Long): PersonRelation? {
-        val row = affinityDao.find(userId) ?: return null
+    private suspend fun loadRelation(
+        userId: String,
+        now: Long,
+        personaId: Long,
+    ): PersonRelation? {
+        val row = affinityDao.find(personaId, userId) ?: return null
         val model = row.toModel()
         val decayed = RelationPolicy.decay(model, now)
         // 只在真的衰减时才写：读路径不能变成写路径
-        if (decayed.affinity != model.affinity) affinityDao.upsert(decayed.toEntity(now))
+        if (decayed.affinity != model.affinity) {
+            affinityDao.upsert(decayed.toEntity(now, personaId))
+        }
         return decayed
     }
 
@@ -114,7 +154,8 @@ class RoomSocialStore(
         val userId = message.senderId?.takeIf { it.isNotBlank() } ?: return
         mutex.withLock {
             val now = clock()
-            val current = affinityDao.find(userId)?.toModel()
+            val personaId = personaKey(message)
+            val current = affinityDao.find(personaId, userId)?.toModel()
             val next =
                 RelationPolicy.apply(
                     current = current,
@@ -124,7 +165,7 @@ class RoomSocialStore(
                     at = now,
                     note = note,
                 )
-            affinityDao.upsert(next.toEntity(now))
+            affinityDao.upsert(next.toEntity(now, personaId))
 
             val mood = moodDao.get()?.toModel() ?: BotMood(updatedAt = now)
             val nextMood = MoodPolicy.apply(mood, event, now)
@@ -132,19 +173,39 @@ class RoomSocialStore(
         }
     }
 
-    /** 关系列表（按好感降序），维护端用。 */
+    /**
+     * 关系列表（按好感降序），维护端用。
+     *
+     * 跟随「当前视角」：未开隔离时是共用那一份；开启后切到哪个档案就显示
+     * 哪个档案攒下的关系。用 flow 包一层是因为解析人格本身是挂起操作。
+     */
     fun observeRelations(limit: Int = 50): Flow<List<PersonRelation>> =
-        affinityDao.observeTop(limit).map { rows -> rows.map { it.toModel() } }
+        flow {
+            val key = personaKey(null)
+            emitAll(affinityDao.observeTop(key, limit))
+        }.map { rows -> rows.map { it.toModel() } }
 
-    suspend fun relationOf(userId: String): PersonRelation? = affinityDao.find(userId)?.toModel()
+    suspend fun relationOf(userId: String): PersonRelation? =
+        affinityDao.find(personaKey(null), userId)?.toModel()
 
-    suspend fun forgetRelation(userId: String) = affinityDao.delete(userId)
+    suspend fun forgetRelation(userId: String) =
+        affinityDao.delete(personaKey(null), userId)
 
-    suspend fun allRelations(): List<PersonRelation> = affinityDao.all().map { it.toModel() }
+    /**
+     * 所有视角的关系行（备份导出用，不丢任何人格攒下的印象）。
+     *
+     * 用 (personaId, relation) 返回而不是裸关系：备份要按人格名重建视角，
+     * 只导数值会在换机后把各人格的关系糊成一份。
+     */
+    suspend fun allRelations(): List<Pair<Long, PersonRelation>> =
+        affinityDao.all().map { it.personaId to it.toModel() }
 
     /** 备份导入：原样写回，不走 RelationPolicy（那会按事件再改一次数值） */
-    suspend fun putRelation(relation: PersonRelation) {
-        affinityDao.upsert(relation.toEntity(clock()))
+    suspend fun putRelation(
+        relation: PersonRelation,
+        personaId: Long = 0,
+    ) {
+        affinityDao.upsert(relation.toEntity(clock(), personaId))
     }
 
     /** 备份导入：原样写回，不累加 hits */
@@ -330,8 +391,12 @@ private fun AffinityEntity.toModel() =
         lastNote = lastNote,
     )
 
-private fun PersonRelation.toEntity(now: Long) =
+private fun PersonRelation.toEntity(
+    now: Long,
+    personaId: Long = 0,
+) =
     AffinityEntity(
+        personaId = personaId,
         userId = userId,
         displayName = displayName,
         familiarity = familiarity,

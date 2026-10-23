@@ -95,6 +95,8 @@ class SettingsRepository(private val context: Context) {
         val MEMORY_PERSONA_REWRITE = booleanPreferencesKey("memory_persona_rewrite")
         val MEMORY_PERSONAL_THREAD = booleanPreferencesKey("memory_personal_thread")
         val MEMORY_PERSONAL_THREAD_SIZE = intPreferencesKey("memory_personal_thread_size")
+        /** 按人设分开记忆：换档案后不继承旧人格的对话、经验与关系 */
+        val MEMORY_PERSONA_SCOPED = booleanPreferencesKey("memory_persona_scoped")
 
         // ---- 群感知 ----
         val GREETING_ENABLED = booleanPreferencesKey("greeting_enabled")
@@ -244,6 +246,7 @@ class SettingsRepository(private val context: Context) {
                 prefs[Keys.MEMORY_PERSONAL_THREAD] ?: defaults.personalThreadEnabled,
             personalThreadSize =
                 prefs[Keys.MEMORY_PERSONAL_THREAD_SIZE] ?: defaults.personalThreadSize,
+            personaScoped = prefs[Keys.MEMORY_PERSONA_SCOPED] ?: defaults.personaScoped,
         )
     }
 
@@ -261,6 +264,7 @@ class SettingsRepository(private val context: Context) {
                 prefs[Keys.MEMORY_PERSONA_REWRITE] = config.personaRewrite
                 prefs[Keys.MEMORY_PERSONAL_THREAD] = config.personalThreadEnabled
                 prefs[Keys.MEMORY_PERSONAL_THREAD_SIZE] = config.personalThreadSize
+                prefs[Keys.MEMORY_PERSONA_SCOPED] = config.personaScoped
             }
         }
     }

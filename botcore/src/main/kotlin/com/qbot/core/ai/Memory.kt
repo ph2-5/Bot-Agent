@@ -117,12 +117,41 @@ data class RoomMessage(
     val externalId: String? = null,
     /** 处理结论：已回复 / 冷却中 / AI 判断不接…… */
     val decision: String? = null,
-)
+    /**
+     * 写下这条记录时生效的人格档案 id。
+     *
+     * 只有机器人自己的发言（assistant）会被它标记；群友说的话永远是全局的。
+     * 开启「按人设分开记忆」后，读取时会把别人人设的 assistant 行滤掉，
+     * 避免新人格接着旧人格的话茬说；关闭时整列不参与过滤。
+     */
+    val personaId: Long? = null,
+) {
+    /**
+     * 这条记录对某个人格是否可见。
+     *
+     * 群友的话（user）与无法归属的历史（personaId 为空）始终可见；
+     * 只有被明确标记成别人格的 assistant 行才隐藏。
+     */
+    fun visibleTo(personaId: Long?): Boolean =
+        personaId == null ||
+            role != "assistant" ||
+            this.personaId == null ||
+            this.personaId == personaId
+}
 
 /** 共享背景存储。scopeKey 形如 g:群openid / u:用户openid / c:频道id。 */
 interface RoomContextStore {
-    /** 最近的消息（正序） */
-    suspend fun recent(scopeKey: String, limit: Int): List<RoomMessage>
+    /**
+     * 最近的消息（正序）。
+     *
+     * [personaId] 非空时只保留「群友说的」+「当前人格说的」，
+     * 其它人格的 assistant 行会被过滤掉（见 [RoomMessage.personaId]）。
+     */
+    suspend fun recent(
+        scopeKey: String,
+        limit: Int,
+        personaId: Long? = null,
+    ): List<RoomMessage>
 
     suspend fun append(scopeKey: String, message: RoomMessage)
 
@@ -215,8 +244,17 @@ class InMemoryRoomContextStore : RoomContextStore {
     private val mutex = Mutex()
     private val store = mutableMapOf<String, MutableList<RoomMessage>>()
 
-    override suspend fun recent(scopeKey: String, limit: Int): List<RoomMessage> =
-        mutex.withLock { store[scopeKey]?.takeLast(limit).orEmpty() }
+    override suspend fun recent(
+        scopeKey: String,
+        limit: Int,
+        personaId: Long?,
+    ): List<RoomMessage> =
+        mutex.withLock {
+            store[scopeKey]
+                ?.filter { it.visibleTo(personaId) }
+                ?.takeLast(limit)
+                .orEmpty()
+        }
 
     override suspend fun append(scopeKey: String, message: RoomMessage) {
         mutex.withLock {

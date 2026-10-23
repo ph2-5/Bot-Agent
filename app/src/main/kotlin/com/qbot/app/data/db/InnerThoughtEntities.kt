@@ -32,6 +32,8 @@ data class InnerThoughtEntity(
     /** 没说出口的那部分（已按 600 字截断） */
     val thought: String,
     val createdAt: Long,
+    /** 产生这段话的人格；null = 未开人设隔离或旧数据 */
+    val personaId: Long? = null,
 )
 
 @Dao
@@ -45,12 +47,21 @@ interface InnerThoughtDao {
     @Query("SELECT * FROM inner_thoughts ORDER BY createdAt DESC, id DESC LIMIT :limit")
     suspend fun recentOnce(limit: Int): List<InnerThoughtEntity>
 
-    /** 对某个人最近一次"没说出口的话"：判断"我上次是不是忍了他"用。 */
+    /**
+     * 对某个人最近一次"没说出口的话"：判断"我上次是不是忍了他"用。
+     *
+     * [personaId] 为空时不过滤（未开人设隔离）；非空时只看当前人格的记录，
+     * 换人设不会继承旧人格"忍过这个人"的情绪。
+     */
     @Query(
         "SELECT * FROM inner_thoughts WHERE senderId = :senderId " +
+            "AND (:personaId IS NULL OR personaId = :personaId) " +
             "ORDER BY createdAt DESC, id DESC LIMIT 1",
     )
-    suspend fun lastFor(senderId: String): InnerThoughtEntity?
+    suspend fun lastFor(
+        senderId: String,
+        personaId: Long?,
+    ): InnerThoughtEntity?
 
     /** 只留最近 [keep] 条，避免长期挂机把库撑大。 */
     @Query(

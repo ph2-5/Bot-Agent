@@ -46,6 +46,7 @@ fun StylePage(onBack: () -> Unit) {
     val rules by controller.observeStyleRules().collectAsState(initial = emptyList())
     val builtin = rules.filter { it.source == StyleRuleSource.BUILTIN }
     val userRules = rules.filter { it.source == StyleRuleSource.USER }
+    val personaRules = rules.filter { it.source == StyleRuleSource.PERSONA }
     val pluginRules = rules.filter { it.source == StyleRuleSource.PLUGIN }
 
     var adding by remember { mutableStateOf(false) }
@@ -126,6 +127,43 @@ fun StylePage(onBack: () -> Unit) {
                             }
                         },
                     ) { Text("删除") }
+                }
+            }
+        }
+
+        SectionHeader("人设里的约束", "从当前人设正文自动提取「怎么说话」的要求，进入同一条渲染链路")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(
+                onClick = {
+                    scope.launch {
+                        val count = runCatching { controller.extractPersonaStyle() }.getOrDefault(0)
+                        hint =
+                            if (count > 0) {
+                                "已从人设提取 $count 条约束"
+                            } else {
+                                "没抽到可执行的约束（或 AI 未启用）"
+                            }
+                    }
+                },
+            ) { Text("从人设提取") }
+        }
+        if (personaRules.isEmpty()) {
+            HintText("还没有。人设里写了「别用感叹号」「不要自称 AI」这类要求，可以在这里一键抽出来。")
+        }
+        personaRules.forEach { rule ->
+            SettingsCard {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        rule.text,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Switch(
+                        checked = rule.enabled,
+                        onCheckedChange = { enabled ->
+                            scope.launch { controller.setStyleRuleEnabled(rule, enabled) }
+                        },
+                    )
                 }
             }
         }

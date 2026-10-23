@@ -53,6 +53,15 @@ class ToolRegistry(tools: List<BotTool> = emptyList()) {
 
     val specs: List<ToolSpec> get() = ordered.map { it.spec }
 
+    /**
+     * 只挑本轮真正能用的工具。
+     *
+     * 例如联网开关关着、表情库为空时，对应的 schema 不该发给模型，
+     * 否则它会调用一个注定返回「不可用」的函数，白白消耗一轮工具循环。
+     */
+    fun specsExcept(excluded: Set<String>): List<ToolSpec> =
+        ordered.filter { it.spec.name !in excluded }.map { it.spec }
+
     val isEmpty: Boolean get() = ordered.isEmpty()
 
     suspend fun execute(call: ToolCall): ToolResult {

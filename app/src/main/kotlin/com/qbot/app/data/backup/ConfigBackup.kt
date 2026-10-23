@@ -95,6 +95,8 @@ data class MemoryBackup(
     // ---- 2.8.0 新增：按人记对话（旧备份按默认值导入） ----
     @SerialName("personal_thread_enabled") val personalThreadEnabled: Boolean = true,
     @SerialName("personal_thread_size") val personalThreadSize: Int = 12,
+    // ---- 2.9.0 新增：按人设分开记忆（旧备份按默认值导入） ----
+    @SerialName("persona_scoped") val personaScoped: Boolean = false,
 )
 
 @Serializable
@@ -199,6 +201,8 @@ data class LessonBackup(
     /** 2.1 新增：目录类别与支撑次数；旧备份缺字段按「其他 / 1」导入 */
     val category: String = "OTHER",
     @SerialName("support_count") val supportCount: Int = 1,
+    /** 2.9.0 新增：经验归属的人格名（null = 共用/旧数据）；按名称而非 id 关联 */
+    @SerialName("persona_name") val personaName: String? = null,
 )
 
 @Serializable
@@ -210,6 +214,8 @@ data class RelationBackup(
     @SerialName("interaction_count") val interactionCount: Int = 0,
     @SerialName("last_interaction_at") val lastInteractionAt: Long = 0,
     @SerialName("last_note") val lastNote: String? = null,
+    /** 2.9.0 新增：关系归属的人格名（null = 共用视角） */
+    @SerialName("persona_name") val personaName: String? = null,
 )
 
 @Serializable

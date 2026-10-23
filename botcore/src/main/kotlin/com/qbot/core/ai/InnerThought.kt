@@ -25,6 +25,13 @@ data class InnerThought(
     /** 没说出口的那部分 */
     val thought: String,
     val createdAt: Long,
+    /**
+     * 产生这段话时的人格 id；null 表示「人设隔离关闭」或旧数据。
+     *
+     * 开启记忆隔离后，同一个人在不同人格下会有各自的内心戏——
+     * 否则新人格会继承旧人格"忍过这个人"的情绪。
+     */
+    val personaId: Long? = null,
 )
 
 /**

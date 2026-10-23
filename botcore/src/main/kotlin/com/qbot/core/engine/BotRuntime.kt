@@ -31,6 +31,7 @@ import com.qbot.core.ai.RelationRecorder
 import com.qbot.core.ai.SlangLearner
 import com.qbot.core.ai.SocialContextProvider
 import com.qbot.core.ai.StyleRule
+import com.qbot.core.ai.StyleRuleSource
 import com.qbot.core.ai.RoomMessage
 import com.qbot.core.ai.describe
 import com.qbot.core.api.MsgType
@@ -285,6 +286,13 @@ class BotRuntime(
         message: IncomingMessage,
         text: String,
     ) {
+        // 单聊/频道私信没有「先 @ 再全量」的双事件窗口，必须自己挡重复投递，
+        // 否则网关重连补发一次消息就会回两遍。群消息的去重在 handleChitchat 里。
+        if (message.kind == MessageKind.C2C || message.kind == MessageKind.DIRECT) {
+            if (isMessageSeen(message.messageId)) return
+            rememberMessage(message.messageId)
+        }
+
         // 学梗：丢到后台，不占这轮回复的时间
         slangLearner?.let { learner ->
             scope.launch { runCatching { learner.maybeLearn(message, text) } }
@@ -536,12 +544,14 @@ class BotRuntime(
                                 pipeline.markChitchatDecision(message, finalReason)
                                 return
                             }
-                            // 经验注入：群级优先、全局兜底；失败不影响判断
+                            // 经验注入：群级优先、全局兜底；开启人设隔离时只取
+                            // 当前人格的专属经验 + 通用经验。失败不影响判断。
                             val lessons =
                                 runCatching {
                                     chimeTrainer?.lessonsForPrompt(
                                         groupId,
                                         config.maxInjectedLessons,
+                                        pipeline.currentPersonaId(message),
                                     ) ?: emptyList()
                                 }.getOrDefault(emptyList())
                             // 关系会影响"想不想接"：熟人多搭两句，被伤过会犹豫。
@@ -672,6 +682,7 @@ class BotRuntime(
                             insulted = insulted,
                             addresseeKind = addressee.kind.name,
                             addresseeName = addressee.name,
+                            personaId = pipeline.currentPersonaId(message),
                             externalId = message.messageId,
                             createdAt = System.currentTimeMillis(),
                         ),
@@ -953,7 +964,24 @@ class BotRuntime(
         // 也不能因为关系表/规则表抖动就整条不回。
         val social = runCatching { socialProvider?.provide(message) }.getOrNull()
         val style = runCatching { styleRuleProvider?.invoke() }.getOrNull().orEmpty()
-        return base.copy(social = social ?: base.social, styleRules = style)
+        return base.copy(social = social ?: base.social, styleRules = styleForMessage(message, style))
+    }
+
+    /**
+     * 「1~10 字」「别用 Markdown」这类内置约束是为群聊闲扯准备的。
+     *
+     * 私聊里让人写总结、解释代码时套上去，只会把正常回答压成残句；
+     * 从人设里抽出来的规则同样属于群聊人格。用户自己手写的规则则：
+     * 他明确说要全局，就全局生效。
+     */
+    private fun styleForMessage(
+        message: IncomingMessage,
+        rules: List<StyleRule>,
+    ): List<StyleRule> {
+        val groupChat =
+            message.kind == MessageKind.GROUP_AT || message.kind == MessageKind.GROUP_MESSAGE
+        if (groupChat) return rules
+        return rules.filter { it.source == StyleRuleSource.USER }
     }
 
     /**
@@ -1006,6 +1034,8 @@ class BotRuntime(
                     spoken = reply.content,
                     thought = excerpt(thought, MAX_THOUGHT_CHARS),
                     createdAt = System.currentTimeMillis(),
+                    // 人设隔离开启时只带当前人格；关闭时为 null（共用一份）
+                    personaId = pipeline.currentPersonaId(message),
                 ),
             )
         }.onFailure { logger.w(TAG, "内心戏写入失败：${it.message}") }
@@ -1077,31 +1107,43 @@ class BotRuntime(
      *
      * 两条降级路径：上传失败或发送失败都只记日志——
      * 图是配菜，不能因为它把整条回复搞砸，更不该让群里看到一条报错。
-     * C2C / 单聊暂不支持：文件上传接口的路径与群不同，等有场景再接。
+     * 群聊与单聊的上传路径不同（`/groups` 与 `/users`），发送通道也不同。
      */
     private suspend fun sendMeme(
         message: IncomingMessage,
         imageUrl: String,
     ): Boolean {
         val target = message.targetId?.takeIf { it.isNotBlank() } ?: return false
-        val groupTarget =
-            when (message.kind) {
-                MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE, MessageKind.GUILD -> target
-                MessageKind.C2C, MessageKind.DIRECT -> return false
-            }
         val fileInfo =
-            runCatching { api.uploadGroupImage(groupTarget, imageUrl) }.getOrNull()
+            runCatching {
+                when (message.kind) {
+                    MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE, MessageKind.GUILD ->
+                        api.uploadGroupImage(target, imageUrl)
+                    MessageKind.C2C, MessageKind.DIRECT ->
+                        api.uploadUserImage(target, imageUrl)
+                }
+            }.getOrNull()
         if (fileInfo.isNullOrBlank()) {
             log(LogLevel.WARN, TAG, "表情包上传失败，跳过：${imageUrl.take(80)}")
             return false
         }
         return runCatching {
-            api.sendGroupMessage(
-                groupOpenId = groupTarget,
-                content = "",
-                msgType = MsgType.MEDIA,
-                mediaFileInfo = fileInfo,
-            )
+            when (message.kind) {
+                MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE, MessageKind.GUILD ->
+                    api.sendGroupMessage(
+                        groupOpenId = target,
+                        content = "",
+                        msgType = MsgType.MEDIA,
+                        mediaFileInfo = fileInfo,
+                    )
+                MessageKind.C2C, MessageKind.DIRECT ->
+                    api.sendUserMessage(
+                        userOpenId = target,
+                        content = "",
+                        msgType = MsgType.MEDIA,
+                        mediaFileInfo = fileInfo,
+                    )
+            }
             // 发出去了才算一次采用：失败时不能被计数，否则淘汰排序会被脏数据带偏
             runCatching { memeLibrary?.recordUse(imageUrl) }
             true

@@ -52,6 +52,13 @@ data class ChimeDecisionRecord(
     val addresseeKind: String? = null,
     /** 对某个成员说时的名字 */
     val addresseeName: String? = null,
+    /**
+     * 做出这次判断时实际扮演的人格。
+     *
+     * 开启「按人设分开记忆」后，由这次判断反思出的经验只归这个人格；
+     * null 表示未开隔离（经验共用）。
+     */
+    val personaId: Long? = null,
     val externalId: String?,
     val createdAt: Long,
 ) {
@@ -171,6 +178,13 @@ data class ChimeLesson(
     val category: String = LessonCategories.OTHER,
     /** 被多少条反馈支撑：同类相似反馈会累加，用于排序与淘汰。 */
     val supportCount: Int = 1,
+    /**
+     * 这条经验属于哪个人格。
+     *
+     * null = 通用经验（任何人格都能用）；非空 = 只在该人格下生效。
+     * 关闭「按人设分开记忆」时读写都不看这一列。
+     */
+    val personaId: Long? = null,
 ) {
     companion object {
         const val SOURCE_REFLECTION = "REFLECTION"
@@ -212,6 +226,60 @@ data class ChimeLesson(
 }
 
 /**
+ * 经验注入的统一挑选规则。
+ *
+ * 内存实现与 Room 实现都走这里，保证「测试里绿的」和「真机上的」是同一套逻辑：
+ * 1. 过滤：启用 + 本群或全局 + 人格可见（null 通用 / 等于当前人格）；
+ * 2. 排序：本群优先 → 时间衰减后的支撑分（30 天前的经验权重减半）；
+ * 3. 配额：同一类别最多 [ChimeLesson.MAX_PER_CATEGORY_INJECTED] 条。
+ *
+ * 衰减解决的是「一条早期错判经验永远排第一」——支撑再多，过几个月也该让位。
+ */
+object LessonSelection {
+    private const val DECAY_DAYS = 30.0
+    private const val DAY_MILLIS = 24.0 * 3600.0 * 1000.0
+
+    fun decayedScore(
+        lesson: ChimeLesson,
+        now: Long,
+    ): Double {
+        val ageDays = ((now - lesson.updatedAt).coerceAtLeast(0L)) / DAY_MILLIS
+        return lesson.supportCount / (1.0 + ageDays / DECAY_DAYS)
+    }
+
+    fun pick(
+        lessons: List<ChimeLesson>,
+        limit: Int,
+        groupId: String?,
+        personaId: Long?,
+        now: Long,
+    ): List<ChimeLesson> {
+        val sorted =
+            lessons
+                .asSequence()
+                .filter { it.enabled }
+                .filter { it.scopeGroupId == null || it.scopeGroupId == groupId }
+                .filter { personaId == null || it.personaId == null || it.personaId == personaId }
+                .sortedWith(
+                    compareByDescending<ChimeLesson> { it.scopeGroupId != null }
+                        .thenByDescending { decayedScore(it, now) }
+                        .thenByDescending { it.updatedAt },
+                )
+                .toList()
+        val perCategory = mutableMapOf<String, Int>()
+        val picked = mutableListOf<ChimeLesson>()
+        for (lesson in sorted) {
+            if (picked.size >= limit) break
+            val used = perCategory[lesson.category] ?: 0
+            if (used >= ChimeLesson.MAX_PER_CATEGORY_INJECTED) continue
+            perCategory[lesson.category] = used + 1
+            picked += lesson
+        }
+        return picked
+    }
+}
+
+/**
  * 决策出口。
  *
  * [com.qbot.core.engine.BotRuntime] 全局只调用一次（handleChitchat 的 finally），
@@ -247,8 +315,12 @@ interface ChimeLessonStore {
 
     suspend fun all(): List<ChimeLesson>
 
-    /** 注入用：该群专属优先，其次全局。类别配额在 [ChimeTrainer] 里做。 */
-    suspend fun promptLessons(groupId: String, limit: Int): List<ChimeLesson>
+    /** 注入用：该群专属优先，其次全局；人格与类别配额由 [LessonSelection] 统一裁剪。 */
+    suspend fun promptLessons(
+        groupId: String,
+        limit: Int,
+        personaId: Long? = null,
+    ): List<ChimeLesson>
 
     suspend fun insert(lesson: ChimeLesson): Long
 
@@ -268,6 +340,8 @@ interface ChimeLessonStore {
     suspend fun sameCategory(
         groupId: String?,
         category: String,
+        /** 只看该人格的经验；null 表示沿用存储的当前视角（未开隔离时即全部） */
+        personaId: Long? = null,
     ): List<ChimeLesson>
 
     suspend fun trim(keep: Int)
@@ -282,13 +356,16 @@ interface ChimeTrainer : ChimeDecisionSink {
     suspend fun lessonsForPrompt(
         groupId: String,
         limit: Int = ChimeLesson.DEFAULT_INJECTED,
+        personaId: Long? = null,
     ): List<ChimeLesson>
 
     suspend fun bumpHits(ids: Collection<Long>)
 }
 
 /** botcore 自带的内存实现，供测试与「不落库」模式使用。 */
-class InMemoryChimeTrainer : ChimeTrainer {
+class InMemoryChimeTrainer(
+    private val now: () -> Long = System::currentTimeMillis,
+) : ChimeTrainer {
     private val records = mutableListOf<ChimeDecisionRecord>()
     private val stored = mutableListOf<ChimeLesson>()
     private var nextId = 1L
@@ -300,27 +377,18 @@ class InMemoryChimeTrainer : ChimeTrainer {
         records += record
     }
 
-    override suspend fun lessonsForPrompt(groupId: String, limit: Int): List<ChimeLesson> {
-        val sorted =
-            stored
-                .filter { it.enabled && (it.scopeGroupId == null || it.scopeGroupId == groupId) }
-                .sortedWith(
-                    compareByDescending<ChimeLesson> { it.scopeGroupId != null }
-                        .thenByDescending { it.supportCount }
-                        .thenByDescending { it.updatedAt },
-                )
-        // 类别配额：同一类最多占 3 条，避免经验被单一场景占满
-        val perCategory = mutableMapOf<String, Int>()
-        val picked = mutableListOf<ChimeLesson>()
-        for (lesson in sorted) {
-            if (picked.size >= limit) break
-            val used = perCategory[lesson.category] ?: 0
-            if (used >= ChimeLesson.MAX_PER_CATEGORY_INJECTED) continue
-            perCategory[lesson.category] = used + 1
-            picked += lesson
-        }
-        return picked
-    }
+    override suspend fun lessonsForPrompt(
+        groupId: String,
+        limit: Int,
+        personaId: Long?,
+    ): List<ChimeLesson> =
+        LessonSelection.pick(
+            lessons = stored.toList(),
+            limit = limit,
+            groupId = groupId,
+            personaId = personaId,
+            now = now(),
+        )
 
     override suspend fun bumpHits(ids: Collection<Long>) {
         if (ids.isEmpty()) return
@@ -338,6 +406,7 @@ class InMemoryChimeTrainer : ChimeTrainer {
         updatedAt: Long = 0,
         category: String = LessonCategories.OTHER,
         supportCount: Int = 1,
+        personaId: Long? = null,
     ): ChimeLesson {
         val lesson =
             ChimeLesson(
@@ -349,6 +418,7 @@ class InMemoryChimeTrainer : ChimeTrainer {
                 updatedAt = updatedAt,
                 category = category,
                 supportCount = supportCount,
+                personaId = personaId,
             )
         stored += lesson
         return lesson

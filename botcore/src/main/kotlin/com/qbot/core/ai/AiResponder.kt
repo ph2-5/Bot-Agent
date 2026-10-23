@@ -96,6 +96,16 @@ data class AiConfig(
         get() = enabled && apiKey.isNotBlank() && model.isNotBlank() && baseUrl.isNotBlank()
 
     /**
+     * 本轮是否真的能把 web_search 工具交给模型。
+     *
+     * 只有 DeepSeek 官方端点实现了这套搜索接口；开关关着或换了服务商时，
+     * 工具说明不能出现在请求里——否则模型会反复调用一个注定失败的函数，
+     * 白烧一轮工具循环。
+     */
+    val webSearchAvailable: Boolean
+        get() = webSearch && baseUrl.contains("deepseek", ignoreCase = true)
+
+    /**
      * 带图时实际使用的模型名。
      *
      * 用户填了 [visionModel] 就用它；没填时，DeepSeek 官方端点退回
@@ -276,11 +286,19 @@ class AiResponder(
     private val imageInliner: ImageInliner = ImageInliner { it },
 ) {
     /**
-     * 服务商不支持 tools 时置位，后续请求不再携带，避免每条消息都白试一次。
+     * 服务商不支持 tools 时记下「是哪套配置不认」，后续同一端点/模型不再携带。
      * 只在 400（且不是上下文超限）时降级。
+     *
+     * 记配置而不是记一个布尔，是因为用户换模型/换服务商后工具可能又能用了；
+     * 一个进程级开关会让表情包和联网搜索在换配置后「永久失效到重启」。
      */
     @Volatile
-    private var toolsUnsupported = false
+    private var toolsUnsupportedFor: String? = null
+
+    private fun toolSignature(config: AiConfig): String = "${config.baseUrl}|${config.model}"
+
+    private fun toolsBlocked(config: AiConfig): Boolean =
+        toolsUnsupportedFor == toolSignature(config)
 
     companion object {
         /** 触发 AI 的命令前缀 */
@@ -326,15 +344,24 @@ class AiResponder(
          */
         const val JUDGE_PROMPT_TAG = "【接话判断】"
 
+        /** 会话锁表上限：超过后回收空闲锁，避免长期运行时 map 无限膨胀。 */
+        private const val MAX_LOCKS = 128
 
     }
 
     // 同一会话串行处理：群聊里多人连问时，避免并发请求把历史顺序打乱。
-    // map 会在超过上限时整体清空重建，长期运行也不会无限增长。
+    // 超过上限时只回收「当前没人持有」的锁；清空整张表会让正在排队的会话
+    // 各自拿到新的 Mutex，历史写入重新变成并发。
     private val locks = ConcurrentHashMap<String, Mutex>()
 
     private fun lockFor(key: String): Mutex {
-        if (locks.size > 128) locks.clear()
+        if (locks.size > MAX_LOCKS) {
+            locks.entries.removeIf { (_, mutex) ->
+                if (!mutex.tryLock()) return@removeIf false
+                mutex.unlock()
+                true
+            }
+        }
         return locks.getOrPut(key) { Mutex() }
     }
 
@@ -748,11 +775,13 @@ class AiResponder(
         config: AiConfig,
         imageUrl: String?,
         useTools: Boolean,
+        unavailableTools: Set<String> = emptySet(),
     ): LlmReply {
         // 带图时优先用视觉模型；没填时 DeepSeek 端点会自动退回 deepseek-flash
         val model =
             if (!imageUrl.isNullOrBlank()) config.modelForImage() else config.model
-        val sendTools = useTools && !toolsUnsupported && !tools.isEmpty
+        val availableSpecs = tools.specsExcept(unavailableTools)
+        val sendTools = useTools && !toolsBlocked(config) && availableSpecs.isNotEmpty()
 
         suspend fun call(withTools: Boolean): LlmReply =
             client.chat(
@@ -763,7 +792,7 @@ class AiResponder(
                 temperature = config.temperature,
                 maxTokens = config.maxTokens,
                 thinkingType = thinkingParam(config),
-                tools = if (withTools) tools.specs else emptyList(),
+                tools = if (withTools) availableSpecs else emptyList(),
             )
 
         val reply =
@@ -785,7 +814,7 @@ class AiResponder(
                     e !is ContextTooLongException &&
                     (looksLikeTools || imageUrl.isNullOrBlank())
                 ) {
-                    toolsUnsupported = true
+                    toolsUnsupportedFor = toolSignature(config)
                     call(false)
                 } else {
                     throw e
@@ -812,9 +841,15 @@ class AiResponder(
         var messages = buildMessages(storedHistory, question, config, memory, systemPrompt, imageUrl)
         var memeUrl: String? = null
         var round = 0
+        // 本轮不能用的工具不发给模型：联网关着 / 端点不支持 / 表情库为空。
+        val unavailable =
+            buildSet {
+                if (!config.webSearchAvailable) add("web_search")
+                if (memory?.social?.memes.isNullOrEmpty()) add("send_meme")
+            }
 
         while (true) {
-            val reply = executeChat(messages, config, imageUrl, useTools = true)
+            val reply = executeChat(messages, config, imageUrl, useTools = true, unavailableTools = unavailable)
             if (reply.toolCalls.isEmpty()) return reply to memeUrl
 
             if (round >= MAX_TOOL_ROUNDS) {

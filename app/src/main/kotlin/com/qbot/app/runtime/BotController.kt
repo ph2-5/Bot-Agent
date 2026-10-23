@@ -75,6 +75,7 @@ import com.qbot.core.ai.PersonaStage
 import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.PersonaResolver
 import com.qbot.core.ai.PersonaLoreExtractor
+import com.qbot.core.ai.PersonaStyleExtractor
 import com.qbot.core.ai.RemoteImageLoader
 import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.SendMemeTool
@@ -184,6 +185,14 @@ class BotController(
             snapshotDao = database.personaSnapshotDao(),
         )
 
+    /**
+     * 逐消息解析当前生效的人格（覆盖层 > 激活档案 > 种子）。
+     *
+     * 提示词、会话线程、人设设定、关系与经验都从这里取同一个 id，
+     * 避免「说的是 A 人设，记忆却记到 B 人设」的错位。
+     */
+    private val personaResolver = PersonaResolver(store = personaRepository)
+
     /** 身份存储，供维护端「备注名 / 忘掉某人」与管线共用。 */
     private val identityStore = RoomIdentityStore(database.identityDao())
 
@@ -220,6 +229,9 @@ class BotController(
             facts = factStore,
             roomContext = roomContextStore,
             configProvider = { settings.memoryConfig.value },
+            // 会话/记忆按「本条消息实际扮演的人格」隔离，而不是全局激活档案；
+            // 是否真的隔离由 MemoryConfig.personaScoped 决定（管线内部判断）。
+            personaIdProvider = { message -> personaResolver.resolve(message).personaId },
             groupStore = groupStore,
             botNameProvider = { runtime?.botName?.takeIf { it.isNotBlank() } },
         )
@@ -231,7 +243,14 @@ class BotController(
      * 经验在判断前读取、注入提示词，并累计命中次数。
      */
     private val chimeDecisionStore = RoomChimeDecisionStore(database.chimeDecisionDao())
-    private val chimeLessonStore = RoomChimeLessonStore(database.chimeLessonDao())
+    private val chimeLessonStore =
+        RoomChimeLessonStore(
+            dao = database.chimeLessonDao(),
+            // 未开隔离时返回 null：经验仍是共用的一份，行为与旧版本一致
+            personaIdProvider = {
+                if (settings.memoryConfig.value.personaScoped) personaRepository.active()?.id else null
+            },
+        )
     private val chimeTrainer = RoomChimeTrainer(chimeDecisionStore, chimeLessonStore)
 
     /** 内心戏出口：思考模式打开时，模型没说出口的那段话落这里。 */
@@ -253,8 +272,17 @@ class BotController(
             thoughtDao = database.innerThoughtDao(),
             memeDao = database.memeDao(),
             loreDao = database.loreDao(),
-            // 人设设定按当前激活档案隔离：换人设后不会把上一个人设的「老爹」带过去
-            personaIdProvider = { personaRepository.active()?.id },
+            // 设定必须跟着本条消息实际扮演的人格走：某群挂了覆盖层人设时，
+            // 过去取 active() 会把设定接到另一个人格上（审计 A1）。
+            personaIdProvider = { message ->
+                if (message == null) {
+                    personaRepository.active()?.id
+                } else {
+                    personaResolver.resolve(message).personaId
+                }
+            },
+            // 关系/内心戏是否按人设分开，由维护端开关决定（默认共用）
+            isolateMemories = { settings.memoryConfig.value.personaScoped },
         )
 
     /** 反思串行化：一次只处理一条反馈，避免并发写入把经验库弄乱 */
@@ -306,6 +334,16 @@ class BotController(
      * 读库、调模型、写快照——用户以为已经关了。
      */
     private var growthJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * 启动代次：每调用一次 start() 递增，stop() 也递增。
+     *
+     * start() 是挂起链（引导 → 读设置 → build），期间用户可能已经点了停止。
+     * 启动协程在每个挂起点后比对代次，发现自己已过期就直接退出，
+     * 避免「停了又自己活过来」的幽灵运行时。
+     */
+    @Volatile
+    private var startGeneration = 0
 
     /** 身份存储（公开给维护端 UI 做备注名 / 忘掉某人）。 */
     fun identityStore(): RoomIdentityStore = identityStore
@@ -513,20 +551,40 @@ class BotController(
         var saved = 0
         entries.forEach { entry ->
             runCatching { loreStore.save(entry) }.onSuccess { saved++ }
-            // 设定里的「特殊说法」同时补进梗库：群里提到时模型能听懂，
-            // 与从群聊里收获的梗分开标注来源，维护端可以区别对待。
-            if (entry.kind == LoreKind.SLANG) {
-                runCatching {
-                    socialStore.upsertSlang(
-                        SlangTerm(
-                            term = entry.name,
-                            meaning = entry.note,
-                            source = SlangTerm.SOURCE_AI,
-                            hits = 1,
-                        ),
-                    )
-                }
-            }
+        }
+        // 设定里的「特殊说法」已由 lore 注入提示词（LoreRender），
+        // 不再同时写进梗库——那会导致同一条说法在提示词里出现两遍（审计 M2）。
+        return saved
+    }
+
+    /**
+     * 从当前人设正文里抽取「怎么说话」的约束，写入 [StyleRuleSource.PERSONA]。
+     *
+     * 过去用户在人设里写的「别用感叹号 / 别自称 AI / 少用表情」只作为人设正文
+     * 的一部分被模型忽略，设置页的「语言约束」与它各管各的（审计 M1）。
+     * 抽取后这些约束进入统一的风格渲染链路，可逐条启停、可被用户规则覆盖。
+     *
+     * 重抽会先清掉上一批 PERSONA 规则，避免人设改短后旧约束残留。
+     *
+     * @return 本次写入的条数；0 表示没抽到或 AI 不可用
+     */
+    suspend fun extractPersonaStyle(): Int {
+        val persona = runCatching { personaRepository.active() }.getOrNull() ?: return 0
+        val prompt = persona.prompt.trim()
+        if (prompt.isBlank()) return 0
+        val config = settings.aiConfig.value
+        if (!config.enabled || !config.isReady) return 0
+        val rules =
+            runCatching {
+                PersonaStyleExtractor(LlmClient(http = http, logger = logger))
+                    .extract(prompt, config)
+            }.getOrDefault(emptyList())
+        // 即使没抽到也清掉上一批：人设已经删掉的约束不该继续生效
+        runCatching { styleRuleStore.clearSource(StyleRuleSource.PERSONA) }
+        if (rules.isEmpty()) return 0
+        var saved = 0
+        rules.forEach { rule ->
+            runCatching { styleRuleStore.upsert(rule) }.onSuccess { saved++ }
         }
         return saved
     }
@@ -573,6 +631,8 @@ class BotController(
             }
 
             val scope = decision.record.groupId
+            // 这次判断实际扮演的人格；开启隔离后，经验只归它、也只参考它的旧经验
+            val personaId = decision.record.personaId
             val updated =
                 decision.copy(
                     feedback = false,
@@ -584,7 +644,7 @@ class BotController(
                     chatWithRetry(
                         cfg = cfg,
                         system = ChimeReflection.buildSystemPrompt(),
-                        user = ChimeReflection.buildUserPrompt(updated, chimeLessonStore.all()),
+                        user = ChimeReflection.buildUserPrompt(updated, lessonsForReflection(personaId)),
                         maxTokens = GenerationLimits.forConfig(cfg),
                     )
                 }.getOrElse {
@@ -597,7 +657,7 @@ class BotController(
 
             // 归档到固定类别后，只在该类别里查重：
             // 同一件事的另一种说法会被改写并累加支撑数，而不是新增一条。
-            val sameCategory = chimeLessonStore.sameCategory(scope, parsed.category)
+            val sameCategory = chimeLessonStore.sameCategory(scope, parsed.category, personaId)
             val similar = ChimeReflection.findSimilar(parsed.text, sameCategory)
             val outcome =
                 if (similar != null) {
@@ -614,6 +674,7 @@ class BotController(
                             updatedAt = now,
                             category = parsed.category,
                             supportCount = 1,
+                            personaId = personaId,
                         ),
                     )
                     "已记录，学到一条「${LessonCategories.label(parsed.category)}」经验：${parsed.text}"
@@ -621,7 +682,7 @@ class BotController(
 
             // 同类过长就归并（偶发、成本可控），顺便按容量淘汰
             val merged =
-                runCatching { mergeCategoryIfNeeded(scope, parsed.category, cfg) }.getOrNull()
+                runCatching { mergeCategoryIfNeeded(scope, parsed.category, cfg, personaId) }.getOrNull()
             if (merged.isNullOrBlank()) {
                 chimeLessonStore.trim(settings.chitchatConfig.value.maxLessons)
                 outcome
@@ -663,6 +724,18 @@ class BotController(
     }
 
     /**
+     * 反思上下文里只看同视角的经验。
+     *
+     * 开启隔离后，别人格攒下的偏好不该影响这次的总结；
+     * personaId 为 null（未开隔离 / 旧记录）时保持全量。
+     * personaId 为空的经验是旧数据或公共经验，仍然保留。
+     */
+    private suspend fun lessonsForReflection(personaId: Long?): List<ChimeLesson> {
+        val all = chimeLessonStore.all()
+        return if (personaId == null) all else all.filter { it.personaId == null || it.personaId == personaId }
+    }
+
+    /**
      * 同类归并：某类别条数超过上限时，让模型把近义条目压成 ≤3 条。
      *
      * 只在「超限」时触发，成本可控；失败保持原样，下次再试。
@@ -672,9 +745,10 @@ class BotController(
         scopeGroupId: String?,
         category: String,
         cfg: AiConfig,
+        personaId: Long? = null,
     ): String? {
         val maxLessons = settings.chitchatConfig.value.maxLessons
-        val lessons = chimeLessonStore.sameCategory(scopeGroupId, category)
+        val lessons = chimeLessonStore.sameCategory(scopeGroupId, category, personaId)
         if (lessons.size <= ChimeLesson.MAX_PER_CATEGORY) {
             chimeLessonStore.trim(maxLessons)
             return null
@@ -704,6 +778,7 @@ class BotController(
                     category = category,
                     supportCount = (support / merged.size).coerceAtLeast(1),
                     hits = (hits / merged.size).coerceAtLeast(0),
+                    personaId = personaId,
                 ),
             )
         }
@@ -819,14 +894,26 @@ class BotController(
             return
         }
 
+        val generation = ++startGeneration
         scope.launch {
             // 保证第一条消息就有人格：引导必须在 build 之前完成
             runCatching { ensurePersonaBootstrap() }
+            if (generation != startGeneration) return@launch
             // 用 first() 直接取当前值：stateIn().value 在还没有订阅者时
             // 只会返回初始默认值，会导致省电模式设置被忽略。
             val powerSaving = settings.powerSaving.first()
+            if (generation != startGeneration) return@launch
             val intents = if (powerSaving) Intents.MESSAGES_ONLY else Intents.DEFAULT
             build(credentials.appId, credentials.clientSecret, intents)
+            // build 之后再次校验：构建期间用户可能已经点了停止
+            if (generation != startGeneration) {
+                runtime?.stop()
+                gateway?.stop()
+                runtime = null
+                gateway = null
+                _status.value = GatewayStatus(state = ConnectionState.IDLE)
+                return@launch
+            }
             runtime?.start()
             ensureGrowthRunning()
         }
@@ -834,6 +921,8 @@ class BotController(
 
     /** 停止机器人。 */
     fun stop() {
+        // 让尚未完成的启动协程作废
+        startGeneration++
         growthJob?.cancel()
         growthJob = null
         runtime?.stop()
@@ -1217,6 +1306,7 @@ class BotController(
                         personaRewrite = memory.personaRewrite,
                         personalThreadEnabled = memory.personalThreadEnabled,
                         personalThreadSize = memory.personalThreadSize,
+                        personaScoped = memory.personaScoped,
                     ),
                 greeting = GreetingBackup(enabled = greeting.enabled, text = greeting.text),
                 chitchat =
@@ -1300,7 +1390,7 @@ class BotController(
                 // 关系与梗：都是"养"出来的，换机不该从零开始
                 relations =
                     runCatching { socialStore.allRelations() }.getOrDefault(emptyList())
-                        .map { relation ->
+                        .map { (personaId, relation) ->
                         RelationBackup(
                             userId = relation.userId,
                             displayName = relation.displayName,
@@ -1309,6 +1399,8 @@ class BotController(
                             interactionCount = relation.interactionCount,
                             lastInteractionAt = relation.lastInteractionAt,
                             lastNote = relation.lastNote,
+                            // 0 是共用视角，不写名字；按名字而不是 id 关联人格
+                            personaName = personaNames[personaId],
                         )
                     },
                 slang =
@@ -1365,6 +1457,7 @@ class BotController(
                             updatedAt = lesson.updatedAt,
                             category = lesson.category,
                             supportCount = lesson.supportCount,
+                            personaName = personaNames[lesson.personaId],
                         )
                     },
             )
@@ -1430,6 +1523,7 @@ class BotController(
                     personaRewrite = it.personaRewrite,
                     personalThreadEnabled = it.personalThreadEnabled,
                     personalThreadSize = it.personalThreadSize,
+                    personaScoped = it.personaScoped,
                 ),
             )
             applied++
@@ -1472,50 +1566,8 @@ class BotController(
             applied++
         }
 
-        // 接话经验：按「同作用域 + 文本相似」去重合并，不覆盖已有条目
-        var lessonCount = 0
-        if (backup.chimeLessons.isNotEmpty()) {
-            val merged = chimeLessonStore.all().toMutableList()
-            val now = System.currentTimeMillis()
-            backup.chimeLessons.forEach { dto ->
-                val text = dto.text.trim().take(ChimeLesson.MAX_TEXT_CHARS)
-                if (text.length < 4) return@forEach
-                val sameScope = merged.filter { it.scopeGroupId == dto.groupId }
-                if (ChimeReflection.findSimilar(text, sameScope) != null) return@forEach
-                val created = dto.createdAt.takeIf { it > 0 } ?: now
-                val updated = dto.updatedAt.takeIf { it > 0 } ?: created
-                val id =
-                    chimeLessonStore.insert(
-                        ChimeLesson(
-                            text = text,
-                            source = ChimeLesson.SOURCE_REFLECTION,
-                            scopeGroupId = dto.groupId,
-                            hits = dto.hits.coerceAtLeast(0),
-                            createdAt = created,
-                            updatedAt = updated,
-                            category = LessonCategories.normalize(dto.category),
-                            supportCount = dto.supportCount.coerceAtLeast(1),
-                        ),
-                    )
-                merged +=
-                    ChimeLesson(
-                        id = id,
-                        text = text,
-                        source = ChimeLesson.SOURCE_REFLECTION,
-                        scopeGroupId = dto.groupId,
-                        hits = dto.hits,
-                        createdAt = created,
-                        updatedAt = updated,
-                        category = LessonCategories.normalize(dto.category),
-                        supportCount = dto.supportCount.coerceAtLeast(1),
-                    )
-                lessonCount++
-            }
-            if (lessonCount > 0) {
-                chimeLessonStore.trim(settings.chitchatConfig.value.maxLessons)
-            }
-            applied++
-        }
+        // 接话经验与关系：必须等人格档案导入完成后才能按「人格名 → id」重建归属，
+        // 因此挪到本方法后半段统一处理（原先在这里，会把经验全落到共用视角）。
 
         var ruleCount = 0
         backup.rules.forEach { dto ->
@@ -1575,24 +1627,7 @@ class BotController(
             return id
         }
 
-        if (backup.relations.isNotEmpty()) {
-            backup.relations.forEach { dto ->
-                runCatching {
-                    socialStore.putRelation(
-                        PersonRelation(
-                            userId = dto.userId,
-                            displayName = dto.displayName,
-                            familiarity = dto.familiarity,
-                            affinity = dto.affinity,
-                            interactionCount = dto.interactionCount,
-                            lastInteractionAt = dto.lastInteractionAt,
-                            lastNote = dto.lastNote,
-                        ),
-                    )
-                }
-            }
-            applied++
-        }
+        // 关系随人格一起在文末导入（需要先建好人格档案）
 
         if (backup.slang.isNotEmpty()) {
             runCatching {
@@ -1720,6 +1755,80 @@ class BotController(
             applied++
         }
 
+        // ---- 接话经验：按人格名重建归属，同作用域 + 文本相似去重 ----
+        var lessonCount = 0
+        if (backup.chimeLessons.isNotEmpty()) {
+            val personaIds = personaRepository.all().associate { it.name to it.id }
+            val merged = chimeLessonStore.all().toMutableList()
+            val now = System.currentTimeMillis()
+            backup.chimeLessons.forEach { dto ->
+                val text = dto.text.trim().take(ChimeLesson.MAX_TEXT_CHARS)
+                if (text.length < 4) return@forEach
+                // 找回这个人格：备份里没有名字（共用经验）或人格已不存在时落在 null
+                val personaId = dto.personaName?.let { personaIds[it] }
+                // 去重只在同一视角、同一作用域内做，避免把两个人格的经验并成一条
+                val sameScope =
+                    merged.filter { it.scopeGroupId == dto.groupId && it.personaId == personaId }
+                if (ChimeReflection.findSimilar(text, sameScope) != null) return@forEach
+                val created = dto.createdAt.takeIf { it > 0 } ?: now
+                val updated = dto.updatedAt.takeIf { it > 0 } ?: created
+                val id =
+                    chimeLessonStore.insert(
+                        ChimeLesson(
+                            text = text,
+                            source = ChimeLesson.SOURCE_REFLECTION,
+                            scopeGroupId = dto.groupId,
+                            hits = dto.hits.coerceAtLeast(0),
+                            createdAt = created,
+                            updatedAt = updated,
+                            category = LessonCategories.normalize(dto.category),
+                            supportCount = dto.supportCount.coerceAtLeast(1),
+                            personaId = personaId,
+                        ),
+                    )
+                merged +=
+                    ChimeLesson(
+                        id = id,
+                        text = text,
+                        source = ChimeLesson.SOURCE_REFLECTION,
+                        scopeGroupId = dto.groupId,
+                        hits = dto.hits,
+                        createdAt = created,
+                        updatedAt = updated,
+                        category = LessonCategories.normalize(dto.category),
+                        supportCount = dto.supportCount.coerceAtLeast(1),
+                        personaId = personaId,
+                    )
+                lessonCount++
+            }
+            if (lessonCount > 0) {
+                chimeLessonStore.trim(settings.chitchatConfig.value.maxLessons)
+            }
+            applied++
+        }
+
+        // ---- 关系：按人格名回到各自视角；找不到人格时落在共用视角 0 ----
+        if (backup.relations.isNotEmpty()) {
+            val personaIds = personaRepository.all().associate { it.name to it.id }
+            backup.relations.forEach { dto ->
+                runCatching {
+                    socialStore.putRelation(
+                        PersonRelation(
+                            userId = dto.userId,
+                            displayName = dto.displayName,
+                            familiarity = dto.familiarity,
+                            affinity = dto.affinity,
+                            interactionCount = dto.interactionCount,
+                            lastInteractionAt = dto.lastInteractionAt,
+                            lastNote = dto.lastNote,
+                        ),
+                        personaId = dto.personaName?.let { personaIds[it] } ?: 0L,
+                    )
+                }
+            }
+            applied++
+        }
+
         var styleCount = 0
         if (backup.styleRules.isNotEmpty()) {
             runCatching {
@@ -1811,7 +1920,7 @@ class BotController(
         // AiConfig 通过 provider 在每条消息处理时现取，改设置无需重启。
         // 人格解析：覆盖层 → 激活档案 → 种子骨架，永不返回空——
         // 空 system 会让 PromptAssembler 整条不注入，模型立刻退化成客服腔。
-        val personaResolver = PersonaResolver(store = personaRepository)
+        // 用类级实例，保证提示词、记忆、设定与经验看到的是同一个人格。
         val aiResponder =
             AiResponder(
                 client = LlmClient(http = http, logger = logger),

@@ -131,4 +131,8 @@ interface StyleRuleDao {
 
     @Query("DELETE FROM style_rules WHERE source = 'USER'")
     suspend fun clearUserRules()
+
+    /** 清空某个来源（从人设重新提取前先删上一批 PERSONA 规则）。 */
+    @Query("DELETE FROM style_rules WHERE source = :source")
+    suspend fun clearSource(source: String)
 }
