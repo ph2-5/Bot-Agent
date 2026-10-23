@@ -842,10 +842,12 @@ class AiResponder(
         var memeUrl: String? = null
         var round = 0
         // 本轮不能用的工具不发给模型：联网关着 / 端点不支持 / 表情库为空。
+        // 注意只有在**拿到记忆上下文且库确实为空**时才摘掉表情工具：
+        // memory 为 null 表示调用方没提供候选，不等于库是空的。
         val unavailable =
             buildSet {
                 if (!config.webSearchAvailable) add("web_search")
-                if (memory?.social?.memes.isNullOrEmpty()) add("send_meme")
+                if (memory != null && memory.social?.memes?.isEmpty() == true) add("send_meme")
             }
 
         while (true) {

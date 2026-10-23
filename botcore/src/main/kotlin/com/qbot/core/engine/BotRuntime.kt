@@ -6,6 +6,7 @@ import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.AiReply
 import com.qbot.core.ai.AiResponder
 import com.qbot.core.ai.BehaviorContext
+import com.qbot.core.ai.BotNameMatcher
 import com.qbot.core.ai.ChimeDecisionRecord
 import com.qbot.core.ai.ChimeTrainer
 import com.qbot.core.ai.LessonCategories
@@ -446,12 +447,14 @@ class BotRuntime(
         val recent = pipeline.recentRoomMessages(message, chitchatConfig?.judgeContextSize ?: 8)
 
         val mentionIds = mentionIdsOf(message)
+        // 名字来源三处：本群群名片、官方 username、人设正文里的自称
+        // （群名片叫「过去的阿远」，角色卡写"你叫阿远"，群友喊的是后一个）。
         val names =
-            if (profile != null) {
-                listOfNotNull(profile.botName, botName.takeIf { it.isNotBlank() })
-            } else {
-                listOfNotNull(botName.takeIf { it.isNotBlank() })
-            }
+            buildList {
+                profile?.botName?.takeIf { it.isNotBlank() }?.let(::add)
+                botName.takeIf { it.isNotBlank() }?.let(::add)
+                addAll(BotNameMatcher.namesFromPrompt(personaPrompt.orEmpty()))
+            }.distinct()
         // 被指名冒犯：名字（含后缀）+ 侮辱词同时成立才算。
         // 侮辱词 = 内置表 + 用户在设置里追加的自定义词（语言黑话层出不穷，
         // 用户把自己群里实际出现的词加进来，判定才准）。
@@ -1035,7 +1038,7 @@ class BotRuntime(
                     thought = excerpt(thought, MAX_THOUGHT_CHARS),
                     createdAt = System.currentTimeMillis(),
                     // 人设隔离开启时只带当前人格；关闭时为 null（共用一份）
-                    personaId = pipeline.currentPersonaId(message),
+                    personaId = memoryPipeline?.currentPersonaId(message),
                 ),
             )
         }.onFailure { logger.w(TAG, "内心戏写入失败：${it.message}") }
