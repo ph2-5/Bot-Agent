@@ -20,18 +20,15 @@ import com.qbot.core.ai.PersonaStage
 import kotlinx.coroutines.launch
 
 /**
- * 人格成长设置。
+ * 人格成长。
  *
- * 2.3.1 起这里只剩"开关"和"说明"——节奏交给模型自己判断。
- * 过去那三个滑杆（多少条破壳 / 多少条成长 / 间隔几小时）本质上是在让用户
- * 猜一个没人知道答案的数字：设大了冷清群永远不长，设小了热闹群天天改。
+ * 这里**没有**"自动成长开关"——它和「冻结」是同一件事，只留一个。
+ * 节奏也不需要用户调：有新消息就交给模型，它觉得没东西可学就回 NO_CHANGE。
  */
 @Composable
 fun PersonaGrowthPage(onBack: () -> Unit) {
     val app = LocalContext.current.applicationContext as BotApplication
     val controller = remember { app.controller }
-    val settings = remember { app.settings }
-    val config by settings.personaGrowthConfig.collectAsState()
     val active by controller.observeActivePersona().collectAsState(initial = null)
     val scope = rememberCoroutineScope()
 
@@ -40,8 +37,8 @@ fun PersonaGrowthPage(onBack: () -> Unit) {
         subtitle = "它自己判断什么时候该长一点",
         onBack = onBack,
     ) {
+        val persona = active
         SettingsCard {
-            val persona = active
             if (persona == null) {
                 HintText("还没有人格档案。去「AI → 人设」点右下角的 + 建一个。")
             } else {
@@ -58,8 +55,11 @@ fun PersonaGrowthPage(onBack: () -> Unit) {
                     color = MaterialTheme.colorScheme.primary,
                 )
 
-                when (persona.stage) {
-                    PersonaStage.MANUAL -> {
+                when {
+                    persona.frozen ->
+                        HintText("已冻结：它不会自己改。想恢复就把下面的开关关掉。")
+
+                    persona.stage == PersonaStage.MANUAL -> {
                         HintText(
                             "这份人格是你手写的（或从旧版系统提示词继承的），不会被自动改写。" +
                                 "想让它自己长，点下面交给它——从这一刻起，它会按群聊自己微调。",
@@ -73,31 +73,31 @@ fun PersonaGrowthPage(onBack: () -> Unit) {
                         }
                     }
 
-                    PersonaStage.EMBRYO ->
+                    persona.stage == PersonaStage.EMBRYO ->
                         HintText("还没破壳：攒到 20 条群消息，它会写出第一版人格。")
 
                     else ->
-                        HintText(
-                            if (persona.frozen) {
-                                "已冻结：不会再自动改。想恢复就在「AI → 人设」里解冻。"
-                            } else {
-                                "正在自己长。每次改动都很小，随时可以在「AI → 人设」里回滚。"
-                            },
-                        )
+                        HintText("正在自己长。每次改动都很小，随时可以在「AI → 人设」里回滚。")
                 }
             }
         }
 
-        SectionHeader("自动成长", "关掉之后只能手动点「立即成长」")
-        SettingsCard {
-            SwitchRow(
-                title = "允许它自己长大",
-                desc = "把新消息交给模型，由它判断值不值得吸收；不值得就什么都不做",
-                checked = config.enabled,
-                onCheckedChange = {
-                    settings.savePersonaGrowthConfig(config.copy(enabled = it))
-                },
-            )
+        if (persona != null) {
+            SectionHeader("刹车", "唯一需要你手动拨的东西")
+            SettingsCard {
+                SwitchRow(
+                    title = "冻结这份人格",
+                    desc = "冻结后不再自动成长，正文原样保留；随时可以解冻接着长",
+                    checked = persona.frozen,
+                    onCheckedChange = { frozen ->
+                        scope.launch { controller.setPersonaFrozen(persona.id, frozen) }
+                    },
+                )
+                HintText(
+                    "想彻底改由自己写：在「AI → 人设」里点「改为手动」，" +
+                        "之后它会完全照你写的来。",
+                )
+            }
         }
 
         SectionHeader("它是怎么判断的", "没有阈值要你调")

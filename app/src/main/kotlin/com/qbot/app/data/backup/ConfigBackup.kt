@@ -37,8 +37,6 @@ data class ConfigBackup(
     @SerialName("chime_lessons") val chimeLessons: List<LessonBackup> = emptyList(),
     /** 2.3.0 新增：人格档案（不含快照历史与游标——运行数据不搬家） */
     @SerialName("persona_profiles") val personaProfiles: List<PersonaProfileBackup> = emptyList(),
-    /** 2.3.0 新增：人格成长参数 */
-    @SerialName("persona_growth") val personaGrowth: PersonaGrowthBackup? = null,
 ) {
     companion object {
         private val json =
@@ -156,14 +154,6 @@ data class PersonaProfileBackup(
     @SerialName("seed_id") val seedId: String? = null,
     val frozen: Boolean = false,
     @SerialName("growth_count") val growthCount: Int = 0,
-)
-
-@Serializable
-data class PersonaGrowthBackup(
-    val enabled: Boolean = true,
-    @SerialName("birth_messages") val birthMessages: Int = 60,
-    @SerialName("grow_messages") val growMessages: Int = 150,
-    @SerialName("grow_interval_hours") val growIntervalHours: Int = 12,
 )
 
 @Serializable

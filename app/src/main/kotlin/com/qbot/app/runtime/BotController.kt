@@ -11,7 +11,6 @@ import com.qbot.app.data.backup.GroupBotNameBackup
 import com.qbot.app.data.backup.LessonBackup
 import com.qbot.app.data.backup.MemoryBackup
 import com.qbot.app.data.backup.PersonaBackup
-import com.qbot.app.data.backup.PersonaGrowthBackup
 import com.qbot.app.data.backup.PersonaProfileBackup
 import com.qbot.app.data.backup.RuleBackup
 import com.qbot.app.data.db.AppDatabase
@@ -219,7 +218,6 @@ class BotController(
             repo = personaRepository,
             messages = database.roomMessageDao(),
             aiConfig = { settings.aiConfig.value },
-            growthConfig = { settings.personaGrowthConfig.value },
             client = LlmClient(http = http, logger = logger),
             botName = { runtime?.botName },
             log = { message -> appendLog(LogLevel.INFO, TAG, message) },
@@ -977,10 +975,6 @@ class BotController(
                                 growthCount = persona.growthCount,
                             )
                         },
-                personaGrowth =
-                    settings.personaGrowthConfig.value.let { growth ->
-                        PersonaGrowthBackup(enabled = growth.enabled)
-                    },
                 displayNames =
                     database.identityDao().recent(1000).map { entry ->
                         DisplayNameBackup(
@@ -1251,14 +1245,6 @@ class BotController(
                 )
             }
             // 两者都没有 → 保留本机现有档案：不能因为导入了旧配置就清空人格
-        }
-
-        backup.personaGrowth?.let { growth ->
-            // 2.3.1 起节奏由模型判断，旧备份里的三个数字不再生效，只保留开关
-            settings.savePersonaGrowthConfig(
-                com.qbot.core.ai.PersonaGrowthConfig(enabled = growth.enabled),
-            )
-            applied++
         }
 
         var personaNew = 0

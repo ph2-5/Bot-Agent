@@ -157,8 +157,20 @@ private fun AiSubtitle(): String {
 private fun PersonaGrowthSubtitle(): String {
     val context = LocalContext.current
     val app = context.applicationContext as BotApplication
-    val config by app.settings.personaGrowthConfig.collectAsState()
-    return if (config.enabled) "自动成长 开 · 由它自己判断" else "自动成长已关闭"
+    val persona by app.controller.observeActivePersona().collectAsState(initial = null)
+    val current = persona ?: return "还没有人格"
+    return buildString {
+        append(
+            when (current.stage) {
+                com.qbot.core.ai.PersonaStage.EMBRYO -> "破壳中"
+                com.qbot.core.ai.PersonaStage.GROWING -> "成长中"
+                com.qbot.core.ai.PersonaStage.MATURE -> "已成熟"
+                com.qbot.core.ai.PersonaStage.MANUAL -> "手动设定"
+            },
+        )
+        if (current.frozen) append(" · 已冻结")
+        if (current.growthCount > 0) append(" · 已成长 ${current.growthCount} 次")
+    }
 }
 
 @Composable

@@ -16,7 +16,6 @@ import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.MemoryConfig
-import com.qbot.core.ai.PersonaGrowthConfig
 import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.ThinkingMode
 import kotlinx.coroutines.CoroutineScope
@@ -123,12 +122,8 @@ class SettingsRepository(private val context: Context) {
         val CHITCHAT_MAX_INJECTED = intPreferencesKey("chitchat_max_injected")
         val CHITCHAT_JUDGE_CONTEXT = intPreferencesKey("chitchat_judge_context")
 
-        // ---- 人格成长（2.3.0） ----
+        // ---- 人格（2.3.0） ----
         val PERSONA_LEGACY_IMPORTED = booleanPreferencesKey("persona_legacy_imported")
-        val PERSONA_GROWTH_ENABLED = booleanPreferencesKey("persona_growth_enabled")
-        val PERSONA_BIRTH_MESSAGES = intPreferencesKey("persona_birth_messages")
-        val PERSONA_GROW_MESSAGES = intPreferencesKey("persona_grow_messages")
-        val PERSONA_GROW_INTERVAL = intPreferencesKey("persona_grow_interval_hours")
     }
 
     private companion object {
@@ -215,11 +210,6 @@ class SettingsRepository(private val context: Context) {
     private val _chitchatConfig = MutableStateFlow(ChitchatConfig())
     val chitchatConfig: StateFlow<ChitchatConfig> = _chitchatConfig.asStateFlow()
 
-    /** 人格自主成长参数。 */
-    private val _personaGrowthConfig = MutableStateFlow(PersonaGrowthConfig())
-    val personaGrowthConfig: StateFlow<PersonaGrowthConfig> =
-        _personaGrowthConfig.asStateFlow()
-
     init {
         // DataStore 的变更合并进 StateFlow；加密偏好里的 apiKey 每次重新读，
         // 保证用户在设置页改完 Key 后保存即可生效。
@@ -229,7 +219,6 @@ class SettingsRepository(private val context: Context) {
                 _memoryConfig.value = readMemoryConfig(prefs)
                 _greetingConfig.value = readGreetingConfig(prefs)
                 _chitchatConfig.value = readChitchatConfig(prefs)
-                _personaGrowthConfig.value = readPersonaGrowthConfig(prefs)
             }
         }
     }
@@ -281,18 +270,6 @@ class SettingsRepository(private val context: Context) {
             context.dataStore.edit { prefs ->
                 prefs[Keys.GREETING_ENABLED] = config.enabled
                 prefs[Keys.GREETING_TEXT] = config.text
-            }
-        }
-    }
-
-    private fun readPersonaGrowthConfig(prefs: Preferences): PersonaGrowthConfig =
-        PersonaGrowthConfig(enabled = prefs[Keys.PERSONA_GROWTH_ENABLED] ?: true)
-
-    fun savePersonaGrowthConfig(config: PersonaGrowthConfig) {
-        _personaGrowthConfig.value = config
-        scope.launch {
-            context.dataStore.edit { prefs ->
-                prefs[Keys.PERSONA_GROWTH_ENABLED] = config.enabled
             }
         }
     }

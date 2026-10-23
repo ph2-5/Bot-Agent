@@ -44,18 +44,10 @@ class PersonaGrowthPolicyTest {
     }
 
     @Test
-    fun `冻结或关开关时不成长`() {
+    fun `冻结时不成长`() {
         assertEquals(
             GrowthAction.NONE,
             PersonaGrowthPolicy.next(state(PersonaStage.GROWING, frozen = true), 5000),
-        )
-        assertEquals(
-            GrowthAction.NONE,
-            PersonaGrowthPolicy.next(
-                state(PersonaStage.GROWING),
-                5000,
-                PersonaGrowthConfig(enabled = false),
-            ),
         )
     }
 

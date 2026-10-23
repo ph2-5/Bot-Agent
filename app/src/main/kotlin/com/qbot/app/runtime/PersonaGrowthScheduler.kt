@@ -9,7 +9,6 @@ import com.qbot.core.ai.GrowthStats
 import com.qbot.core.ai.LlmClient
 import com.qbot.core.ai.Persona
 import com.qbot.core.ai.PersonaGrowth
-import com.qbot.core.ai.PersonaGrowthConfig
 import com.qbot.core.ai.PersonaGrowthPolicy
 import com.qbot.core.ai.PersonaGrowthState
 import com.qbot.core.ai.PersonaKind
@@ -40,7 +39,6 @@ class PersonaGrowthScheduler(
     private val repo: PersonaRepository,
     private val messages: RoomMessageDao,
     private val aiConfig: () -> AiConfig,
-    private val growthConfig: () -> PersonaGrowthConfig,
     private val client: LlmClient,
     private val botName: () -> String?,
     private val log: (String) -> Unit,
@@ -117,9 +115,6 @@ class PersonaGrowthScheduler(
     }
 
     private suspend fun runOnce() {
-        val config = growthConfig()
-        if (!config.enabled) return
-
         val ai = aiConfig()
         if (!ai.enabled || !ai.isReady) return
 
@@ -148,7 +143,6 @@ class PersonaGrowthScheduler(
                         lastGrownAt = profile.lastGrownAt,
                     ),
                 pendingMessages = pending,
-                config = config,
             )
 
         when (action) {

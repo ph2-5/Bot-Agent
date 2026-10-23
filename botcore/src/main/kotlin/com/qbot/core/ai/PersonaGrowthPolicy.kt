@@ -1,19 +1,5 @@
 package com.qbot.core.ai
 
-/**
- * 人格成长的用户可调参数。
- *
- * 2.3.1 起只剩一个开关：**节奏交给模型自己判断**。
- *
- * 过去这里有三个滑杆（破壳消息数 / 成长消息数 / 最小间隔），
- * 让用户去猜"多少条才够"，实际上没人知道答案，而且数字一设死，
- * 冷清群永远不长、热闹群天天改。现在改成：有新消息就把它交给模型，
- * 由模型判断"这批对话里有没有值得吸收的东西"——没有就回 NO_CHANGE。
- */
-data class PersonaGrowthConfig(
-    val enabled: Boolean = true,
-)
-
 /** 判定成长所需的人格状态切片（只保留判定需要的字段）。 */
 data class PersonaGrowthState(
     val stage: PersonaStage,
@@ -55,9 +41,10 @@ object PersonaGrowthPolicy {
     fun next(
         state: PersonaGrowthState,
         pendingMessages: Int,
-        config: PersonaGrowthConfig = PersonaGrowthConfig(),
     ): GrowthAction {
-        if (!config.enabled || state.frozen) return GrowthAction.NONE
+        // 唯一的人工刹车是「冻结」——全局开关和它完全等价，已删除，
+        // 避免同一个意思在界面上出现两次。
+        if (state.frozen) return GrowthAction.NONE
 
         return when (state.stage) {
             PersonaStage.EMBRYO ->
