@@ -154,14 +154,14 @@ fun AiModelPage(onBack: () -> Unit) {
                 value = visionModel,
                 onValueChange = { visionModel = it },
                 label = { Text("看图用的模型名（可留空）") },
-                placeholder = { Text("留空则沿用上面的模型名") },
+                placeholder = { Text("留空：DeepSeek 端点自动用 deepseek-flash") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
             HintText(
                 "群友只发表情包不配文字时，用它来「看」那张图再回答。" +
-                    "上面的主模型不支持图片时（比如 DeepSeek），" +
-                    "把这里换成一个支持图片的模型（取决于你的服务商）。" +
+                    "留空时，DeepSeek 官方端点会自动改用 deepseek-flash（默认的 deepseek-chat 不支持图片）；" +
+                    "其他服务商则沿用上面的主模型，需要你确认它支持图片。" +
                     "两张模型是分开计费的，看一次图算一次。",
             )
 
@@ -177,8 +177,10 @@ fun AiModelPage(onBack: () -> Unit) {
                 )
             }
             HintText(
-                "打开后，遇到群里反复出现又看不懂的说法，它会去搜一下什么意思再记住。" +
-                    "按成功请求计费，且只在「遇到可疑词」时触发，不参与每一轮对话。" +
+                "打开后，遇到新闻、价格、版本发布这类需要最新信息的问题，" +
+                    "它会自己决定搜一次再回答；闲聊和常识问题不会搜。" +
+                    "遇到看不懂的说法时也会顺手查一下再记住。" +
+                    "按成功请求计费；关掉后工具会直接拒绝。" +
                     "非 DeepSeek 端点没有搜索接口，开了也会自动跳过。",
             )
         }

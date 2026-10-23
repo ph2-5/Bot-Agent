@@ -95,6 +95,19 @@ data class AiConfig(
     val isReady: Boolean
         get() = enabled && apiKey.isNotBlank() && model.isNotBlank() && baseUrl.isNotBlank()
 
+    /**
+     * 带图时实际使用的模型名。
+     *
+     * 用户填了 [visionModel] 就用它；没填时，DeepSeek 官方端点退回
+     * `deepseek-flash`——默认的 `deepseek-chat` 不接受图片，若沿用它会直接 400，
+     * 表现就是「机器人完全看不见图」。其他服务商仍沿用主模型，
+     * 因为无法假设它们也有同名视觉模型。
+     */
+    fun modelForImage(): String =
+        visionModel.ifBlank {
+            if (baseUrl.contains("deepseek", ignoreCase = true)) "deepseek-flash" else model
+        }
+
     companion object {
         /**
          * 2.2.0 及更早版本的出厂默认提示词。
@@ -240,7 +253,35 @@ class AiResponder(
      * 不该为了拿一段提示词而 runBlocking。
      */
     private val personaResolver: (suspend (IncomingMessage) -> String?)? = null,
+    /**
+     * 本轮可用的工具。为空时行为与之前完全一致（纯文本 + 表情标记）。
+     *
+     * 工具只给主回复链路，不给插话判断/反思等结构化短任务——
+     * 那些调用需要的是确定性，不需要模型自主选动作。
+     */
+    private val tools: ToolRegistry = ToolRegistry(),
+    /**
+     * 会话作用域：返回值会拼进历史 key。
+     *
+     * Android 侧传入当前生效的人设 id，切换档案后自动新开一条线程，
+     * 避免新人设继续沿用旧人设的语气与话题。
+     */
+    private val conversationScopeProvider: (suspend (IncomingMessage) -> String?)? = null,
+    /**
+     * 图片内联：把 QQ 的临时图片链接下载后转成 data URL。
+     *
+     * 默认原样返回地址（不下载），这样纯测试/外部调用路径不发额外网络请求。
+     * Android 侧传入 [RemoteImageLoader]，避免链接过期或防盗链导致模型看不到图。
+     */
+    private val imageInliner: ImageInliner = ImageInliner { it },
 ) {
+    /**
+     * 服务商不支持 tools 时置位，后续请求不再携带，避免每条消息都白试一次。
+     * 只在 400（且不是上下文超限）时降级。
+     */
+    @Volatile
+    private var toolsUnsupported = false
+
     companion object {
         /** 触发 AI 的命令前缀 */
         const val COMMAND_PREFIX = "/ai"
@@ -270,6 +311,14 @@ class AiResponder(
         const val MAX_REASON_CHARS = 40
 
         /**
+         * 一次回复里最多允许几轮工具调用。
+         *
+         * 群聊回复要快，工具也不该串成链：一轮选图足够；
+         * 给两轮是为了兼容"先查再答"的简单组合，超过就强制收口。
+         */
+        const val MAX_TOOL_ROUNDS = 2
+
+        /**
          * 判断提示词的固定标记。
          *
          * 测试与日志用它识别"这是一次接话判断"，不依赖具体措辞——
@@ -287,6 +336,18 @@ class AiResponder(
     private fun lockFor(key: String): Mutex {
         if (locks.size > 128) locks.clear()
         return locks.getOrPut(key) { Mutex() }
+    }
+
+    /**
+     * 历史 key：按人隔离，再叠加当前生效的人设。
+     *
+     * 覆盖层（按人/按群）也有独立 id，所以"这个群用覆盖人设"与
+     * "全局档案"不会共享上下文；切换档案后自然就是一条新线程。
+     */
+    private suspend fun historyKey(message: IncomingMessage): String {
+        val base = ConversationKeys.history(message)
+        val scope = conversationScopeProvider?.invoke(message)?.takeIf { it.isNotBlank() }
+        return if (scope == null) base else "$base|$scope"
     }
 
     /**
@@ -359,7 +420,7 @@ class AiResponder(
         memory: MemoryContext? = null,
         directive: String? = null,
     ): AiReply {
-        val key = ConversationKeys.history(message)
+        val key = historyKey(message)
         // 只发了图没写字：给模型一个默认问题，否则它会回"请问你想问什么"——
         // 对方明明发了图，这么问等于没看见。
         val rawQuestion =
@@ -371,6 +432,12 @@ class AiResponder(
                 }
             }
         val systemPrompt = personaResolver?.invoke(message) ?: config.systemPrompt
+        // 先本地下载再交图：QQ 图片链接带签名、会过期，也有防盗链；
+        // 直接让模型去抓，失败时用户只看到"看图失败"。下载失败则回退原地址。
+        val imageUrl =
+            message.imageUrl?.let { raw ->
+                runCatching { imageInliner.inline(raw) }.getOrNull() ?: raw
+            }
 
         lockFor(key).withLock {
             // 清空指令不调用模型，直接重置上下文
@@ -393,12 +460,12 @@ class AiResponder(
 
             val result =
                 try {
-                    callLlm(stored, question, config, memory, systemPrompt, message.imageUrl)
+                    callLlmWithTools(stored, question, config, memory, systemPrompt, imageUrl)
                 } catch (e: ContextTooLongException) {
                     // 估算偏差或历史里混进超长消息：砍掉一半历史重试一次，
                     // 仍失败就把异常抛给调用方走兜底话术。
                     val halved = stored.drop(stored.size / 2)
-                    callLlm(halved, question, config, memory, systemPrompt, message.imageUrl)
+                    callLlmWithTools(halved, question, config, memory, systemPrompt, imageUrl)
                 }
 
             // 成功后才写入历史：失败的请求不应污染上下文。
@@ -406,7 +473,10 @@ class AiResponder(
             // 否则下一轮历史里会残留「【指令结果】…」这类内部文本。
             // 表情包标记在进历史前剥掉：历史里只留说出口的话，
             // 但图地址要带出去给发送链路（见 [AiReply.memeUrl]）。
-            val (spoken, memeUrl) = MemeMarker.parse(result.content)
+            val reply = result.first
+            val (spoken, markerMeme) = MemeMarker.parse(reply.content)
+            // 工具选图优先于文本标记：前者已经过本地库校验。
+            val memeUrl = result.second ?: markerMeme
             // 纯表情包回复：正文是空的，历史里不能留一条空 assistant 消息——
             // 下一轮它会看见"自己刚才啥也没说"。留一句只有它看得懂的记号。
             val forHistory =
@@ -418,7 +488,7 @@ class AiResponder(
             return AiReply(
                 content = truncate(spoken),
                 // 思考模式关闭时这里恒为 null，不会产生空的内心记录
-                reasoning = result.reasoning?.takeIf { it.isNotBlank() },
+                reasoning = reply.reasoning?.takeIf { it.isNotBlank() },
                 memeUrl = memeUrl,
             )
         }
@@ -645,14 +715,15 @@ class AiResponder(
     private val _lastUsage = MutableStateFlow<LlmUsage?>(null)
     val lastUsage: StateFlow<LlmUsage?> = _lastUsage.asStateFlow()
 
-    private suspend fun callLlm(
+    /** 组装本轮消息：system + 记忆 + 历史 + 问题，并只给最后一条 user 附图。 */
+    private fun buildMessages(
         storedHistory: List<ChatMessage>,
         question: String,
         config: AiConfig,
         memory: MemoryContext?,
         systemPrompt: String,
         imageUrl: String? = null,
-    ): LlmReply {
+    ): List<ChatMessage> {
         val assembled =
             assembler.assemble(
                 personaPrompt = systemPrompt,
@@ -662,25 +733,28 @@ class AiResponder(
                 tokenBudget = config.contextTokenBudget,
             )
         // 只有本轮带图：历史里的图不再重复送，否则同一张图每轮都要付一次 token。
-        val messages =
-            if (imageUrl.isNullOrBlank()) {
-                assembled
-            } else {
-                val last = assembled.lastOrNull()
-                if (last?.role == "user") {
-                    assembled.dropLast(1) + last.copy(images = listOf(imageUrl))
-                } else {
-                    assembled
-                }
-            }
-        // 带图时优先用视觉模型；没配就沿用主模型（用户可能主模型本来就支持图片）
+        if (imageUrl.isNullOrBlank()) return assembled
+        val last = assembled.lastOrNull() ?: return assembled
+        return if (last.role == "user") {
+            assembled.dropLast(1) + last.copy(images = listOf(imageUrl))
+        } else {
+            assembled
+        }
+    }
+
+    /** 选择模型并真正发起请求；tools 不支持时自动降级一次。 */
+    private suspend fun executeChat(
+        messages: List<ChatMessage>,
+        config: AiConfig,
+        imageUrl: String?,
+        useTools: Boolean,
+    ): LlmReply {
+        // 带图时优先用视觉模型；没填时 DeepSeek 端点会自动退回 deepseek-flash
         val model =
-            if (!imageUrl.isNullOrBlank() && config.visionModel.isNotBlank()) {
-                config.visionModel
-            } else {
-                config.model
-            }
-        val reply =
+            if (!imageUrl.isNullOrBlank()) config.modelForImage() else config.model
+        val sendTools = useTools && !toolsUnsupported && !tools.isEmpty
+
+        suspend fun call(withTools: Boolean): LlmReply =
             client.chat(
                 baseUrl = config.baseUrl,
                 apiKey = config.apiKey,
@@ -689,9 +763,91 @@ class AiResponder(
                 temperature = config.temperature,
                 maxTokens = config.maxTokens,
                 thinkingType = thinkingParam(config),
+                tools = if (withTools) tools.specs else emptyList(),
             )
+
+        val reply =
+            try {
+                call(sendTools)
+            } catch (e: LlmException) {
+                // 一些 OpenAI 兼容端点不认识 tools，会直接 400。
+                // 只降级一次并记住，后续请求不再带工具；上下文超限另走裁剪逻辑。
+                //
+                // 但 400 不一定怪 tools：带图时也可能是「模型不支持图片」。
+                // 只有报文明确提到 tools/function，或本轮根本没带图时，
+                // 才认定是工具不兼容——否则一次看图失败会让表情包工具永久失效。
+                val looksLikeTools =
+                    e.message.orEmpty().lowercase().let {
+                        it.contains("tool") || it.contains("function")
+                    }
+                if (sendTools &&
+                    e.statusCode == 400 &&
+                    e !is ContextTooLongException &&
+                    (looksLikeTools || imageUrl.isNullOrBlank())
+                ) {
+                    toolsUnsupported = true
+                    call(false)
+                } else {
+                    throw e
+                }
+            }
         _lastUsage.value = reply.usage
         return reply
+    }
+
+    /**
+     * 主回复链路：允许模型在一次回复里调用工具。
+     *
+     * 返回「最终回复 + 工具选定的表情地址」。工具只执行一轮或两轮，
+     * 超过上限时强制不带工具再请求一次，避免模型陷入调用循环。
+     */
+    private suspend fun callLlmWithTools(
+        storedHistory: List<ChatMessage>,
+        question: String,
+        config: AiConfig,
+        memory: MemoryContext?,
+        systemPrompt: String,
+        imageUrl: String? = null,
+    ): Pair<LlmReply, String?> {
+        var messages = buildMessages(storedHistory, question, config, memory, systemPrompt, imageUrl)
+        var memeUrl: String? = null
+        var round = 0
+
+        while (true) {
+            val reply = executeChat(messages, config, imageUrl, useTools = true)
+            if (reply.toolCalls.isEmpty()) return reply to memeUrl
+
+            if (round >= MAX_TOOL_ROUNDS) {
+                // 已经给过机会：收口成文字，别把用户晾着。
+                val forced =
+                    messages +
+                        ChatMessage(
+                            role = "user",
+                            content = "请直接用一句自然的话回复，不要再调用工具。",
+                        )
+                return executeChat(forced, config, imageUrl, useTools = false) to memeUrl
+            }
+
+            messages =
+                messages +
+                    ChatMessage(
+                        role = "assistant",
+                        content = reply.content,
+                        toolCalls = reply.toolCalls,
+                    )
+            reply.toolCalls.forEach { call ->
+                val result = tools.execute(call)
+                result.memeUrl?.takeIf { it.isNotBlank() }?.let { memeUrl = it }
+                messages =
+                    messages +
+                        ChatMessage(
+                            role = "tool",
+                            content = result.content,
+                            toolCallId = call.id,
+                        )
+            }
+            round++
+        }
     }
 
     /**
@@ -729,9 +885,9 @@ class AiResponder(
      */
     internal fun thinkingParam(config: AiConfig): String? = ThinkingParams.forConfig(config)
 
-    /** 清空某个会话的上下文（按人隔离的线程）。 */
+    /** 清空某个会话的上下文（按人 + 当前人设隔离的线程）。 */
     suspend fun clearHistory(message: IncomingMessage) {
-        history.clear(ConversationKeys.history(message))
+        history.clear(historyKey(message))
     }
 
     /** 启动时清理一次全局过期历史。 */

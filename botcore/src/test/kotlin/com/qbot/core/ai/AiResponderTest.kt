@@ -82,6 +82,34 @@ class AiResponderTest {
         )
     }
 
+    private class FakeMemeLibrary(
+        private val url: String? = "https://a.com/1.jpg",
+    ) : MemeLibrary {
+        var used = 0
+
+        override suspend fun contains(url: String): Boolean = url == this.url
+
+        override suspend fun recordUse(url: String) {
+            used++
+        }
+
+        override suspend fun pick(): String? = url
+    }
+
+    private fun enqueueMemeToolCall(url: String = "https://a.com/1.jpg") {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    {"choices":[{"message":{"role":"assistant","content":null,
+                    "tool_calls":[{"id":"call_1","type":"function",
+                    "function":{"name":"send_meme","arguments":"{\"url\":\"$url\"}"}}]}}]}
+                    """.trimIndent(),
+                ),
+        )
+    }
+
     // ---------- shouldHandle ----------
 
     @Test
@@ -608,5 +636,169 @@ class AiResponderTest {
             assertTrue("应表达想不想而不是该不该", body.contains("想不想"))
             assertTrue("应给出对话对象", body.contains("对「阿远」说的"))
             assertTrue("应说明插别人对话很怪", body.contains("插进去通常很怪"))
+        }
+
+    @Test
+    fun `看图时 DeepSeek 端点自动使用视觉模型`() {
+        // 默认主模型 deepseek-chat 不接受图片，留空 visionModel 时必须自动换
+        assertEquals(
+            "deepseek-flash",
+            AiConfig(baseUrl = "https://api.deepseek.com").modelForImage(),
+        )
+        // 用户显式配置优先
+        assertEquals(
+            "my-vl",
+            AiConfig(baseUrl = "https://api.deepseek.com", visionModel = "my-vl").modelForImage(),
+        )
+        // 非 DeepSeek 端点不能瞎猜，沿用主模型
+        assertEquals(
+            "gpt-4o",
+            AiConfig(baseUrl = "https://api.openai.com", model = "gpt-4o").modelForImage(),
+        )
+    }
+
+    @Test
+    fun `看图前会先把图片转成 data URL`() =
+        runBlocking {
+            val inlining =
+                AiResponder(
+                    client = client,
+                    history = history,
+                    imageInliner = ImageInliner { "data:image/png;base64,AAAA" },
+                )
+
+            enqueueAnswer("看到了")
+            inlining.reply(
+                message("这是什么", imageUrl = "https://gchat.qpic.cn/tmp.jpg"),
+                config(),
+            )
+
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue("应带内联图片，实际=$body", body.contains("data:image/png;base64,AAAA"))
+            assertFalse("不应再把临时链接交给模型", body.contains("gchat.qpic.cn"))
+        }
+
+    @Test
+    fun `看图 400 不会被误判成工具不兼容`() =
+        runBlocking {
+            val library = FakeMemeLibrary()
+            val withTools =
+                AiResponder(
+                    client = client,
+                    history = history,
+                    tools = ToolRegistry(listOf(SendMemeTool(library))),
+                )
+
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(400)
+                    .setBody("""{"error":{"message":"this model does not support image input"}}"""),
+            )
+
+            val error =
+                runCatching {
+                    withTools.reply(
+                        message("这是什么", imageUrl = "https://a.com/1.jpg"),
+                        config(),
+                    )
+                }.exceptionOrNull()
+            assertTrue(error is LlmException)
+
+            // 下一轮纯文字对话仍应带 tools：一次看图失败不能把表情包能力永久关掉
+            enqueueMemeToolCall()
+            enqueueAnswer("好")
+            withTools.replyDetailed(message("发个表情包"), config())
+
+            server.takeRequest() // 看图的 400 请求
+            val textRequest = server.takeRequest().body.readUtf8()
+            assertTrue("工具不应因看图失败被永久禁用，实际=$textRequest", textRequest.contains("\"tools\""))
+        }
+
+    // ---------- 工具调用 ----------
+
+    @Test
+    fun `工具选中的表情包会随回复带出`() =
+        runBlocking {
+            val library = FakeMemeLibrary()
+            val withTools =
+                AiResponder(
+                    client = client,
+                    history = history,
+                    tools = ToolRegistry(listOf(SendMemeTool(library))),
+                )
+
+            enqueueMemeToolCall()
+            enqueueAnswer("哈哈，给你配一张")
+
+            val reply = withTools.replyDetailed(message("发个表情包"), config())
+
+            assertEquals("哈哈，给你配一张", reply.content)
+            assertEquals("https://a.com/1.jpg", reply.memeUrl)
+            assertTrue("工具选中的图应回到历史里也不算空回复", reply.memeUrl != null)
+
+            val first = server.takeRequest().body.readUtf8()
+            assertTrue("首轮应带 tools，实际=$first", first.contains("\"tools\""))
+            val second = server.takeRequest().body.readUtf8()
+            assertTrue("次轮应回放工具结果，实际=$second", second.contains("\"role\":\"tool\""))
+            assertTrue("工具结果应带调用 id，实际=$second", second.contains("\"tool_call_id\":\"call_1\""))
+        }
+
+    @Test
+    fun `服务商不支持 tools 时自动降级并记住`() =
+        runBlocking {
+            val library = FakeMemeLibrary()
+            val withTools =
+                AiResponder(
+                    client = client,
+                    history = history,
+                    tools = ToolRegistry(listOf(SendMemeTool(library))),
+                )
+
+            // 第一次带 tools 被 400 拒绝，降级重试成功
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(400)
+                    .setBody("""{"error":{"message":"tools is not supported"}}"""),
+            )
+            enqueueAnswer("普通回复")
+
+            assertEquals("普通回复", withTools.reply(message("你好"), config()))
+
+            val declined = server.takeRequest().body.readUtf8()
+            assertTrue("首次应尝试带 tools", declined.contains("\"tools\""))
+            val downgraded = server.takeRequest().body.readUtf8()
+            assertFalse("降级请求不应再带 tools，实际=$downgraded", downgraded.contains("\"tools\""))
+
+            // 第二次对话：直接不带 tools，不再白试一次
+            enqueueAnswer("第二次回复")
+            assertEquals("第二次回复", withTools.reply(message("再来一次"), config()))
+            val later = server.takeRequest().body.readUtf8()
+            assertFalse("应记住服务商不支持 tools，实际=$later", later.contains("\"tools\""))
+            assertEquals("总共只应发起三次请求", 3, server.requestCount)
+        }
+
+    @Test
+    fun `切换人设后不会沿用上一条会话的历史`() =
+        runBlocking {
+            var scope = "persona-1"
+            val switching =
+                AiResponder(
+                    client = client,
+                    history = history,
+                    conversationScopeProvider = { scope },
+                )
+
+            enqueueAnswer("旧人设的回答")
+            switching.reply(message("旧人设的问题"), config())
+
+            scope = "persona-2"
+            enqueueAnswer("新人设的回答")
+            switching.reply(message("新人设的问题"), config())
+
+            server.takeRequest() // 旧人设的请求
+            val second = server.takeRequest().body.readUtf8()
+            assertFalse("新人设不应看到旧人设的对话", second.contains("旧人设的问题"))
+            assertFalse("新人设不应看到旧人设的回答", second.contains("旧人设的回答"))
+            assertTrue("应带上本轮问题", second.contains("新人设的问题"))
         }
 }

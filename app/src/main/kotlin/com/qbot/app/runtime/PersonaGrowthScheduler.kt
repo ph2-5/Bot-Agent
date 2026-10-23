@@ -65,12 +65,13 @@ class PersonaGrowthScheduler(
     private val growth = PersonaGrowth(client)
 
     /**
-     * 上次真正询问模型的时间。
+     * 每个人格上次真正询问模型的时间。
      *
+     * 按档案 id 隔离：给旧人格点过「立即成长」后，新人格不应跟着一起冷却——
+     * 否则切换过去的人会觉得"新档案一直不生不长"。
      * 刻意放内存：重启后重新计时无所谓，但能保证"十次 tick 不会问十次"。
-     * 不落库是避免为一个纯节流值再加一列。
      */
-    private var lastAskedAt = 0L
+    private val lastAskedAt = mutableMapOf<Long, Long>()
 
     fun start(scope: CoroutineScope): Job =
         scope.launch {
@@ -104,8 +105,8 @@ class PersonaGrowthScheduler(
             if (!ai.enabled || !ai.isReady) return false
             val profile = repo.active() ?: return false
             if (profile.kind != PersonaKind.PROFILE || profile.frozen) return false
-            // 手动催过一次也要刷新冷却，否则 10 分钟后的定时任务会再自动长一次
-            lastAskedAt = clock()
+            // 手动催过一次也要刷新这个人格自己的冷却，否则 10 分钟后的定时任务会再自动长一次
+            lastAskedAt[profile.id] = clock()
             return if (profile.stage == PersonaStage.EMBRYO) {
                 birth(profile, ai)
             } else {
@@ -132,8 +133,9 @@ class PersonaGrowthScheduler(
                 GROW_COOLDOWN_MILLIS
             }
         // delta 为负说明系统时间被回拨过：视为"已过期"，否则会永久停摆
-        val delta = now - lastAskedAt
-        if (lastAskedAt > 0 && delta >= 0 && delta < cooldown) return
+        val last = lastAskedAt[profile.id] ?: 0L
+        val delta = now - last
+        if (last > 0 && delta >= 0 && delta < cooldown) return
 
         val pending = messages.countSince(profile.msgCursor)
         val action =
@@ -152,11 +154,11 @@ class PersonaGrowthScheduler(
         when (action) {
             GrowthAction.NONE -> Unit
             GrowthAction.BIRTH -> {
-                lastAskedAt = now
+                lastAskedAt[profile.id] = now
                 birth(profile, ai)
             }
             GrowthAction.GROW -> {
-                lastAskedAt = now
+                lastAskedAt[profile.id] = now
                 grow(profile, pending, ai)
             }
         }

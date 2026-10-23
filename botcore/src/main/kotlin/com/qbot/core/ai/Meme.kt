@@ -72,6 +72,48 @@ object MemeMarker {
 }
 
 /**
+ * 「直接要一张表情包」的本地意图识别。
+ *
+ * 只认短句里的明确索取（"发个表情包""来张图"）：这类请求没必要先花一次
+ * 模型调用再让它选图，本地挑一张更快，也不会因为模型心情不好而不发。
+ *
+ * 长句多半是在聊图本身（"你刚才那个表情包挺好笑的"），
+ * 那应该交给模型正常接话，所以这里用长度和描述性词做了排除。
+ */
+object MemeIntent {
+    private val REQUESTS =
+        listOf(
+            "表情包",
+            "来张表情",
+            "发张表情",
+            "发个表情",
+            "来张图",
+            "发张图",
+            "发个图",
+            "斗图",
+        )
+
+    private val DESCRIPTIVE =
+        listOf(
+            "这个表情",
+            "那个表情",
+            "这张图",
+            "那张图",
+            "什么表情",
+            "表情包好",
+            "表情好笑",
+            "表情不错",
+        )
+
+    fun isRequest(text: String): Boolean {
+        val clean = text.trim()
+        if (clean.isEmpty() || clean.length > 20) return false
+        if (DESCRIPTIVE.any { clean.contains(it) }) return false
+        return REQUESTS.any { clean.contains(it) }
+    }
+}
+
+/**
  * 见到群友发表情包时收进来。
  *
  * 由 BotRuntime 在后台调用：上传、去重、淘汰都由实现方负责；

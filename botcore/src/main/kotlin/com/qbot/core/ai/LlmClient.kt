@@ -17,7 +17,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 
-/** 一条对话消息。role 取值 user / assistant / system。 */
+/** 一条对话消息。role 取值 system / user / assistant / tool。 */
 @Serializable
 data class ChatMessage(
     val role: String,
@@ -29,6 +29,10 @@ data class ChatMessage(
      * 同一张图重复付 token，而且图片只允许出现在 user 消息里。
      */
     val images: List<String> = emptyList(),
+    /** role=tool 时对应哪一次 tool_call */
+    val toolCallId: String? = null,
+    /** role=assistant 且模型决定调用工具时，带上的调用列表 */
+    val toolCalls: List<ToolCall> = emptyList(),
 )
 
 /** LLM 调用失败。 */
@@ -82,8 +86,10 @@ data class LlmReply(
     val usage: LlmUsage = LlmUsage(),
     /** 思考过程（DeepSeek 等），仅在开启思考时有值；不作为正文使用 */
     val reasoning: String? = null,
-    /** stop / length / content_filter …；length 表示被输出额度截断 */
+    /** stop / length / content_filter / tool_calls …；length 表示被输出额度截断 */
     val finishReason: String? = null,
+    /** 模型请求调用的工具；为空表示这是一次普通文本回复 */
+    val toolCalls: List<ToolCall> = emptyList(),
 )
 
 /**
@@ -147,6 +153,8 @@ class LlmClient(
         maxTokens: Int = 1000,
         timeoutSeconds: Long = 60L,
         thinkingType: String? = null,
+        /** 非空时按 OpenAI tools 协议发送；不支持的服务商由调用方降级重试 */
+        tools: List<ToolSpec> = emptyList(),
     ): LlmReply {
         require(apiKey.isNotBlank()) { "API Key 未填写" }
         require(model.isNotBlank()) { "模型名称未填写" }
@@ -164,7 +172,33 @@ class LlmClient(
                             add(
                                 buildJsonObject {
                                     put("role", msg.role)
-                                    if (msg.images.isEmpty()) {
+                                    msg.toolCallId?.let { put("tool_call_id", it) }
+                                    if (msg.toolCalls.isNotEmpty()) {
+                                        // assistant 的 tool_calls 回放：OpenAI 兼容协议
+                                        // 要求 function.arguments 是 JSON **字符串**，
+                                        // 不是对象；这里原样带回去。
+                                        put("content", msg.content)
+                                        put(
+                                            "tool_calls",
+                                            kotlinx.serialization.json.buildJsonArray {
+                                                msg.toolCalls.forEach { call ->
+                                                    add(
+                                                        buildJsonObject {
+                                                            put("id", call.id)
+                                                            put("type", "function")
+                                                            put(
+                                                                "function",
+                                                                buildJsonObject {
+                                                                    put("name", call.name)
+                                                                    put("arguments", call.arguments)
+                                                                },
+                                                            )
+                                                        },
+                                                    )
+                                                }
+                                            },
+                                        )
+                                    } else if (msg.images.isEmpty()) {
                                         put("content", msg.content)
                                     } else {
                                         // OpenAI 兼容的多模态格式：content 变成块数组
@@ -196,6 +230,29 @@ class LlmClient(
                         }
                     },
                 )
+                if (tools.isNotEmpty()) {
+                    put(
+                        "tools",
+                        kotlinx.serialization.json.buildJsonArray {
+                            tools.forEach { tool ->
+                                add(
+                                    buildJsonObject {
+                                        put("type", "function")
+                                        put(
+                                            "function",
+                                            buildJsonObject {
+                                                put("name", tool.name)
+                                                put("description", tool.description)
+                                                put("parameters", tool.parameters)
+                                            },
+                                        )
+                                    },
+                                )
+                            }
+                        },
+                    )
+                    put("tool_choice", "auto")
+                }
                 // 思考模式下 temperature/presence_penalty 等采样参数不生效
                 // （官方明确说明），干脆不发送，避免误导用户以为调了有用。
                 if (thinkingType != "enabled") {
@@ -299,9 +356,11 @@ class LlmClient(
         val content = root.messageText("content")
         val reasoning = root.messageText("reasoning_content")
         val finishReason = root.finishReason()
+        val toolCalls = root.messageToolCalls()
         val snippet = body.take(120)
 
-        if (content.isNullOrBlank()) {
+        // 只有工具调用、没有正文是合法响应：模型决定先发工具请求。
+        if (content.isNullOrBlank() && toolCalls.isEmpty()) {
             // 有些兼容实现在错误时也返回 200，靠 error 字段说明原因
             val err =
                 (root["error"] as? JsonObject)?.get("message")
@@ -323,12 +382,50 @@ class LlmClient(
         }
 
         return LlmReply(
-            content = content.trim(),
+            content = content.orEmpty().trim(),
             usage = parseUsage(root),
             reasoning = reasoning?.takeIf { it.isNotBlank() },
             finishReason = finishReason,
+            toolCalls = toolCalls,
         )
     }
+
+    /** 读取 choices[0].message.tool_calls（兼容 arguments 为字符串或对象两种实现）。 */
+    private fun JsonObject.messageToolCalls(): List<ToolCall> =
+        runCatching {
+            this["choices"]
+                ?.let { it as? kotlinx.serialization.json.JsonArray }
+                ?.firstOrNull()
+                ?.let { it as? JsonObject }
+                ?.get("message")
+                ?.let { it as? JsonObject }
+                ?.get("tool_calls")
+                ?.let { it as? kotlinx.serialization.json.JsonArray }
+                ?.mapNotNull { element ->
+                    val call = element as? JsonObject ?: return@mapNotNull null
+                    val function = call["function"] as? JsonObject ?: return@mapNotNull null
+                    val name =
+                        (function["name"] as? kotlinx.serialization.json.JsonPrimitive)
+                            ?.contentOrNull
+                            ?.takeIf { it.isNotBlank() }
+                            ?: return@mapNotNull null
+                    val rawArgs = function["arguments"]
+                    val arguments =
+                        when (rawArgs) {
+                            is kotlinx.serialization.json.JsonPrimitive ->
+                                rawArgs.contentOrNull.orEmpty()
+                            null -> "{}"
+                            else -> rawArgs.toString()
+                        }
+                    val id =
+                        (call["id"] as? kotlinx.serialization.json.JsonPrimitive)
+                            ?.contentOrNull
+                            ?.takeIf { it.isNotBlank() }
+                            ?: "call_${name}_${call.hashCode()}"
+                    ToolCall(id = id, name = name, arguments = arguments)
+                }
+                .orEmpty()
+        }.getOrDefault(emptyList())
 
     /**
      * 解析 usage 字段。

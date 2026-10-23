@@ -190,11 +190,20 @@ class PersonaResolver(
             return ResolvedPersona(it.prompt, it.id, PersonaSource.OVERRIDE, it.stage)
         }
 
-        // 2) 当前激活档案；正文为空（EMBRYO）时用种子骨架顶上
+        // 2) 当前激活档案；正文为空（EMBRYO）时用种子骨架顶上。
+        // 档案名不参与养成，但必须进提示词：不然用户新建一个空档案、
+        // 改了名字再切换，模型收到的仍是与名字无关的种子骨架，
+        // 看起来就像"切换没生效"。群昵称仍然优先。
         val active = all.firstOrNull { it.active && it.kind == PersonaKind.PROFILE }
         if (active != null) {
             val body = active.prompt.ifBlank { PersonaGrowth.embryoSkeleton(active.seedId) }
-            return ResolvedPersona(body, active.id, PersonaSource.PROFILE, active.stage)
+            val named =
+                if (active.name.isBlank()) {
+                    body
+                } else {
+                    "你的人设名是「${active.name}」（群里怎么称呼你以群昵称为准，不必主动自我介绍）。\n\n$body"
+                }
+            return ResolvedPersona(named, active.id, PersonaSource.PROFILE, active.stage)
         }
 
         // 3) 兼容兜底

@@ -5,6 +5,7 @@ import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.AiResponder
 import com.qbot.core.ai.InMemoryAiHistoryStore
 import com.qbot.core.ai.LlmClient
+import com.qbot.core.ai.MemeLibrary
 import com.qbot.core.auth.AccessTokenManager
 import com.qbot.core.api.OpenApi
 import com.qbot.core.gateway.GatewayClient
@@ -133,6 +134,7 @@ class BotRuntimeAiTest {
         rules: List<Rule> = emptyList(),
         logSink: LogSink? = null,
         memeHarvester: com.qbot.core.ai.MemeHarvester? = null,
+        memeLibrary: MemeLibrary? = null,
     ): BotRuntime {
         val auth =
             AccessTokenManager(
@@ -166,7 +168,22 @@ class BotRuntimeAiTest {
                 ),
             aiConfigProvider = { config },
             memeHarvester = memeHarvester,
+            memeLibrary = memeLibrary,
         )
+    }
+
+    private class FixedMemeLibrary(
+        private val url: String? = "https://example.com/fixed.jpg",
+    ) : MemeLibrary {
+        val used = CopyOnWriteArrayList<String>()
+
+        override suspend fun contains(url: String): Boolean = url == this.url
+
+        override suspend fun recordUse(url: String) {
+            used += url
+        }
+
+        override suspend fun pick(): String? = url
     }
 
     /** 把日志收进列表，既用于断言，也作为"协程处理完了"的完成信号。 */
@@ -366,6 +383,42 @@ class BotRuntimeAiTest {
             // 只有一条媒体消息，没有空文字消息
             assertEquals(1, sentMessages.size)
             assertTrue(sentMessages[0].contains("\"msg_type\":7"))
+        }
+
+    @Test
+    fun `明确要表情包时本地直接挑图且不调用模型`() =
+        runBlocking {
+            val logs = CopyOnWriteArrayList<LogEntry>()
+            val library = FixedMemeLibrary()
+            val runtime =
+                buildRuntime(
+                    scope = this,
+                    config =
+                        AiConfig(
+                            enabled = true,
+                            baseUrl = server.url("/").toString(),
+                            apiKey = "sk-test",
+                            model = "deepseek-chat",
+                        ),
+                    logSink = capturingSink(logs),
+                    memeLibrary = library,
+                )
+
+            runtime.onMessage(message("发个表情包"))
+            awaitOutcome(logs, "按明确请求发送了一张表情包")
+            while (uploadedImages.isEmpty()) {
+                delay(50)
+            }
+            delay(200)
+
+            // 目的一开始就明确，不需要再问模型
+            assertEquals(0, countRequestsTo("/v1/chat/completions"))
+            // 只发图，不发文字
+            assertEquals(1, sentMessages.size)
+            assertTrue(sentMessages[0].contains("\"msg_type\":7"))
+            assertTrue(uploadedImages[0].contains("https://example.com/fixed.jpg"))
+            // 真正发出去了才计一次采用
+            assertEquals(listOf("https://example.com/fixed.jpg"), library.used.toList())
         }
 
     @Test

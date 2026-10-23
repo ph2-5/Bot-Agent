@@ -1,6 +1,8 @@
 package com.qbot.core.ai
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -353,28 +355,104 @@ class LlmClientTest {
         }
 
     @Test
-    fun `空白回复的错误信息带原始返回片段`() =
+    fun `tools 会按 OpenAI 协议写入请求体`() =
         runBlocking {
             server.enqueue(
                 MockResponse()
                     .setResponseCode(200)
-                    .setBody("""{"choices":[{"message":{"content":"   "}}]}"""),
+                    .setBody("""{"choices":[{"message":{"content":"ok"}}]}"""),
             )
 
-            val error =
-                runCatching {
-                    client.chat(
-                        baseUrl = server.url("/").toString(),
-                        apiKey = "k",
-                        model = "m",
-                        messages = listOf(ChatMessage("user", "hi")),
-                    )
-                }.exceptionOrNull()
-
-            assertTrue(error is LlmException)
-            assertTrue(
-                "错误信息应包含原始返回，实际=${(error as LlmException).message}",
-                error.message.orEmpty().contains("原始返回"),
+            client.chat(
+                baseUrl = server.url("/").toString(),
+                apiKey = "k",
+                model = "m",
+                messages = listOf(ChatMessage("user", "发个表情包")),
+                tools =
+                    listOf(
+                        ToolSpec(
+                            name = "send_meme",
+                            description = "发一张表情包",
+                            parameters = buildJsonObject { put("type", "object") },
+                        ),
+                    ),
             )
+
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue("应带 tools 字段，实际=$body", body.contains("\"tools\""))
+            assertTrue("应自动选择工具，实际=$body", body.contains("\"tool_choice\":\"auto\""))
+            assertTrue("应带工具名，实际=$body", body.contains("\"name\":\"send_meme\""))
+            assertTrue("应带参数 schema，实际=$body", body.contains("\"parameters\""))
+        }
+
+    @Test
+    fun `只有 tool_calls 的响应是合法回复`() =
+        runBlocking {
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setBody(
+                        """
+                        {"choices":[{"message":{"role":"assistant","content":null,
+                        "tool_calls":[{"id":"call_1","type":"function",
+                        "function":{"name":"send_meme","arguments":"{\"url\":\"https://a.com/1.jpg\"}"}}]}}]}
+                        """.trimIndent(),
+                    ),
+            )
+
+            val reply =
+                client.chat(
+                    baseUrl = server.url("/").toString(),
+                    apiKey = "k",
+                    model = "m",
+                    messages = listOf(ChatMessage("user", "发个表情包")),
+                )
+
+            assertEquals("", reply.content)
+            assertEquals(1, reply.toolCalls.size)
+            val call = reply.toolCalls.single()
+            assertEquals("call_1", call.id)
+            assertEquals("send_meme", call.name)
+            assertTrue(call.arguments.contains("https://a.com/1.jpg"))
+        }
+
+    @Test
+    fun `tool 消息与 assistant 的 tool_calls 会被回放`() =
+        runBlocking {
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setBody("""{"choices":[{"message":{"content":"ok"}}]}"""),
+            )
+
+            client.chat(
+                baseUrl = server.url("/").toString(),
+                apiKey = "k",
+                model = "m",
+                messages =
+                    listOf(
+                        ChatMessage("user", "发个表情包"),
+                        ChatMessage(
+                            role = "assistant",
+                            content = "",
+                            toolCalls =
+                                listOf(
+                                    ToolCall(
+                                        id = "call_1",
+                                        name = "send_meme",
+                                        arguments = """{"url":"https://a.com/1.jpg"}""",
+                                    ),
+                                ),
+                        ),
+                        ChatMessage(role = "tool", content = "已选定", toolCallId = "call_1"),
+                    ),
+            )
+
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue("assistant 应带 tool_calls，实际=$body", body.contains("\"tool_calls\""))
+            assertTrue("应带工具调用 id，实际=$body", body.contains("\"id\":\"call_1\""))
+            assertTrue("tool 消息应带 tool_call_id，实际=$body", body.contains("\"tool_call_id\":\"call_1\""))
+            // OpenAI 协议要求 arguments 是 JSON 字符串，而不是对象
+            assertTrue("arguments 应是字符串，实际=$body", body.contains("\"arguments\":\"{\\\"url\\\""))
         }
 }

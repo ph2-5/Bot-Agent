@@ -78,7 +78,14 @@ class DeepSeekSearch(
 
     /** 非 DeepSeek 端点没有搜索接口，直接视为不可用。 */
     internal fun endpointOf(baseUrl: String): String? {
-        val root = baseUrl.trim().trimEnd('/').removeSuffix("/v1")
+        // 与 LlmClient.normalizeEndpoint 保持一致：用户可能填根地址、
+        // 带 /v1 的地址，也可能直接粘完整的 /v1/chat/completions。
+        // 只剥 /v1 会把最后一种拼成 .../chat/completions/v1/tools/search。
+        val root =
+            baseUrl.trim()
+                .trimEnd('/')
+                .removeSuffix("/chat/completions")
+                .removeSuffix("/v1")
         if (root.isBlank() || !root.contains("deepseek", ignoreCase = true)) return null
         return "$root/v1/tools/search"
     }

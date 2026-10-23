@@ -10,6 +10,7 @@ import com.qbot.app.data.db.SlangDao
 import com.qbot.app.data.db.SlangEntity
 import com.qbot.core.ai.BotMood
 import com.qbot.core.ai.MemeImage
+import com.qbot.core.ai.MemeLibrary
 import com.qbot.core.ai.MoodPolicy
 import com.qbot.core.model.IncomingMessage
 import com.qbot.core.ai.PersonRelation
@@ -41,7 +42,7 @@ class RoomSocialStore(
     private val thoughtDao: com.qbot.app.data.db.InnerThoughtDao? = null,
     private val memeDao: MemeDao? = null,
     private val clock: () -> Long = System::currentTimeMillis,
-) : SocialContextProvider, RelationRecorder {
+) : SocialContextProvider, RelationRecorder, MemeLibrary {
     /** 读-改-写要串行，否则并发两条消息会把彼此的增量覆盖掉 */
     private val mutex = Mutex()
 
@@ -203,6 +204,35 @@ class RoomSocialStore(
     suspend fun promptMemes(limit: Int = 8): List<String> =
         runCatching { memeDao?.promptImages(limit)?.map { it.url } ?: emptyList() }
             .getOrDefault(emptyList())
+
+    /** 模型给的地址必须真的在库里，防止它编造 URL 或被人用提示词注入外链。 */
+    override suspend fun contains(url: String): Boolean {
+        val dao = memeDao ?: return false
+        val clean = url.trim()
+        if (clean.isBlank()) return false
+        return runCatching { dao.find(clean) != null }.getOrDefault(false)
+    }
+
+    /** 采用一次：只累加 hits，重复地址不会新增行。 */
+    override suspend fun recordUse(url: String) {
+        val dao = memeDao ?: return
+        val clean = url.trim()
+        if (clean.isBlank()) return
+        runCatching {
+            dao.find(clean)?.let { dao.bumpHits(it.id, 1) }
+        }
+    }
+
+    /**
+     * 明确要图时挑一张。
+     *
+     * 从常用的前 20 张里随机选，而不是永远取第一名——
+     * 固定第一张会让机器人翻来覆去只发同一张，群里很快就看腻了。
+     */
+    override suspend fun pick(): String? =
+        runCatching {
+            memeDao?.promptImages(20)?.randomOrNull()?.url
+        }.getOrNull()?.takeIf { it.isNotBlank() }
 
     /**
      * 群里见到一张图，收进来。
