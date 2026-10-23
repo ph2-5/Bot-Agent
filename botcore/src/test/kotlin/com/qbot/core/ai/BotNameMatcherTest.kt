@@ -32,6 +32,18 @@ class BotNameMatcherTest {
     }
 
     @Test
+    fun `角色卡开头的你是阿远也能抽到`() {
+        // 用户真实的角色卡就是这种写法，不带「叫」字
+        val names = BotNameMatcher.namesFromPrompt("你是阿远，是这个群里最熟的老面孔。")
+        assertEquals(listOf("阿远"), names)
+    }
+
+    @Test
+    fun `泛称不会被当成名字`() {
+        assertEquals(emptyList<String>(), BotNameMatcher.namesFromPrompt("你是一个 AI 助手，要保持自然。"))
+    }
+
+    @Test
     fun `问句与代词不会被当成名字`() {
         assertEquals(emptyList<String>(), BotNameMatcher.namesFromPrompt("你叫什么名字？"))
         assertEquals(emptyList<String>(), BotNameMatcher.namesFromPrompt("你叫他来一下"))

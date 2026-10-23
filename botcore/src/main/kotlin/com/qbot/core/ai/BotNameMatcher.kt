@@ -20,10 +20,10 @@ object BotNameMatcher {
     /**
      * 人设正文里的自称。
      *
-     * 群名片是「过去的阿远」，但角色卡里写着"你叫阿远"——群友喊的是角色名，
+     * 群名片是「过去的阿远」，但角色卡里写着"你是阿远"——群友喊的是角色名，
      * 只认群名片就会漏判。这里按确定性规则抽出来，不调模型：
-     * 只认「你叫X / 你的名字是X / 名字：X」且 X 后面必须跟标点或结束，
-     * 抽不到的宁可不认（"你叫什么"这类问句不会命中）。
+     * 只认「你叫X / 你的名字是X / 名字：X / 你是X」且 X 后面必须跟标点或结束，
+     * 抽不到的宁可不认（"你叫什么"、"你是一个助手"这类都不会命中）。
      */
     private val SELF_NAME_PATTERNS =
         listOf(
@@ -32,6 +32,8 @@ object BotNameMatcher {
             Regex("""(?:名字|昵称)[:：]\s*[「『“"']?([^\s，。！？、；：）」』”"'（(]{2,12})(?=[，。！？、；：\s）」』”"'）)]|$)"""),
             // 只认带引号的「你是"阿远"」：不带引号的"你是一个群友"不是名字
             Regex("""你(?:是|就是)\s*[「『“"']([^」』”"']{2,12})[」』”"']"""),
+            // 角色卡常见写法：「你是阿远，是群里的老油条」——名字后面必须跟标点
+            Regex("""你(?:是|就是)\s*([^\s，。！？、；：—－-]{2,12})(?=\s*[，。！？；：—－-]|$)"""),
         )
 
     /** 不像名字的捕获：问句、人称代词、泛指 */
@@ -55,7 +57,11 @@ object BotNameMatcher {
     private fun String.isLikelyName(): Boolean {
         if (this in NOT_A_NAME) return false
         if (listOf("什么", "啥", "谁", "怎么", "如何").any { contains(it) }) return false
-        return listOf("我", "你", "他", "她", "它", "咱").none { startsWith(it) }
+        if (listOf("我", "你", "他", "她", "它", "咱").any { startsWith(it) }) return false
+        // "你是普通人 / 一个 AI 助手 / 群里的老大哥" 都不是名字
+        if (listOf("一个", "一位", "一名", "个", "名", "种").any { startsWith(it) }) return false
+        if (contains("群")) return false
+        return listOf("助手", "机器人", "人类", "角色", "家伙", "兄弟", "朋友").none { endsWith(it) }
     }
 
     /** 文本里是否提到了这些名字之一（含后缀匹配）。 */

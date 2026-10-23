@@ -1,7 +1,9 @@
 package com.qbot.core.engine
 
 import com.qbot.core.ai.AiConfig
+import com.qbot.core.ai.Addressee
 import com.qbot.core.ai.AddresseeDetector
+import com.qbot.core.ai.AddresseeKind
 import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.AiReply
 import com.qbot.core.ai.AiResponder
@@ -495,6 +497,16 @@ class BotRuntime(
                 }
             }
 
+        // 规则层已经认定「这是在叫它 / 在骂它」时，对话对象必须跟着一致。
+        // 否则会出现自相矛盾：它明明照着"叫名字必答"回了话，
+        // 复盘却记成"对全群说"——因为两处用的是不同判定（审计发现）。
+        val finalAddressee =
+            if (gate is ChitchatGate.Forced && addressee.kind == AddresseeKind.GROUP) {
+                Addressee(AddresseeKind.BOT, null, gate.reason)
+            } else {
+                addressee
+            }
+
         pipeline.recordChitchat(
             message = message,
             cleanText = text,
@@ -572,7 +584,7 @@ class BotRuntime(
                                         personaPrompt,
                                         lastBotSpokeAgoMillis =
                                             chitchatPolicy.lastSpokeAgoMillis(groupId),
-                                        addressee = addressee,
+                                        addressee = finalAddressee,
                                         behavior =
                                             BehaviorContext(
                                                 userRules = config.chimeRules,
@@ -683,8 +695,8 @@ class BotRuntime(
                             replyText = replyText?.take(200),
                             addressed = addressed,
                             insulted = insulted,
-                            addresseeKind = addressee.kind.name,
-                            addresseeName = addressee.name,
+                            addresseeKind = finalAddressee.kind.name,
+                            addresseeName = finalAddressee.name,
                             personaId = pipeline.currentPersonaId(message),
                             externalId = message.messageId,
                             createdAt = System.currentTimeMillis(),

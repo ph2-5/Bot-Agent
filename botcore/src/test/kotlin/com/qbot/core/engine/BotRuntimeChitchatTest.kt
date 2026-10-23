@@ -326,6 +326,30 @@ class BotRuntimeChitchatTest {
         }
 
     @Test
+    fun `名字出现在后半句时决策记录仍认为是对机器人说的`() =
+        runBlocking {
+            // 规则层「叫名字必答」能认出现在任意位置的简称，
+            // 对话对象判定过去只看开头，于是出现"说了话却记成对全群说"。
+            val runtime = prepareRuntime(this)
+            groups.upsert(
+                com.qbot.core.ai.GroupProfile(
+                    groupId = "group-openid",
+                    botName = "过去的阿远",
+                    joinedAt = 0,
+                    lastSeenAt = 0,
+                ),
+            )
+
+            runtime.onMessage(fullMessage("你嘴上积点德阿远"))
+            awaitSent(1)
+            withTimeout(15_000) {
+                while (trainer.decisions.isEmpty()) delay(50)
+            }
+
+            assertEquals("BOT", trainer.decisions.single().addresseeKind)
+        }
+
+    @Test
     fun `艾特机器人的全量消息交给艾特链路不重复回复`() =
         runBlocking {
             val runtime = prepareRuntime(this)
