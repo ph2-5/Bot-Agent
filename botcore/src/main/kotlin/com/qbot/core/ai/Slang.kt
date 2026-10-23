@@ -25,7 +25,7 @@ data class SlangTerm(
     /** 在群聊里出现过的次数，用于排序与淘汰 */
     val hits: Int = 0,
     val enabled: Boolean = true,
-    /** HARVEST / MANUAL */
+    /** HARVEST / MANUAL / LEARNED / AI */
     val source: String = "HARVEST",
     val createdAt: Long = 0,
     val updatedAt: Long = 0,
@@ -36,6 +36,9 @@ data class SlangTerm(
 
         /** 聊天时遇到、当场问出来的 */
         const val SOURCE_LEARNED = "LEARNED"
+
+        /** 从人设（角色卡）里抽出来的特殊说法 / 外号 / 雷点 */
+        const val SOURCE_AI = "AI"
     }
 }
 

@@ -438,6 +438,77 @@ class MemoryPipelineTest {
             assertNull(p.handleMemoryCommand(message("我的记忆"), "我的记忆"))
         }
 
+    // ---------- 多人记忆 ----------
+
+    @Test
+    fun `每轮对话都写进这个人的私人线程含机器人回复`() =
+        runTest {
+            pipeline.recordExchange(message("在吗", senderId = "a"), "在吗", "在的")
+
+            val thread = room.recent("g:group-1@p:a", 10)
+            assertEquals(2, thread.size)
+            assertEquals("user", thread[0].role)
+            assertEquals("assistant", thread[1].role)
+            assertEquals("在的", thread[1].content)
+            // 别人的线程不受影响
+            assertTrue(room.recent("g:group-1@p:b", 10).isEmpty())
+        }
+
+    @Test
+    fun `回复时只注入当前这个人的往返记录`() =
+        runTest {
+            pipeline.recordExchange(message("我叫小明", senderId = "a"), "我叫小明", "记住了")
+            pipeline.recordExchange(message("我讨厌香菜", senderId = "b"), "我讨厌香菜", "好的")
+            clock.tick()
+
+            val a = pipeline.buildContext(message("我刚才说啥了", senderId = "a"), "bot", "我刚才说啥了")
+            assertTrue(a.personalDigest.any { it.content.contains("我叫小明") })
+            assertTrue(a.personalDigest.any { it.role == "assistant" })
+            assertFalse(a.personalDigest.any { it.content.contains("香菜") })
+
+            val b = pipeline.buildContext(message("你还记得我吗", senderId = "b"), "bot", "你还记得我吗")
+            assertTrue(b.personalDigest.any { it.content.contains("香菜") })
+            assertFalse(b.personalDigest.any { it.content.contains("小明") })
+        }
+
+    @Test
+    fun `关闭私人线程后不再写入也不再注入`() =
+        runTest {
+            val p = newPipeline(MemoryConfig(personalThreadEnabled = false))
+            p.recordExchange(message("在吗", senderId = "a"), "在吗", "在的")
+
+            assertTrue(room.recent("g:group-1@p:a", 10).isEmpty())
+            val ctx = p.buildContext(message("在吗", senderId = "a"), "bot", "在吗")
+            assertTrue(ctx.personalDigest.isEmpty())
+        }
+
+    @Test
+    fun `群画像把每个人和他的事实绑定`() =
+        runTest {
+            val groupStore = InMemoryGroupStore()
+            val p =
+                MemoryPipeline(
+                    identities = identities,
+                    facts = facts,
+                    roomContext = room,
+                    configProvider = { MemoryConfig() },
+                    clock = { clock.now },
+                    groupStore = groupStore,
+                )
+            identities.remember("a", "小明", NameSource.DECLARED, clock.now)
+            identities.remember("b", "小红", NameSource.DECLARED, clock.now)
+            groupStore.touch("group-1", "a", clock.now)
+            groupStore.touch("group-1", "b", clock.now)
+            facts.add(UserFact(senderId = "a", text = "喜欢吃辣", updatedAt = clock.now))
+            facts.add(UserFact(senderId = "b", text = "讨厌香菜", updatedAt = clock.now))
+
+            val ctx = p.buildContext(message("群里都有谁", senderId = "a"), "bot", "群里都有谁")
+            val people = ctx.group!!.people
+            assertEquals(2, people.size)
+            assertEquals(listOf("喜欢吃辣"), people.first { it.displayName == "小明" }.facts)
+            assertEquals(listOf("讨厌香菜"), people.first { it.displayName == "小红" }.facts)
+        }
+
     // ---------- 启动收敛 ----------
 
     @Test

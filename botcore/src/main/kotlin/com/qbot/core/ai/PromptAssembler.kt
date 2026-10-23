@@ -27,6 +27,12 @@ class PromptAssembler {
         /** 群聊背景最多占用预算的比例 */
         private const val DIGEST_BUDGET_RATIO = 0.25
 
+        /** 私人对话最多占用预算的比例 */
+        private const val PERSONAL_DIGEST_BUDGET_RATIO = 0.2
+
+        /** 私人对话注入条数上限 */
+        private const val PERSONAL_DIGEST_LIMIT = 10
+
         /** 预算再紧也至少保留几条事实 */
         private const val MIN_FACTS_KEPT = 3
 
@@ -60,6 +66,12 @@ class PromptAssembler {
         // 1) 人设：永不丢弃
         if (personaPrompt.isNotBlank()) {
             result += ChatMessage(role = "system", content = personaPrompt)
+        }
+
+        // 1.4) 说话约束：紧接着人设，且内容稳定（改设置才会变），
+        // 放在这里既能压住人设里的修辞，也不破坏后续前缀缓存。
+        StyleRender.block(memory?.styleRules.orEmpty())?.let { text ->
+            result += ChatMessage(role = "system", content = text)
         }
 
         val budget = tokenBudget.coerceAtLeast(TokenEstimator.estimate(question) + 16)
@@ -117,7 +129,17 @@ class PromptAssembler {
                 lines += "正在跟你说话的这个人叫「$who」，以此为准；历史里的旧称呼作废。"
             }
             lines += "这个群里跟你有过交流的成员约 ${group.seenCount} 人。"
-            if (group.knownMembers.isNotEmpty()) {
+            if (group.people.isNotEmpty()) {
+                lines += "本群你认识的人（每人一行；别把一个人的事算到另一个人头上）："
+                group.people.take(6).forEach { person ->
+                    val facts = person.facts.filter { it.isNotBlank() }.joinToString("、")
+                    lines +=
+                        "- ${person.displayName}" +
+                            if (facts.isNotBlank()) "：$facts" else ""
+                }
+                lines += "被问到群里有哪些人时只报上面这些名字，不要编造；" +
+                    "也别把甲的喜好、经历说成乙的。"
+            } else if (group.knownMembers.isNotEmpty()) {
                 lines +=
                     "你认识的人：" + group.knownMembers.joinToString("、") +
                         if (group.unnamedCount > 0) {
@@ -140,6 +162,15 @@ class PromptAssembler {
             val block = lines.joinToString("\n")
             result += ChatMessage(role = "system", content = block)
             remaining -= TokenEstimator.estimate(block)
+        }
+
+        // 2.6) 人设设定：从角色卡里抽出来的「认识的人 / 雷点 / 特殊说法」。
+        // 与人设正文分开存，改人设时不会把这些长期设定一起改没。
+        memory?.social?.lore?.let { lore ->
+            LoreRender.block(lore)?.let { text ->
+                result += ChatMessage(role = "system", content = text)
+                remaining -= TokenEstimator.estimate(text)
+            }
         }
 
         // 2.7) 被引用的原文：指代不明时最有效的一条线索
@@ -215,6 +246,35 @@ class PromptAssembler {
             MemeRender.block(urls)?.let { text ->
                 result += ChatMessage(role = "system", content = text)
                 remaining -= TokenEstimator.estimate(text)
+            }
+        }
+
+        // 3.0) 你和当前这个人之间的往返（含机器人自己的回复）。
+        // 这是「多人记忆」的关键一层：群背景是全群混在一起的，
+        // 这里只放两人之间的对话，模型才不会张冠李戴。
+        val personal = memory?.personalDigest.orEmpty()
+        if (personal.isNotEmpty() && remaining > 0) {
+            val who = memory?.senderLabel?.takeIf { it.isNotBlank() } ?: "对方"
+            val cap = (budget * PERSONAL_DIGEST_BUDGET_RATIO).toInt()
+            val lines = mutableListOf<String>()
+            var cost = 0
+            for (msg in personal.takeLast(PERSONAL_DIGEST_LIMIT)) {
+                val speaker = if (msg.role == "assistant") "你" else who
+                val body = msg.content.replace("\n", " ").take(DIGEST_ENTRY_MAX)
+                val line = "[$speaker] $body"
+                val lineCost = TokenEstimator.estimate(line)
+                if (cost + lineCost > cap && lines.isNotEmpty()) break
+                if (cost + lineCost > cap && lines.isEmpty()) break
+                lines += line
+                cost += lineCost
+            }
+            if (lines.isNotEmpty()) {
+                val block =
+                    "你和「$who」之前的对话（只属于你们两个人；" +
+                        "这里没有别人的话，别把群背景里其他人的事算到他头上）：\n" +
+                        lines.joinToString("\n")
+                result += ChatMessage(role = "system", content = block)
+                remaining -= TokenEstimator.estimate(block)
             }
         }
 

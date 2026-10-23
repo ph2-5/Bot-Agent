@@ -9,6 +9,7 @@ import com.qbot.app.data.backup.DisplayNameBackup
 import com.qbot.app.data.backup.GreetingBackup
 import com.qbot.app.data.backup.GroupBotNameBackup
 import com.qbot.app.data.backup.LessonBackup
+import com.qbot.app.data.backup.LoreBackup
 import com.qbot.app.data.backup.MemeBackup
 import com.qbot.app.data.backup.MemoryBackup
 import com.qbot.app.data.backup.PersonaBackup
@@ -16,9 +17,12 @@ import com.qbot.app.data.backup.RelationBackup
 import com.qbot.app.data.backup.SlangBackup
 import com.qbot.app.data.backup.PersonaProfileBackup
 import com.qbot.app.data.backup.RuleBackup
+import com.qbot.app.data.backup.StyleRuleBackup
 import com.qbot.app.data.db.AppDatabase
 import com.qbot.app.data.db.LogEntity
+import com.qbot.app.data.db.LoreEntity
 import com.qbot.app.data.db.RuleEntity
+import com.qbot.app.data.db.StyleRuleEntity
 import com.qbot.app.data.repo.PersonaRepository
 import com.qbot.app.data.repo.RoomChimeDecisionStore
 import com.qbot.app.data.repo.RoomChimeLessonStore
@@ -28,7 +32,9 @@ import com.qbot.app.data.repo.RoomFactStore
 import com.qbot.app.data.repo.RoomGroupStore
 import com.qbot.app.data.repo.RoomIdentityStore
 import com.qbot.app.data.repo.RoomInnerThoughtSink
+import com.qbot.app.data.repo.RoomLoreStore
 import com.qbot.app.data.repo.RoomSocialStore
+import com.qbot.app.data.repo.RoomStyleRuleStore
 import com.qbot.core.api.DeepSeekSearch
 import com.qbot.app.data.repo.RoomSharedContextStore
 import com.qbot.app.data.repo.SettingsRepository
@@ -51,6 +57,9 @@ import com.qbot.core.ai.ChimeStats
 import com.qbot.core.ai.EmptyContentException
 import com.qbot.core.ai.GenerationLimits
 import com.qbot.core.ai.LessonCategories
+import com.qbot.core.ai.LoreEntry
+import com.qbot.core.ai.LoreKind
+import com.qbot.core.ai.LoreSource
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.GroupProfile
 import com.qbot.core.ai.LlmClient
@@ -65,9 +74,15 @@ import com.qbot.core.ai.PersonaSeed
 import com.qbot.core.ai.PersonaStage
 import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.PersonaResolver
+import com.qbot.core.ai.PersonaLoreExtractor
 import com.qbot.core.ai.RemoteImageLoader
 import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.SendMemeTool
+import com.qbot.core.ai.StyleRule
+import com.qbot.core.ai.StyleRuleCategory
+import com.qbot.core.ai.StyleRuleComposer
+import com.qbot.core.ai.StyleRuleSource
+import com.qbot.core.ai.StyleRender
 import com.qbot.core.ai.ThinkingMode
 import com.qbot.core.ai.ThinkingParams
 import com.qbot.core.ai.ToolRegistry
@@ -222,7 +237,14 @@ class BotController(
     /** 内心戏出口：思考模式打开时，模型没说出口的那段话落这里。 */
     private val innerThoughtSink = RoomInnerThoughtSink(database.innerThoughtDao())
 
-    /** 关系、心情、梗库：既是提示词的数据源，也是互动事件的落库点。 */
+    /** 关系、心情、梗库、人设设定：既是提示词的数据源，也是互动事件的落库点。 */
+    private val loreStore = RoomLoreStore(database.loreDao())
+
+    private val styleRuleStore = RoomStyleRuleStore(database.styleRuleDao())
+
+    /** 三路约束的合并器：内置（可逐条停用）+ 用户自定义 + 未来插件 */
+    private val styleRuleComposer = StyleRuleComposer(store = styleRuleStore)
+
     private val socialStore =
         RoomSocialStore(
             affinityDao = database.affinityDao(),
@@ -230,6 +252,9 @@ class BotController(
             slangDao = database.slangDao(),
             thoughtDao = database.innerThoughtDao(),
             memeDao = database.memeDao(),
+            loreDao = database.loreDao(),
+            // 人设设定按当前激活档案隔离：换人设后不会把上一个人设的「老爹」带过去
+            personaIdProvider = { personaRepository.active()?.id },
         )
 
     /** 反思串行化：一次只处理一条反馈，避免并发写入把经验库弄乱 */
@@ -386,6 +411,124 @@ class BotController(
         }
         socialStore.trimSlang(200)
         return touched
+    }
+
+    // ---- 说话风格（去 AI 味约束） ----
+
+    /**
+     * 合并后的约束列表（内置 + 用户自定义）。
+     *
+     * 内置规则始终返回，enabled 反映用户是否停用过——
+     * 数据库里没有行就是默认启用，这样升级新增的内置规则会自动出现。
+     */
+    fun observeStyleRules(): Flow<List<StyleRule>> =
+        styleRuleStore.observeRows().map { saved -> styleRuleComposer.merge(saved) }
+
+    /** 新增一条自定义约束；文本为空返回 false。 */
+    suspend fun addStyleRule(
+        text: String,
+        category: StyleRuleCategory = StyleRuleCategory.TONE,
+    ): Boolean {
+        val clean = text.trim()
+        if (clean.isEmpty()) return false
+        styleRuleStore.upsert(
+            StyleRule(
+                text = clean.take(StyleRender.MAX_ONE_RULE),
+                category = category,
+                source = StyleRuleSource.USER,
+            ),
+        )
+        return true
+    }
+
+    suspend fun setStyleRuleEnabled(
+        rule: StyleRule,
+        enabled: Boolean,
+    ) = styleRuleStore.setEnabled(rule.id, enabled)
+
+    /** 删除用户规则；对内置规则而言等于「恢复默认」。 */
+    suspend fun deleteStyleRule(rule: StyleRule) = styleRuleStore.delete(rule.id)
+
+    suspend fun clearUserStyleRules() = styleRuleStore.clearUserRules()
+
+    // ---- 人设设定（认识的人 / 说法） ----
+
+    fun observeLore(): Flow<List<LoreEntry>> = loreStore.observeAll()
+
+    /** 手动加一条设定；挂在当前激活的人格下。 */
+    suspend fun addLore(
+        kind: LoreKind,
+        name: String,
+        note: String,
+    ): Boolean {
+        val cleanName = name.trim()
+        val cleanNote = note.trim()
+        if (cleanName.isEmpty() || cleanNote.isEmpty()) return false
+        loreStore.save(
+            LoreEntry(
+                personaId = personaRepository.active()?.id,
+                kind = kind,
+                name = cleanName.take(12),
+                note = cleanNote.take(40),
+                source = LoreSource.MANUAL,
+            ),
+        )
+        return true
+    }
+
+    suspend fun setLoreEnabled(
+        id: Long,
+        enabled: Boolean,
+    ) = loreStore.setEnabled(id, enabled)
+
+    suspend fun deleteLore(id: Long) = loreStore.delete(id)
+
+    /**
+     * 让模型从当前人设正文里抽取「认识的人」与「特殊说法」。
+     *
+     * 只在用户点按钮时跑：抽取是一次性成本，产物落库后不再需要模型。
+     * 重抽会替换上一轮 AI 抽的条目，手动加的保留。
+     *
+     * @return 本次写入的条数；0 表示没抽到或 AI 不可用
+     */
+    suspend fun extractPersonaLore(): Int {
+        val persona = runCatching { personaRepository.active() }.getOrNull() ?: return 0
+        val prompt = persona.prompt.trim()
+        if (prompt.isBlank()) return 0
+        val config = settings.aiConfig.value
+        if (!config.enabled || !config.isReady) return 0
+        val entries =
+            runCatching {
+                PersonaLoreExtractor(LlmClient(http = http, logger = logger))
+                    .extract(prompt, persona.id, config)
+            }.getOrDefault(emptyList())
+        if (entries.isEmpty()) return 0
+
+        // 重抽即替换：只清上一轮 AI 的产物，手动补充的设定不动
+        runCatching {
+            loreStore.all()
+                .filter { it.personaId == persona.id && it.source == LoreSource.AI }
+                .forEach { loreStore.delete(it.id) }
+        }
+        var saved = 0
+        entries.forEach { entry ->
+            runCatching { loreStore.save(entry) }.onSuccess { saved++ }
+            // 设定里的「特殊说法」同时补进梗库：群里提到时模型能听懂，
+            // 与从群聊里收获的梗分开标注来源，维护端可以区别对待。
+            if (entry.kind == LoreKind.SLANG) {
+                runCatching {
+                    socialStore.upsertSlang(
+                        SlangTerm(
+                            term = entry.name,
+                            meaning = entry.note,
+                            source = SlangTerm.SOURCE_AI,
+                            hits = 1,
+                        ),
+                    )
+                }
+            }
+        }
+        return saved
     }
 
     /** 近 N 天的判断质量统计。 */
@@ -1036,6 +1179,10 @@ class BotController(
         val chitchat = settings.chitchatConfig.value
         val creds = settings.credentials()
 
+        // 备份里用名称而不是 id 关联人格：自增 id 换机后对不上
+        val personaNames =
+            runCatching { personaRepository.all() }.getOrDefault(emptyList()).associate { it.id to it.name }
+
         val backup =
             ConfigBackup(
                 exportedAt = System.currentTimeMillis(),
@@ -1068,6 +1215,8 @@ class BotController(
                         learnNames = memory.learnNames,
                         learnFacts = memory.learnFacts,
                         personaRewrite = memory.personaRewrite,
+                        personalThreadEnabled = memory.personalThreadEnabled,
+                        personalThreadSize = memory.personalThreadSize,
                     ),
                 greeting = GreetingBackup(enabled = greeting.enabled, text = greeting.text),
                 chitchat =
@@ -1181,6 +1330,29 @@ class BotController(
                             hits = meme.hits,
                         )
                     },
+                // 人设设定与说话约束：用户手工调过的东西，换机不该丢
+                lore =
+                    runCatching { database.loreDao().all() }.getOrDefault(emptyList()).map { entry ->
+                        LoreBackup(
+                            personaName = entry.personaId?.let { personaNames[it] },
+                            kind = entry.kind,
+                            name = entry.name,
+                            note = entry.note,
+                            scopeGroupId = entry.scopeGroupId,
+                            enabled = entry.enabled,
+                            source = entry.source,
+                        )
+                    },
+                styleRules =
+                    runCatching { database.styleRuleDao().all() }.getOrDefault(emptyList()).map { row ->
+                        StyleRuleBackup(
+                            id = row.id,
+                            text = row.text,
+                            category = row.category,
+                            source = row.source,
+                            enabled = row.enabled,
+                        )
+                    },
                 // 训练成果：经验库跟着配置走，换机后不必重新教一遍
                 chimeLessons =
                     chimeLessonStore.all().map { lesson ->
@@ -1256,6 +1428,8 @@ class BotController(
                     learnNames = it.learnNames,
                     learnFacts = it.learnFacts,
                     personaRewrite = it.personaRewrite,
+                    personalThreadEnabled = it.personalThreadEnabled,
+                    personalThreadSize = it.personalThreadSize,
                 ),
             )
             applied++
@@ -1516,6 +1690,57 @@ class BotController(
             if (hit == null) personaNew++ else personaUpdated++
         }
 
+        // 人设设定与说话约束：放在人格导入之后，才能按名称重新绑定人格
+        var loreCount = 0
+        if (backup.lore.isNotEmpty()) {
+            runCatching {
+                val names = personaRepository.all().associateBy { it.name }
+                val dao = database.loreDao()
+                dao.clearPersona(null)
+                backup.lore.forEach { dto ->
+                    val personaId = dto.personaName?.let { names[it]?.id }
+                    val old = dao.find(personaId, dto.kind, dto.name, dto.scopeGroupId)
+                    dao.upsert(
+                        LoreEntity(
+                            id = old?.id ?: 0,
+                            personaId = personaId,
+                            kind = dto.kind,
+                            name = dto.name,
+                            note = dto.note,
+                            scopeGroupId = dto.scopeGroupId,
+                            enabled = dto.enabled,
+                            source = dto.source,
+                            createdAt = old?.createdAt ?: System.currentTimeMillis(),
+                            updatedAt = System.currentTimeMillis(),
+                        ),
+                    )
+                    loreCount++
+                }
+            }
+            applied++
+        }
+
+        var styleCount = 0
+        if (backup.styleRules.isNotEmpty()) {
+            runCatching {
+                val dao = database.styleRuleDao()
+                backup.styleRules.forEach { dto ->
+                    dao.upsert(
+                        StyleRuleEntity(
+                            id = dto.id,
+                            text = dto.text,
+                            category = dto.category,
+                            source = dto.source,
+                            enabled = dto.enabled,
+                            updatedAt = System.currentTimeMillis(),
+                        ),
+                    )
+                    styleCount++
+                }
+            }
+            applied++
+        }
+
         var nameCount = 0
         backup.displayNames.forEach { dto ->
             if (dto.senderId.isBlank() || dto.displayName.isBlank()) return@forEach
@@ -1550,11 +1775,13 @@ class BotController(
             TAG,
             "配置导入完成：规则 $ruleCount 条、人格档案 +$profileNew/更新$profileUpdated、" +
                 "人设覆盖 +$personaNew/更新$personaUpdated、" +
-                "备注 $nameCount、群名片 $groupNameCount、经验 $lessonCount 条、配置项 $applied",
+                "备注 $nameCount、群名片 $groupNameCount、经验 $lessonCount 条、" +
+                "人设设定 $loreCount 条、说话约束 $styleCount 条、配置项 $applied",
         )
         return "导入完成：规则 $ruleCount 条，人格档案新增 $profileNew、更新 $profileUpdated，" +
             "人设覆盖新增 $personaNew、更新 $personaUpdated，" +
-            "备注名 $nameCount，群名片 $groupNameCount，经验 $lessonCount 条，配置组 $applied 项" +
+            "备注名 $nameCount，群名片 $groupNameCount，经验 $lessonCount 条，" +
+            "人设设定 $loreCount 条，说话约束 $styleCount 条，配置组 $applied 项" +
             (if (backup.credentials != null) "（含凭证，需重新启动机器人生效）" else "")
     }
 
@@ -1661,10 +1888,12 @@ class BotController(
                 chimeTrainer = chimeTrainer,
                 // 内心戏：只落库，不进上下文也不发给群友
                 innerThoughtSink = innerThoughtSink,
-                // 关系 / 心情 / 梗：读注入提示词，写来自互动事件
+                // 关系 / 心情 / 梗 / 人设设定：读注入提示词，写来自互动事件
                 socialProvider = socialStore,
                 relationRecorder = socialStore,
                 slangLearner = slangLearner,
+                // 「去 AI 味」约束：内置 + 用户自定义（+ 未来插件），每条消息现取
+                styleRuleProvider = { styleRuleComposer.rules() },
                 // 表情包：群友发的图捡库，回复时模型可以从库里挑一张配着发
                 memeHarvester = memeHarvester,
                 // 明确被要求发图时本地直接挑一张；工具选中的图也在这里计数

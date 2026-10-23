@@ -26,7 +26,24 @@ class MemoryExtractorTest {
     fun `昵称句式提取自称名`() {
         assertEquals("测试_user-1", extractor.extractName("我的昵称是测试_user-1"))
         assertEquals("小美", extractor.extractName("我的名字是小美"))
-        assertEquals("阿珍", extractor.extractName("昵称阿珍"))
+        assertEquals("阿珍", extractor.extractName("昵称是阿珍"))
+    }
+
+    @Test
+    fun `别人对我的称呼不会被当成自称`() {
+        // 「他们叫我小明」是别人的说法，记到发送者头上就是记混
+        assertNull(extractor.extractName("他们叫我小明"))
+        assertNull(extractor.extractName("你可以叫他阿伟"))
+        // 「他说我是学生」里的「我是」不是句首声明
+        assertNull(extractor.extractName("他说我是学生"))
+    }
+
+    @Test
+    fun `半句话不会被当成名字`() {
+        assertNull(extractor.extractName("昵称怎么改"))
+        assertNull(extractor.extractName("这个昵称好听"))
+        assertNull(extractor.extractName("叫我怎么办"))
+        assertNull(extractor.extractName("叫我很开心"))
     }
 
     @Test

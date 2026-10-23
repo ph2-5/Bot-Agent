@@ -64,6 +64,14 @@ fun MemoryPage(onBack: () -> Unit) {
                 enabled = config.enabled,
             )
             SwitchRow(
+                title = "按人记对话",
+                desc = "每个人都有一条独立往返记录（含机器人自己的回复），回复时只看当前这个人的，" +
+                    "不会把甲说过的话算到乙头上",
+                checked = config.personalThreadEnabled,
+                onCheckedChange = { update(config.copy(personalThreadEnabled = it)) },
+                enabled = config.enabled,
+            )
+            SwitchRow(
                 title = "共享群聊背景",
                 desc = "记住群里最近的对话，让「那他呢」这类承接能听懂",
                 checked = config.roomContextEnabled,
@@ -114,6 +122,27 @@ fun MemoryPage(onBack: () -> Unit) {
                 onValueChangeFinished = {
                     update(
                         config.copy(roomContextSize = roomContextSize.toInt().coerceIn(5, 50)),
+                    )
+                },
+            )
+
+            var personalThreadSize by remember(config.personalThreadSize) {
+                mutableFloatStateOf(config.personalThreadSize.toFloat())
+            }
+            Text(
+                "每人的私人对话注入 ${personalThreadSize.toInt()} 条（机器人自己的回复也算在内）",
+                style = MaterialTheme.typography.labelMedium,
+            )
+            Slider(
+                value = personalThreadSize,
+                onValueChange = { personalThreadSize = it },
+                valueRange = 4f..30f,
+                enabled = config.enabled && config.personalThreadEnabled,
+                onValueChangeFinished = {
+                    update(
+                        config.copy(
+                            personalThreadSize = personalThreadSize.toInt().coerceIn(4, 30),
+                        ),
                     )
                 },
             )

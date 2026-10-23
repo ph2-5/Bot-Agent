@@ -48,6 +48,8 @@ class MemoryExtractor {
                 "博士", "硕士", "本科生", "摄影师", "画手", "主播", "厨师", "医生", "律师",
                 "会计", "销售", "客服", "测试", "前端", "后端", "全栈", "策划", "作者",
                 "作家", "编辑", "翻译", "自由职业者", "打工人", "上班族",
+                "路人", "网友", "好人", "坏人", "傻子", "笨蛋", "天才",
+                "本人", "自己", "别人", "某人", "有人", "一个人", "新来的",
             )
 
         /** 捕获内容里的疑问词/代词：整段命中或以其开头即视为误匹配 */
@@ -68,18 +70,25 @@ class MemoryExtractor {
             )
 
         /** 结尾语气词，自称名里直接剥掉 */
-        private const val PARTICLES = "呀啊哦吧呢嘛啦哟欸"
+        private const val PARTICLES = "呀啊哦吧呢嘛啦哟欸吗"
 
         /** 截断用的标点集合 */
         private const val CUT_CHARS = "，。！？、,.!?~～\\s:：;；|/"
 
+        /**
+         * 自称名模式。
+         *
+         * 刻意收紧的两处，都是「把别人的话记到发送者头上」的真实来源：
+         * - 「叫我X」前面不能紧挨着他/她/它/你/您/们（「他们叫我小明」不是自称）；
+         * - 「我是X」只认句首或标点之后（「他说我是学生」里的「我是」不是自称）。
+         */
         private val NAME_PATTERNS =
             listOf(
                 Regex("我的昵称是(.{1,15})"),
                 Regex("我的名字是(.{1,15})"),
-                Regex("昵称(?:是|叫)?(.{1,15})"),
-                Regex("叫我(.{1,15})"),
-                Regex("我是(.{1,15})"),
+                Regex("昵称(?:是|叫)(.{1,15})"),
+                Regex("(?<![他她它们你您])叫我(.{1,15})"),
+                Regex("(?:^|[，。,.!?！？\\s])我是(.{1,15})"),
             )
 
         private data class FactPattern(
@@ -173,6 +182,15 @@ class MemoryExtractor {
         if (s.length !in 2..12) return null
         if (!s.matches(Regex("[\\u4e00-\\u9fa5A-Za-z0-9_\\-]+"))) return null
         if (s in NAME_STOPWORDS) return null
+        // 疑问词开头不是名字（「叫我怎么办」）
+        if (CAPTURE_STOPWORDS.any { s == it || s.startsWith(it) }) return null
+        // 以否定/程度/助词开头或结尾的，多半是半句话而不是名字
+        if (s.startsWith("不") || s.startsWith("没") || s.startsWith("很") || s.startsWith("太") ||
+            s.startsWith("真") || s.startsWith("有")
+        ) {
+            return null
+        }
+        if (s.endsWith("的") || s.endsWith("了") || s.endsWith("着") || s.endsWith("过")) return null
         return s
     }
 

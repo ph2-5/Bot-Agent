@@ -93,6 +93,8 @@ class SettingsRepository(private val context: Context) {
         val MEMORY_LEARN_NAMES = booleanPreferencesKey("memory_learn_names")
         val MEMORY_LEARN_FACTS = booleanPreferencesKey("memory_learn_facts")
         val MEMORY_PERSONA_REWRITE = booleanPreferencesKey("memory_persona_rewrite")
+        val MEMORY_PERSONAL_THREAD = booleanPreferencesKey("memory_personal_thread")
+        val MEMORY_PERSONAL_THREAD_SIZE = intPreferencesKey("memory_personal_thread_size")
 
         // ---- 群感知 ----
         val GREETING_ENABLED = booleanPreferencesKey("greeting_enabled")
@@ -238,6 +240,10 @@ class SettingsRepository(private val context: Context) {
             learnFacts = prefs[Keys.MEMORY_LEARN_FACTS] ?: defaults.learnFacts,
             personaRewrite =
                 prefs[Keys.MEMORY_PERSONA_REWRITE] ?: defaults.personaRewrite,
+            personalThreadEnabled =
+                prefs[Keys.MEMORY_PERSONAL_THREAD] ?: defaults.personalThreadEnabled,
+            personalThreadSize =
+                prefs[Keys.MEMORY_PERSONAL_THREAD_SIZE] ?: defaults.personalThreadSize,
         )
     }
 
@@ -253,6 +259,8 @@ class SettingsRepository(private val context: Context) {
                 prefs[Keys.MEMORY_LEARN_NAMES] = config.learnNames
                 prefs[Keys.MEMORY_LEARN_FACTS] = config.learnFacts
                 prefs[Keys.MEMORY_PERSONA_REWRITE] = config.personaRewrite
+                prefs[Keys.MEMORY_PERSONAL_THREAD] = config.personalThreadEnabled
+                prefs[Keys.MEMORY_PERSONAL_THREAD_SIZE] = config.personalThreadSize
             }
         }
     }

@@ -36,6 +36,16 @@ data class MemoryConfig(
      * 注入提示词时仍按 [roomContextSize] 截取，不撑爆预算。
      */
     val chitchatRetention: Int = 200,
+    /**
+     * 是否按人单独记一条「我和他之间的对话」。
+     *
+     * 群背景是全群混在一起的，光靠它模型分不清「这句话是谁对我说的、
+     * 我又回了谁」。开启后每位群友各有一条往返记录（含机器人自己的回复），
+     * 回复时只注入当前这个人那条，既不串人，也能记住「上次答应过他什么」。
+     */
+    val personalThreadEnabled: Boolean = true,
+    /** 注入提示词的私人对话条数 */
+    val personalThreadSize: Int = 12,
 )
 
 /**
@@ -152,6 +162,9 @@ class MemoryPipeline(
             Regex("^我?(?:以后|今后|从那以后)?(?:就)?叫你([\\u4e00-\\u9fa5A-Za-z0-9_-]{1,12})$")
 
         private const val TAG = "MemoryPipeline"
+
+        /** 私人对话线程至少保留的条数（含机器人自己那一半） */
+        private const val MIN_PERSON_THREAD_KEEP = 30
     }
 
     /** 本条消息的记忆上下文（回复前调用）。 */
@@ -203,6 +216,17 @@ class MemoryPipeline(
                 emptyList()
             }
 
+        // 只属于这个人的往返记录（含机器人自己的回复）。
+        // 群背景告诉模型"群里在聊什么"，这条告诉它"我和他之间发生过什么"。
+        val personalDigest =
+            if (config.personalThreadEnabled) {
+                personThreadKey(message)?.let {
+                    roomContext.recent(it, config.personalThreadSize)
+                }.orEmpty()
+            } else {
+                emptyList()
+            }
+
         // 群画像：只有群聊且装了这个群的档案才注入
         val groupDigest = loadGroupDigest(message)
 
@@ -221,6 +245,7 @@ class MemoryPipeline(
         return MemoryContext(
             senderLabel = label,
             facts = personFacts,
+            personalDigest = personalDigest,
             roomDigest = digest,
             group = groupDigest,
             quoted = quoted,
@@ -337,8 +362,7 @@ class MemoryPipeline(
 
         val now = clock()
         val key = ConversationKeys.room(message)
-        roomContext.append(
-            key,
+        val userRow =
             RoomMessage(
                 senderId = message.senderId,
                 senderName = identities.find(message.senderId ?: "")?.displayName,
@@ -348,19 +372,19 @@ class MemoryPipeline(
                 isAt = message.kind == MessageKind.GROUP_AT,
                 externalId = message.messageId,
                 decision = "已回复",
-            ),
-        )
-        roomContext.append(
-            key,
+            )
+        val botRow =
             RoomMessage(
                 senderId = null,
                 senderName = null,
                 role = "assistant",
                 content = answer,
                 timestampMillis = now,
-            ),
-        )
+            )
+        roomContext.append(key, userRow)
+        roomContext.append(key, botRow)
         roomContext.trim(key, retention(config))
+        appendPersonThread(message, config, userRow, botRow)
     }
 
     /**
@@ -385,8 +409,7 @@ class MemoryPipeline(
 
         val key = ConversationKeys.room(message)
         val senderId = message.senderId
-        roomContext.append(
-            key,
+        val row =
             RoomMessage(
                 senderId = senderId,
                 senderName =
@@ -398,9 +421,10 @@ class MemoryPipeline(
                 isAt = isAt,
                 externalId = message.messageId,
                 decision = decision,
-            ),
-        )
+            )
+        roomContext.append(key, row)
         roomContext.trim(key, retention(config))
+        appendPersonThread(message, config, row)
 
         // 顺带学习事实：群里其他人说的「我在考研」「我不吃香菜」同样是记忆来源。
         // 先跑纯正则抽取，抽不到就直接返回——绝大多数闲聊天不会触发下面的数据库读写。
@@ -439,17 +463,17 @@ class MemoryPipeline(
         if (!config.enabled) return
         if (message.targetId.isNullOrBlank() || answer.isBlank()) return
         val key = ConversationKeys.room(message)
-        roomContext.append(
-            key,
+        val row =
             RoomMessage(
                 senderId = null,
                 senderName = null,
                 role = "assistant",
                 content = answer,
                 timestampMillis = clock(),
-            ),
-        )
+            )
+        roomContext.append(key, row)
         roomContext.trim(key, retention(config))
+        appendPersonThread(message, config, row)
     }
 
     /** 回填一条群消息的处理结论（"为什么没回"）。 */
@@ -466,6 +490,31 @@ class MemoryPipeline(
     /** 群背景存储上限：取「注入条数」与「保留条数」的较大者。 */
     private fun retention(config: MemoryConfig): Int =
         maxOf(config.roomContextSize, config.chitchatRetention)
+
+    /** 当前消息发送者的私人线程键；没有 senderId 时返回 null。 */
+    private fun personThreadKey(message: IncomingMessage): String? {
+        val senderId = message.senderId?.takeIf { it.isNotBlank() } ?: return null
+        if (message.targetId.isNullOrBlank()) return null
+        return ConversationKeys.personThread(ConversationKeys.room(message), senderId)
+    }
+
+    /**
+     * 把一轮（或一条）对话写进这个人的私人线程。
+     *
+     * 存得比注入多：注入按 [MemoryConfig.personalThreadSize]，
+     * 存储至少留三倍，避免刚说过两句就被洗掉。
+     */
+    private suspend fun appendPersonThread(
+        message: IncomingMessage,
+        config: MemoryConfig,
+        vararg rows: RoomMessage,
+    ) {
+        if (!config.personalThreadEnabled) return
+        val key = personThreadKey(message) ?: return
+        rows.forEach { row -> roomContext.append(key, row) }
+        val keep = maxOf(config.personalThreadSize * 3, MIN_PERSON_THREAD_KEEP)
+        roomContext.trim(key, keep)
+    }
 
     /**
      * 读取某个范围最近的对话，供插话判断使用。
@@ -743,24 +792,38 @@ class MemoryPipeline(
         val groupId = message.targetId?.takeIf { it.isNotBlank() } ?: return null
         val profile = store.find(groupId) ?: return null
         val seen = profile.seenMembers
-        // 只查前 40 个成员的名称（一次 IN 查询），最多展示 8 个：
-        // 群画像要短、要稳定，塞 500 个名字既费 token 也刷屏。
-        val known =
-            if (seen.isEmpty()) {
-                emptyList()
-            } else {
-                identities.findMany(seen.take(40)).values
-                    .map { it.displayName }
-                    .distinct()
-                    .take(8)
-            }
+        // 只查最近出现的 40 人（一次 IN 查询）：老成员的名字既占 token，
+        // 也容易和当前话题无关。seenMembers 的顺序就是最近出现顺序。
+        val recentIds = seen.toList().takeLast(40)
+        val named = if (recentIds.isEmpty()) emptyMap() else identities.findMany(recentIds)
+        // 认识的人 = 有名字的人 + 关于他的两三条事实。
+        // 把事实按人绑定展示，是「别把 A 的事记到 B 头上」最直接的办法。
+        val people =
+            recentIds
+                .asReversed()
+                .mapNotNull { id ->
+                    val entry = named[id] ?: return@mapNotNull null
+                    PersonBrief(
+                        senderId = id,
+                        displayName = entry.displayName,
+                        facts = if (configProvider().learnFacts) {
+                            facts.facts(id).take(2).map { it.text }
+                        } else {
+                            emptyList()
+                        },
+                    )
+                }
+                .distinctBy { it.displayName }
+                .take(6)
+        val known = people.map { it.displayName }
         return GroupDigest(
             groupId = groupId,
             botName = profile.botName,
             seenCount = profile.seenCount,
             proactiveAllowed = profile.proactiveAllowed,
             knownMembers = known,
-            unnamedCount = (seen.size - known.size).coerceAtLeast(0),
+            unnamedCount = (seen.size - people.size).coerceAtLeast(0),
+            people = people,
         )
     }
 

@@ -43,6 +43,10 @@ data class ConfigBackup(
     val slang: List<SlangBackup> = emptyList(),
     /** 2.6.0 新增：表情包库（手动贴的链接 + 群里捡的图） */
     val memes: List<MemeBackup> = emptyList(),
+    /** 2.8.0 新增：人设设定（梗 / 认识的人 / 关系） */
+    val lore: List<LoreBackup> = emptyList(),
+    /** 2.8.0 新增：说话风格约束（内置的启停覆盖 + 用户自定义） */
+    @SerialName("style_rules") val styleRules: List<StyleRuleBackup> = emptyList(),
 ) {
     companion object {
         private val json =
@@ -88,6 +92,9 @@ data class MemoryBackup(
     @SerialName("learn_names") val learnNames: Boolean,
     @SerialName("learn_facts") val learnFacts: Boolean,
     @SerialName("persona_rewrite") val personaRewrite: Boolean,
+    // ---- 2.8.0 新增：按人记对话（旧备份按默认值导入） ----
+    @SerialName("personal_thread_enabled") val personalThreadEnabled: Boolean = true,
+    @SerialName("personal_thread_size") val personalThreadSize: Int = 12,
 )
 
 @Serializable
@@ -219,4 +226,39 @@ data class MemeBackup(
     val url: String,
     val source: String = "HARVEST",
     val hits: Int = 0,
+)
+
+/**
+ * 一条人设设定。
+ *
+ * [personaName] 而不是 personaId：数据库自增 id 换机后对不上，
+ * 导入时按人格名称重新绑定；人格不存在则落成全局设定。
+ */
+@Serializable
+data class LoreBackup(
+    @SerialName("persona_name") val personaName: String? = null,
+    /** PERSON / SLANG / RELATION / NOTE */
+    val kind: String,
+    val name: String,
+    val note: String = "",
+    @SerialName("scope_group_id") val scopeGroupId: String? = null,
+    val enabled: Boolean = true,
+    /** AI / MANUAL */
+    val source: String = "MANUAL",
+)
+
+/**
+ * 一条说话风格约束。
+ *
+ * 内置规则只备份「用户改过的启停」，[source] = BUILTIN；
+ * 用户自定义的是 [source] = USER，完整带着 id 以免重复导入。
+ */
+@Serializable
+data class StyleRuleBackup(
+    val id: String,
+    val text: String,
+    /** LENGTH / TONE / FORMAT / ECHO / BOUNDARY */
+    val category: String = "TONE",
+    val source: String = "USER",
+    val enabled: Boolean = true,
 )

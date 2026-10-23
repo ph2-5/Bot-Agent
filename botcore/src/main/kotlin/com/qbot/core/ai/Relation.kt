@@ -226,6 +226,13 @@ data class SocialContext(
      * 否则每次都要重新忍一遍。只截一小段，且明确"别翻旧账"。
      */
     val lastThought: String? = null,
+    /**
+     * 人设设定里抽出来的「认识的人 / 特殊说法」。
+     *
+     * 与 [slang] 的分工：slang 是群里自然长出来的说法，
+     * lore 是角色卡里写死的设定（老爹、雷点、彩蛋称呼）。
+     */
+    val lore: List<LoreEntry> = emptyList(),
 )
 
 /** 社交上下文的注入出口，由 BotRuntime 在组装记忆后填入。 */

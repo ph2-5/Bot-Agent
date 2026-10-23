@@ -21,18 +21,22 @@ class PromptAssemblerTest {
         label: String = "小明",
         facts: List<UserFact> = emptyList(),
         digest: List<RoomMessage> = emptyList(),
+        personalDigest: List<RoomMessage> = emptyList(),
         group: GroupDigest? = null,
         quoted: QuotedMessage? = null,
         insult: InsultContext? = null,
         social: SocialContext? = null,
+        styleRules: List<StyleRule> = emptyList(),
     ) = MemoryContext(
         senderLabel = label,
         facts = facts,
+        personalDigest = personalDigest,
         roomDigest = digest,
         group = group,
         quoted = quoted,
         insult = insult,
         social = social,
+        styleRules = styleRules,
     )
 
     private fun fact(text: String) = UserFact(senderId = "s", text = text)
@@ -513,5 +517,91 @@ class PromptAssemblerTest {
         // 否则模型会开始编造图片地址
         assertFalse(messages.any { it.content.contains("表情包") })
         assertFalse(messages.any { it.content.contains("表情:") })
+    }
+
+    @Test
+    fun `说话约束紧跟在人设之后`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "你是一只小鲸鱼",
+                memory =
+                    memory(
+                        styleRules =
+                            listOf(
+                                StyleRule(id = "builtin.length.short", text = "一条回复默认 1~10 个字"),
+                            ),
+                    ),
+                history = emptyList(),
+                question = "在吗",
+                tokenBudget = 10_000,
+            )
+
+        assertEquals("你是一只小鲸鱼", messages[0].content)
+        assertTrue(messages[1].content.contains("说话风格"))
+        assertTrue(messages[1].content.contains("一条回复默认 1~10 个字"))
+    }
+
+    @Test
+    fun `私人往返记录单独注入且标明只有你们两个人`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "你是群友",
+                memory =
+                    memory(
+                        label = "小明",
+                        personalDigest =
+                            listOf(
+                                RoomMessage(
+                                    senderId = "s",
+                                    senderName = "小明",
+                                    role = "user",
+                                    content = "我答应过你少熬夜",
+                                    timestampMillis = 0,
+                                ),
+                                RoomMessage(
+                                    senderId = null,
+                                    senderName = null,
+                                    role = "assistant",
+                                    content = "记住了",
+                                    timestampMillis = 0,
+                                ),
+                            ),
+                    ),
+                history = emptyList(),
+                question = "我答应过你什么",
+                tokenBudget = 10_000,
+            )
+
+        val block = messages.first { it.content.contains("只属于你们两个人") }
+        assertTrue("应带上他说过的话", block.content.contains("[小明] 我答应过你少熬夜"))
+        assertTrue("应带上机器人自己的回复", block.content.contains("[你] 记住了"))
+        assertTrue("应提醒别把别人的事算到他头上", block.content.contains("别把群背景里其他人的事算到他头上"))
+    }
+
+    @Test
+    fun `人设设定块注入认识的人与说法`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "你是群友",
+                memory =
+                    memory(
+                        social =
+                            SocialContext(
+                                lore =
+                                    listOf(
+                                        LoreEntry(kind = LoreKind.PERSON, name = "老爹", note = "只能对他温顺"),
+                                        LoreEntry(kind = LoreKind.SLANG, name = "大肥鱼", note = "雷点，叫了会炸毛"),
+                                    ),
+                            ),
+                    ),
+                history = emptyList(),
+                question = "在吗",
+                tokenBudget = 10_000,
+            )
+
+        val block = messages.first { it.content.contains("人设里已经定下") }
+        assertTrue("应带上认识的人", block.content.contains("「老爹」"))
+        assertTrue("应带上特殊说法", block.content.contains("「大肥鱼」"))
+        assertTrue("应说明是设定背景", block.content.contains("不要主动向群里复述"))
     }
 }

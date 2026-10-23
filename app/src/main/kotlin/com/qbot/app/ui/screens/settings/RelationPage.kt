@@ -246,7 +246,11 @@ private fun SlangRow(
                 Text(
                     buildString {
                         append("出现 ${term.hits} 次 · ").append(groupName)
-                        if (term.source == SlangTerm.SOURCE_MANUAL) append(" · 手动")
+                        when (term.source) {
+                            SlangTerm.SOURCE_MANUAL -> append(" · 手动")
+                            SlangTerm.SOURCE_AI -> append(" · 人设提取")
+                            else -> Unit
+                        }
                         term.usage?.let { append(" · ").append(it) }
                     },
                     style = MaterialTheme.typography.labelSmall,

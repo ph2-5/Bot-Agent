@@ -284,10 +284,20 @@ data class InsultContext(
 data class MemoryContext(
     val senderLabel: String,
     val facts: List<UserFact> = emptyList(),
+    /**
+     * 只属于「当前这个人」的对话记录（含机器人自己的回复）。
+     *
+     * 与 [roomDigest] 的区别：群背景是整个群混在一起的，
+     * 这里只放你和这个人的往返——「他上次让我记的」「我答应过他什么」
+     * 都在这里，不会和别人的话混成一团。
+     */
+    val personalDigest: List<RoomMessage> = emptyList(),
     val roomDigest: List<RoomMessage> = emptyList(),
     val group: GroupDigest? = null,
     val quoted: QuotedMessage? = null,
     val insult: InsultContext? = null,
+    /** 本次生效的「去 AI 味」说话约束（内置 + 用户 + 插件） */
+    val styleRules: List<StyleRule> = emptyList(),
     /**
      * 社交上下文：对这个人什么关系、我自己什么心情、群里最近怎么说。
      *
@@ -314,6 +324,20 @@ data class GroupDigest(
     val knownMembers: List<String> = emptyList(),
     /** 见过但没有名字的成员数 */
     val unnamedCount: Int = 0,
+    /**
+     * 本群「认识的人」一行一个：名字 + 关于他的两三条事实。
+     *
+     * 多人记忆真正的难点不是存，而是**别把 A 的事算到 B 头上**。
+     * 把每个人和他的事实绑在一起给模型看，比给一串名字有效得多。
+     */
+    val people: List<PersonBrief> = emptyList(),
+)
+
+/** 群画像里的一个人：展示名 + 关于他的事实摘要。 */
+data class PersonBrief(
+    val senderId: String,
+    val displayName: String,
+    val facts: List<String> = emptyList(),
 )
 
 /**
@@ -365,4 +389,17 @@ object ConversationKeys {
 
     /** 群背景的键（没有消息对象时用，如人设进化取样）。 */
     fun groupRoom(groupId: String): String = "g:$groupId"
+
+    /**
+     * 某个人的私人对话线程键。
+     *
+     * 在群背景键后面挂上人，形成 `g:群id@p:人id` 的独立命名空间：
+     * 同一张 room_messages 表，既能存「整个群发生了什么」（[room]），
+     * 也能存「我和某个人之间发生了什么」（本方法）。
+     * 机器人自己的回复也写进这里，所以「上一次我答应过他什么」查得到。
+     */
+    fun personThread(
+        roomKey: String,
+        senderId: String,
+    ): String = "$roomKey@p:$senderId"
 }

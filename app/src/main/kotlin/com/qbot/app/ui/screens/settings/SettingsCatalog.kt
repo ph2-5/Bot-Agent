@@ -8,7 +8,9 @@ import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.runtime.Composable
@@ -94,6 +96,20 @@ private fun builtinEntries(onRequestBatteryWhitelist: () -> Unit): List<Settings
             icon = Icons.Filled.Favorite,
             subtitle = { RelationSubtitle() },
         ) { onBack -> RelationPage(onBack = onBack) },
+        SettingsEntry(
+            id = "style",
+            group = "智能",
+            title = "说话风格",
+            icon = Icons.Filled.RecordVoiceOver,
+            subtitle = { StyleSubtitle() },
+        ) { onBack -> StylePage(onBack = onBack) },
+        SettingsEntry(
+            id = "lore",
+            group = "智能",
+            title = "人设设定",
+            icon = Icons.Filled.Person,
+            subtitle = { LoreSubtitle() },
+        ) { onBack -> LorePage(onBack = onBack) },
         SettingsEntry(
             id = "meme",
             group = "智能",

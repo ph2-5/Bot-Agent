@@ -147,8 +147,10 @@ interface AiHistoryDao {
         BotMoodEntity::class,
         SlangEntity::class,
         MemeEntity::class,
+        LoreEntity::class,
+        StyleRuleEntity::class,
     ],
-    version = 13,
+    version = 14,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -185,6 +187,10 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun slangDao(): SlangDao
 
     abstract fun memeDao(): MemeDao
+
+    abstract fun loreDao(): LoreDao
+
+    abstract fun styleRuleDao(): StyleRuleDao
 
     companion object {
         /**
@@ -613,6 +619,40 @@ abstract class AppDatabase : RoomDatabase() {
                             "`source` TEXT NOT NULL, " +
                             "`hits` INTEGER NOT NULL, " +
                             "`createdAt` INTEGER NOT NULL)",
+                    )
+                }
+            }
+        val MIGRATION_13_14 =
+            object : androidx.room.migration.Migration(13, 14) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS `persona_lore` (
+                            `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            `personaId` INTEGER,
+                            `kind` TEXT NOT NULL,
+                            `name` TEXT NOT NULL,
+                            `note` TEXT NOT NULL,
+                            `scopeGroupId` TEXT,
+                            `enabled` INTEGER NOT NULL,
+                            `source` TEXT NOT NULL,
+                            `createdAt` INTEGER NOT NULL,
+                            `updatedAt` INTEGER NOT NULL)
+                        """.trimIndent(),
+                    )
+                    db.execSQL("CREATE INDEX IF NOT EXISTS `index_persona_lore_personaId` ON `persona_lore` (`personaId`)")
+                    db.execSQL("CREATE INDEX IF NOT EXISTS `index_persona_lore_kind` ON `persona_lore` (`kind`)")
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS `style_rules` (
+                            `id` TEXT NOT NULL,
+                            `text` TEXT NOT NULL,
+                            `category` TEXT NOT NULL,
+                            `source` TEXT NOT NULL,
+                            `enabled` INTEGER NOT NULL,
+                            `updatedAt` INTEGER NOT NULL,
+                            PRIMARY KEY(`id`))
+                        """.trimIndent(),
                     )
                 }
             }

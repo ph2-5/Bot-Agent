@@ -30,6 +30,7 @@ import com.qbot.core.ai.RelationEvent
 import com.qbot.core.ai.RelationRecorder
 import com.qbot.core.ai.SlangLearner
 import com.qbot.core.ai.SocialContextProvider
+import com.qbot.core.ai.StyleRule
 import com.qbot.core.ai.RoomMessage
 import com.qbot.core.ai.describe
 import com.qbot.core.api.MsgType
@@ -163,6 +164,13 @@ class BotRuntime(
      * 为 null 时只保留提示词里的 `[表情:URL]` 约定。
      */
     private val memeLibrary: MemeLibrary? = null,
+    /**
+     * 说话约束提供者（内置 + 用户自定义 + 插件）。
+     *
+     * 每轮回复前取一次并注入提示词；为 null 时不注入，
+     * 行为与接入前一致（测试 / 轻量模式）。
+     */
+    private val styleRuleProvider: (suspend () -> List<StyleRule>)? = null,
     /** 插话决策引擎；默认实例即可，测试可注入固定时钟 */
     private val chitchatPolicy: ChitchatPolicy = ChitchatPolicy(),
     /** 冒犯检测：被指名辱骂时要按人设反应，不能装没看见 */
@@ -941,8 +949,11 @@ class BotRuntime(
     ): MemoryContext? {
         val pipeline = memoryPipeline ?: return null
         val base = pipeline.buildContext(message, botId, text, insult)
-        val social = runCatching { socialProvider?.provide(message) }.getOrNull() ?: return base
-        return base.copy(social = social)
+        // 社交层与说话约束都查失败可降级：宁可这一轮"没有态度"，
+        // 也不能因为关系表/规则表抖动就整条不回。
+        val social = runCatching { socialProvider?.provide(message) }.getOrNull()
+        val style = runCatching { styleRuleProvider?.invoke() }.getOrNull().orEmpty()
+        return base.copy(social = social ?: base.social, styleRules = style)
     }
 
     /**

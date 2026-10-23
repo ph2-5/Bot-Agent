@@ -41,6 +41,10 @@ class RoomSocialStore(
     private val slangDao: SlangDao,
     private val thoughtDao: com.qbot.app.data.db.InnerThoughtDao? = null,
     private val memeDao: MemeDao? = null,
+    /** 人设设定：角色卡里写死的「认识的人 / 说法」，与聊天中学到的梗互补 */
+    private val loreDao: com.qbot.app.data.db.LoreDao? = null,
+    /** 当前生效的人格档案 id：设定按人格隔离，切换档案后不会串 */
+    private val personaIdProvider: (suspend () -> Long?)? = null,
     private val clock: () -> Long = System::currentTimeMillis,
 ) : SocialContextProvider, RelationRecorder, MemeLibrary {
     /** 读-改-写要串行，否则并发两条消息会把彼此的增量覆盖掉 */
@@ -66,11 +70,22 @@ class RoomSocialStore(
             } else {
                 runCatching { thoughtDao?.lastFor(userId)?.thought?.take(120) }.getOrNull()
             }
+        // 人设设定（认识的人 / 雷点 / 特殊说法）：只取当前人格 + 当前群可用的
+        val dao = loreDao
+        val lore =
+            if (dao == null) {
+                emptyList()
+            } else {
+                runCatching {
+                    dao.forPersona(personaIdProvider?.invoke(), groupId).map { it.toModel() }
+                }.getOrDefault(emptyList())
+            }
         return SocialContext(
             relation = relation,
             mood = mood,
             slang = slang,
             memes = memes,
+            lore = lore,
             lastThought = lastThought?.takeIf { it.isNotBlank() },
         )
     }
