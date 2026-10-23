@@ -17,12 +17,15 @@ import kotlinx.serialization.json.Json
  * - 成员备注名（身份名录）
  * - 群名片（只导 botName，成员/活跃度等运行数据不导）
  *
- * 不导出：日志、AI 会话历史、群背景消息、事实记忆、人设版本快照——
- * 这些是"运行数据"而非"配置"，搬过去反而会把旧设备的上下文带歪。
+ * 不导出：日志、AI 会话历史、人设版本快照、判断决策日志——
+ * 这些是短期运行日志（7 天自动过期），搬过去只会带去过期状态。
+ *
+ * 3.0.0 起长期记忆（事实、最近对话、内心戏）也进备份：
+ * 它们虽然不是"配置"，但换机后从零开始等于把养出来的人格也丢了。
  */
 @Serializable
 data class ConfigBackup(
-    val version: Int = 4,
+    val version: Int = 5,
     @SerialName("exported_at") val exportedAt: Long,
     val credentials: CredentialsBackup? = null,
     val ai: AiBackup? = null,
@@ -47,6 +50,12 @@ data class ConfigBackup(
     val lore: List<LoreBackup> = emptyList(),
     /** 2.8.0 新增：说话风格约束（内置的启停覆盖 + 用户自定义） */
     @SerialName("style_rules") val styleRules: List<StyleRuleBackup> = emptyList(),
+    /** 3.0.0 新增：长期事实记忆（换机后不用重新认识每个人） */
+    val facts: List<FactBackup> = emptyList(),
+    /** 3.0.0 新增：最近对话背景（够模型接上"上次聊到哪"） */
+    @SerialName("room_messages") val roomMessages: List<RoomMessageBackup> = emptyList(),
+    /** 3.0.0 新增：内心戏（"忍过这个人"的情绪记忆） */
+    @SerialName("inner_thoughts") val innerThoughts: List<InnerThoughtBackup> = emptyList(),
 ) {
     companion object {
         private val json =
@@ -267,4 +276,55 @@ data class StyleRuleBackup(
     val category: String = "TONE",
     val source: String = "USER",
     val enabled: Boolean = true,
+)
+
+/**
+ * 一条长期事实记忆。
+ *
+ * 按 senderId 关联：事实本来就是"关于某个人"的，id 换了人还是同一个 openid。
+ * 导入时按 (senderId, text) 去重，重复导入不会翻倍。
+ */
+@Serializable
+data class FactBackup(
+    @SerialName("sender_id") val senderId: String,
+    val text: String,
+    /** NAME / PREFERENCE / PROFILE / NOTE */
+    val kind: String = "NOTE",
+    /** EXTRACTED / MANUAL / REFLECTED */
+    val source: String = "EXTRACTED",
+    @SerialName("updated_at") val updatedAt: Long = 0,
+)
+
+/**
+ * 一条最近对话。
+ *
+ * 只备份最近一段（有上限），不是全量聊天记录：
+ * 目的只是让模型换机后能接上"上次聊到哪"，不是做聊天归档。
+ */
+@Serializable
+data class RoomMessageBackup(
+    @SerialName("scope_key") val scopeKey: String,
+    @SerialName("sender_id") val senderId: String? = null,
+    @SerialName("sender_name") val senderName: String? = null,
+    /** user / assistant */
+    val role: String = "user",
+    val content: String,
+    @SerialName("timestamp_millis") val timestampMillis: Long = 0,
+    @SerialName("is_at") val isAt: Boolean = false,
+    @SerialName("external_id") val externalId: String? = null,
+    val decision: String? = null,
+    /** 机器人发言当时扮演的人格名（null = 共用/旧数据） */
+    @SerialName("persona_name") val personaName: String? = null,
+)
+
+/** 一条内心戏。 */
+@Serializable
+data class InnerThoughtBackup(
+    @SerialName("group_id") val groupId: String? = null,
+    @SerialName("sender_id") val senderId: String? = null,
+    @SerialName("sender_name") val senderName: String? = null,
+    val spoken: String,
+    val thought: String,
+    @SerialName("created_at") val createdAt: Long = 0,
+    @SerialName("persona_name") val personaName: String? = null,
 )

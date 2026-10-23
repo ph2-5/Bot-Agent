@@ -99,8 +99,14 @@ class RoomSocialStore(
             if (userId == null) {
                 null
             } else {
-                runCatching { thoughtDao?.lastFor(userId, scopeId.takeIf { isolateMemories() })?.thought?.take(120) }
-                    .getOrNull()
+                runCatching {
+                    thoughtDao?.lastFor(
+                        senderId = userId,
+                        personaId = scopeId.takeIf { isolateMemories() },
+                        // 同一会话内的内心才有意义：A 群忍住的话不该带到 B 群
+                        groupId = groupId,
+                    )?.thought?.take(120)
+                }.getOrNull()
             }
         // 人设设定（认识的人 / 雷点 / 特殊说法）：按本条消息解析出的人格取，
         // 与提示词里实际扮演的角色同源，覆盖层人设也能拿到自己的设定。

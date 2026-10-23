@@ -667,7 +667,7 @@ private fun LessonRow(
                     buildString {
                         append(groupName ?: "全局")
                         append(" · 支撑 ${lesson.supportCount} 次")
-                        append(" · 命中 ${lesson.hits} 次")
+                        append(" · 采纳 ${lesson.hits} 次")
                     },
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,

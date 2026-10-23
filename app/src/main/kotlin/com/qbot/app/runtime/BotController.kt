@@ -6,23 +6,30 @@ import com.qbot.app.data.backup.AiBackup
 import com.qbot.app.data.backup.ChitchatBackup
 import com.qbot.app.data.backup.CredentialsBackup
 import com.qbot.app.data.backup.DisplayNameBackup
+import com.qbot.app.data.backup.FactBackup
 import com.qbot.app.data.backup.GreetingBackup
 import com.qbot.app.data.backup.GroupBotNameBackup
+import com.qbot.app.data.backup.InnerThoughtBackup
 import com.qbot.app.data.backup.LessonBackup
 import com.qbot.app.data.backup.LoreBackup
 import com.qbot.app.data.backup.MemeBackup
 import com.qbot.app.data.backup.MemoryBackup
 import com.qbot.app.data.backup.PersonaBackup
 import com.qbot.app.data.backup.RelationBackup
+import com.qbot.app.data.backup.RoomMessageBackup
 import com.qbot.app.data.backup.SlangBackup
 import com.qbot.app.data.backup.PersonaProfileBackup
 import com.qbot.app.data.backup.RuleBackup
 import com.qbot.app.data.backup.StyleRuleBackup
 import com.qbot.app.data.db.AppDatabase
+import com.qbot.app.data.db.FactEntity
+import com.qbot.app.data.db.InnerThoughtEntity
 import com.qbot.app.data.db.LogEntity
 import com.qbot.app.data.db.LoreEntity
+import com.qbot.app.data.db.RoomMessageEntity
 import com.qbot.app.data.db.RuleEntity
 import com.qbot.app.data.db.StyleRuleEntity
+import com.qbot.app.data.plugin.FileStylePluginHost
 import com.qbot.app.data.repo.PersonaRepository
 import com.qbot.app.data.repo.RoomChimeDecisionStore
 import com.qbot.app.data.repo.RoomChimeLessonStore
@@ -54,6 +61,8 @@ import com.qbot.core.ai.ChimeDecisionRecord
 import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChimeReflection
 import com.qbot.core.ai.ChimeStats
+import com.qbot.core.ai.FactKind
+import com.qbot.core.ai.FactSource
 import com.qbot.core.ai.EmptyContentException
 import com.qbot.core.ai.GenerationLimits
 import com.qbot.core.ai.LessonCategories
@@ -147,6 +156,12 @@ class BotController(
 
         /** 决策日志总量上限，防止高频群把库撑大 */
         private const val CHIME_MAX_DECISIONS = 2000
+
+        /** 备份里最多带多少条最近对话：够接上"上次聊到哪"即可 */
+        private const val BACKUP_ROOM_MESSAGES = 2000
+
+        /** 备份里最多带多少条内心戏 */
+        private const val BACKUP_INNER_THOUGHTS = 500
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -214,6 +229,9 @@ class BotController(
             memberDao = database.groupMemberDao(),
         )
 
+    /** 关系、心情、梗库、人设设定：既是提示词的数据源，也是互动事件的落库点。 */
+    private val loreStore = RoomLoreStore(database.loreDao())
+
     /**
      * 记忆管线：身份 → 事实 → 共享群聊背景 → 群画像。
      *
@@ -234,6 +252,8 @@ class BotController(
             personaIdProvider = { message -> personaResolver.resolve(message).personaId },
             groupStore = groupStore,
             botNameProvider = { runtime?.botName?.takeIf { it.isNotBlank() } },
+            // 「忘掉 X」同时清掉这个人设下与 X 相关的设定，避免下一轮又被注入
+            loreStore = loreStore,
         )
 
     /**
@@ -256,13 +276,21 @@ class BotController(
     /** 内心戏出口：思考模式打开时，模型没说出口的那段话落这里。 */
     private val innerThoughtSink = RoomInnerThoughtSink(database.innerThoughtDao())
 
-    /** 关系、心情、梗库、人设设定：既是提示词的数据源，也是互动事件的落库点。 */
-    private val loreStore = RoomLoreStore(database.loreDao())
-
     private val styleRuleStore = RoomStyleRuleStore(database.styleRuleDao())
 
-    /** 三路约束的合并器：内置（可逐条停用）+ 用户自定义 + 未来插件 */
-    private val styleRuleComposer = StyleRuleComposer(store = styleRuleStore)
+    /** 文件式语气插件：`Android/data/<包名>/files/plugins` 下的 JSON，改文件即生效 */
+    private val stylePluginHost =
+        FileStylePluginHost(
+            // 优先外部私有目录：插上电脑或用文件管理器能直接放 JSON
+            java.io.File(context.getExternalFilesDir(null) ?: context.filesDir, "plugins"),
+        )
+
+    /** 插件目录路径（设置页展示用） */
+    val stylePluginDirectory: String get() = stylePluginHost.directoryPath
+
+    /** 三路约束的合并器：内置（可逐条停用）+ 用户自定义 + 插件 */
+    private val styleRuleComposer =
+        StyleRuleComposer(store = styleRuleStore, plugins = listOf(stylePluginHost))
 
     private val socialStore =
         RoomSocialStore(
@@ -460,7 +488,9 @@ class BotController(
      * 数据库里没有行就是默认启用，这样升级新增的内置规则会自动出现。
      */
     fun observeStyleRules(): Flow<List<StyleRule>> =
-        styleRuleStore.observeRows().map { saved -> styleRuleComposer.merge(saved) }
+        styleRuleStore.observeRows().map { saved ->
+            styleRuleComposer.merge(saved, stylePluginHost.rules())
+        }
 
     /** 新增一条自定义约束；文本为空返回 false。 */
     suspend fun addStyleRule(
@@ -1259,7 +1289,8 @@ class BotController(
      * 导出全部用户配置为 JSON 文本。
      *
      * 包含凭证与 API Key（明文）——备份文件请妥善保管。
-     * 运行数据（日志、聊天记录、事实记忆、版本快照）不导出。
+     * 长期记忆（事实 / 最近对话 / 内心戏）一起导出；日志、AI 会话历史、
+     * 版本快照与决策日志不导出。
      */
     suspend fun exportBackup(): String {
         val ai = settings.aiConfig.value
@@ -1445,6 +1476,51 @@ class BotController(
                             enabled = row.enabled,
                         )
                     },
+                // 长期记忆与最近对话：换机后不该从零开始
+                facts =
+                    runCatching { database.factDao().all() }.getOrDefault(emptyList()).map { fact ->
+                        FactBackup(
+                            senderId = fact.senderId,
+                            text = fact.text,
+                            kind = fact.kind,
+                            source = fact.source,
+                            updatedAt = fact.updatedAt,
+                        )
+                    },
+                roomMessages =
+                    runCatching { database.roomMessageDao().exportRecent(BACKUP_ROOM_MESSAGES) }
+                        .getOrDefault(emptyList())
+                        // DAO 按 id 倒序取最近 N 条，导出时恢复成时间正序
+                        .asReversed()
+                        .map { row ->
+                            RoomMessageBackup(
+                                scopeKey = row.scopeKey,
+                                senderId = row.senderId,
+                                senderName = row.senderName,
+                                role = row.role,
+                                content = row.content,
+                                timestampMillis = row.timestampMillis,
+                                isAt = row.isAt,
+                                externalId = row.externalId,
+                                decision = row.decision,
+                                personaName = row.personaId?.let { personaNames[it] },
+                            )
+                        },
+                innerThoughts =
+                    runCatching { database.innerThoughtDao().recentOnce(BACKUP_INNER_THOUGHTS) }
+                        .getOrDefault(emptyList())
+                        .asReversed()
+                        .map { thought ->
+                            InnerThoughtBackup(
+                                groupId = thought.groupId,
+                                senderId = thought.senderId,
+                                senderName = thought.senderName,
+                                spoken = thought.spoken,
+                                thought = thought.thought,
+                                createdAt = thought.createdAt,
+                                personaName = thought.personaId?.let { personaNames[it] },
+                            )
+                        },
                 // 训练成果：经验库跟着配置走，换机后不必重新教一遍
                 chimeLessons =
                     chimeLessonStore.all().map { lesson ->
@@ -1755,6 +1831,101 @@ class BotController(
             applied++
         }
 
+        // ---- 长期记忆：事实 / 最近对话 / 内心戏 ----
+        // 人格归属已在上面建好，这里按名称重新绑定。
+        val personaIdsForMemory = personaRepository.all().associate { it.name to it.id }
+
+        var factCount = 0
+        if (backup.facts.isNotEmpty()) {
+            runCatching {
+                val dao = database.factDao()
+                // 按 (senderId, text) 去重：重复导入同一份备份不会翻倍
+                val existing = dao.all().map { it.senderId to it.text }.toMutableSet()
+                backup.facts.forEach { dto ->
+                    val sender = dto.senderId.trim()
+                    val text = dto.text.trim()
+                    if (sender.isEmpty() || text.isEmpty()) return@forEach
+                    if (!existing.add(sender to text)) return@forEach
+                    dao.insert(
+                        FactEntity(
+                            senderId = sender,
+                            text = text,
+                            kind =
+                                runCatching { FactKind.valueOf(dto.kind) }
+                                    .getOrDefault(FactKind.NOTE)
+                                    .name,
+                            source =
+                                runCatching { FactSource.valueOf(dto.source) }
+                                    .getOrDefault(FactSource.EXTRACTED)
+                                    .name,
+                            updatedAt = dto.updatedAt.takeIf { it > 0 } ?: System.currentTimeMillis(),
+                        ),
+                    )
+                    factCount++
+                }
+                factStore.trimAll(settings.memoryConfig.value.factsPerPerson)
+            }
+            if (factCount > 0) applied++
+        }
+
+        var messageCount = 0
+        if (backup.roomMessages.isNotEmpty()) {
+            runCatching {
+                val dao = database.roomMessageDao()
+                backup.roomMessages.forEach { dto ->
+                    val scopeKey = dto.scopeKey.trim()
+                    val content = dto.content
+                    if (scopeKey.isEmpty() || content.isBlank()) return@forEach
+                    // 平台消息 id 去重；没有 id 的（机器人自己的发言）只能照单插入
+                    val externalId = dto.externalId?.takeIf { it.isNotBlank() }
+                    if (externalId != null && dao.countByExternalId(scopeKey, externalId) > 0) {
+                        return@forEach
+                    }
+                    dao.insert(
+                        RoomMessageEntity(
+                            scopeKey = scopeKey,
+                            senderId = dto.senderId,
+                            senderName = dto.senderName,
+                            role = dto.role.takeIf { it == "assistant" } ?: "user",
+                            content = content,
+                            timestampMillis =
+                                dto.timestampMillis.takeIf { it > 0 } ?: System.currentTimeMillis(),
+                            isAt = dto.isAt,
+                            externalId = externalId,
+                            decision = dto.decision,
+                            personaId = dto.personaName?.let { personaIdsForMemory[it] },
+                        ),
+                    )
+                    messageCount++
+                }
+            }
+            if (messageCount > 0) applied++
+        }
+
+        var thoughtCount = 0
+        if (backup.innerThoughts.isNotEmpty()) {
+            runCatching {
+                val dao = database.innerThoughtDao()
+                backup.innerThoughts.forEach { dto ->
+                    if (dto.spoken.isBlank() && dto.thought.isBlank()) return@forEach
+                    dao.insert(
+                        InnerThoughtEntity(
+                            groupId = dto.groupId,
+                            senderId = dto.senderId,
+                            senderName = dto.senderName,
+                            spoken = dto.spoken,
+                            thought = dto.thought.take(600),
+                            createdAt = dto.createdAt.takeIf { it > 0 } ?: System.currentTimeMillis(),
+                            personaId = dto.personaName?.let { personaIdsForMemory[it] },
+                        ),
+                    )
+                    thoughtCount++
+                }
+                dao.trim(BACKUP_INNER_THOUGHTS)
+            }
+            if (thoughtCount > 0) applied++
+        }
+
         // ---- 接话经验：按人格名重建归属，同作用域 + 文本相似去重 ----
         var lessonCount = 0
         if (backup.chimeLessons.isNotEmpty()) {
@@ -1885,12 +2056,16 @@ class BotController(
             "配置导入完成：规则 $ruleCount 条、人格档案 +$profileNew/更新$profileUpdated、" +
                 "人设覆盖 +$personaNew/更新$personaUpdated、" +
                 "备注 $nameCount、群名片 $groupNameCount、经验 $lessonCount 条、" +
-                "人设设定 $loreCount 条、说话约束 $styleCount 条、配置项 $applied",
+                "人设设定 $loreCount 条、说话约束 $styleCount 条、" +
+                "记忆 $factCount 条、最近对话 $messageCount 条、内心戏 $thoughtCount 条、" +
+                "配置项 $applied",
         )
         return "导入完成：规则 $ruleCount 条，人格档案新增 $profileNew、更新 $profileUpdated，" +
             "人设覆盖新增 $personaNew、更新 $personaUpdated，" +
             "备注名 $nameCount，群名片 $groupNameCount，经验 $lessonCount 条，" +
-            "人设设定 $loreCount 条，说话约束 $styleCount 条，配置组 $applied 项" +
+            "人设设定 $loreCount 条，说话约束 $styleCount 条，" +
+            "记忆 $factCount 条，最近对话 $messageCount 条，内心戏 $thoughtCount 条，" +
+            "配置组 $applied 项" +
             (if (backup.credentials != null) "（含凭证，需重新启动机器人生效）" else "")
     }
 

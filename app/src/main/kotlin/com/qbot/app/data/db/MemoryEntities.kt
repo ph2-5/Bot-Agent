@@ -103,6 +103,10 @@ interface FactDao {
     @Query("SELECT DISTINCT senderId FROM facts")
     suspend fun allSenders(): List<String>
 
+    /** 备份导出：全部事实（配置级长期记忆） */
+    @Query("SELECT * FROM facts ORDER BY updatedAt DESC, id DESC")
+    suspend fun all(): List<FactEntity>
+
     @Query("SELECT COUNT(*) FROM facts")
     suspend fun count(): Int
 
@@ -177,6 +181,20 @@ interface RoomMessageDao {
 
     @Insert
     suspend fun insert(message: RoomMessageEntity)
+
+    /** 备份导出：最近 [limit] 条（按 id 倒序，调用方自行反转） */
+    @Query("SELECT * FROM room_messages ORDER BY id DESC LIMIT :limit")
+    suspend fun exportRecent(limit: Int): List<RoomMessageEntity>
+
+    /** 导入备份时去重：同一会话里同一条平台消息只写一次 */
+    @Query(
+        "SELECT COUNT(*) FROM room_messages " +
+            "WHERE scopeKey = :scopeKey AND externalId = :externalId",
+    )
+    suspend fun countByExternalId(
+        scopeKey: String,
+        externalId: String,
+    ): Int
 
     @Query(
         """

@@ -10,6 +10,7 @@ import com.qbot.core.ai.AiResponder
 import com.qbot.core.ai.BehaviorContext
 import com.qbot.core.ai.BotNameMatcher
 import com.qbot.core.ai.ChimeDecisionRecord
+import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChimeTrainer
 import com.qbot.core.ai.LessonCategories
 import com.qbot.core.ai.LlmException
@@ -529,6 +530,9 @@ class BotRuntime(
         var action = ChimeDecisionRecord.ACTION_SILENT
         var finalReason = gate.describe()
         var replyText: String? = null
+        // 本次判断实际注入了哪些经验：只有真的接话才计一次「被采纳」，
+        // 单纯问过模型不算（否则错判经验也会显得很有用，见审计 B4）。
+        var injectedLessons: List<ChimeLesson> = emptyList()
         val gatePath =
             when (gate) {
                 is ChitchatGate.Forced -> ChimeDecisionRecord.GATE_FORCED
@@ -609,10 +613,8 @@ class BotRuntime(
                             }
                             aiVerdict = if (verdict.wants) "YES" else "NO"
                             aiReason = verdict.reason
-                            // 被参考过的经验计一次命中（失败不影响判断）
-                            if (lessons.isNotEmpty()) {
-                                runCatching { chimeTrainer?.bumpHits(lessons.map { it.id }) }
-                            }
+                            // 先记下被参考过的经验；等真的说出来再计一次采纳
+                            injectedLessons = lessons
                             if (!verdict.wants) {
                                 finalReason = "不接：AI 判断不需要接话"
                                 pipeline.markChitchatDecision(message, finalReason)
@@ -660,6 +662,10 @@ class BotRuntime(
                     return@runCatching
                 }
                 sendReply(message, answer.content, answer.memeUrl)
+                // 经验真正被采纳：这一轮是看了这些经验才决定接的
+                if (injectedLessons.isNotEmpty()) {
+                    runCatching { chimeTrainer?.bumpHits(injectedLessons.map { it.id }) }
+                }
                 // 内心戏：说出口的已经发出去了，没说出口的落在这里
                 recordThought(message, answer)
                 chitchatPolicy.markSpoke(groupId)

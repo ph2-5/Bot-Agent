@@ -169,7 +169,7 @@ data class ChimeLesson(
     /** null = 全局经验；非空 = 只在某个群生效（不同群有不同脾气）。 */
     val scopeGroupId: String? = null,
     val fromDecisionId: Long? = null,
-    /** 被注入判断提示词的次数。 */
+    /** 被注入后确实促成了接话的次数（采纳数，不是注入数）。 */
     val hits: Int = 0,
     val enabled: Boolean = true,
     val createdAt: Long = 0,

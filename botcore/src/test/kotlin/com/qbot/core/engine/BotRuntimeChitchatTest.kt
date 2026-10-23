@@ -439,7 +439,7 @@ class BotRuntimeChitchatTest {
         }
 
     @Test
-    fun `学到的经验注入判断提示词并累计命中`() =
+    fun `学到的经验注入判断提示词并在接话后累计采纳`() =
         runBlocking {
             llmVerdict = "YES\n有人在征求意见"
             val runtime =
@@ -457,6 +457,23 @@ class BotRuntimeChitchatTest {
                 while (trainer.lessons.single().hits == 0) delay(50)
             }
             assertEquals(1, trainer.lessons.single().hits)
+        }
+
+    @Test
+    fun `判断不接时经验不计采纳`() =
+        runBlocking {
+            llmVerdict = "NO\n不用接"
+            val runtime =
+                prepareRuntime(this, ChitchatConfig(enabled = true, aiJudge = true))
+            trainer.addLesson("有人提问时主动接话", scopeGroupId = "group-openid", updatedAt = 1)
+
+            runtime.onMessage(fullMessage("这个怎么设置"))
+            withTimeout(15_000) {
+                while (trainer.decisions.isEmpty()) delay(50)
+            }
+
+            assertEquals("SILENT", trainer.decisions.single().action)
+            assertEquals("问过模型但没接，不算采纳", 0, trainer.lessons.single().hits)
         }
 
     @Test

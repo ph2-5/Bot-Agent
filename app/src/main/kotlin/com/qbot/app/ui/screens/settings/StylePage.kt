@@ -168,9 +168,14 @@ fun StylePage(onBack: () -> Unit) {
             }
         }
 
-        SectionHeader("插件约束", "插件系统接入后，插件带来的约束会自动出现在这里")
+        SectionHeader("插件约束", "插件通过 JSON 文件贡献约束，放在下面的目录里即可生效")
         if (pluginRules.isEmpty()) {
-            HintText("当前没有插件提供约束。")
+            HintText(
+                "当前没有插件提供约束。\n" +
+                    "目录：${controller.stylePluginDirectory}\n" +
+                    "把 {\"id\":\"my-plugin\",\"enabled\":true," +
+                    "\"style_rules\":[{\"text\":\"不要用问句结尾\"}]} 存成 .json 放进该目录。",
+            )
         } else {
             pluginRules.forEach { rule ->
                 SettingsCard { Text(rule.text, style = MaterialTheme.typography.bodySmall) }

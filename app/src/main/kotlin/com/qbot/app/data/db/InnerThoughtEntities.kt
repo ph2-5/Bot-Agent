@@ -52,15 +52,19 @@ interface InnerThoughtDao {
      *
      * [personaId] 为空时不过滤（未开人设隔离）；非空时只看当前人格的记录，
      * 换人设不会继承旧人格"忍过这个人"的情绪。
+     * [groupId] 非空时只看同一会话（同一个群 / 同一个私聊）的记录——
+     * A 群里忍住没说的话，不该影响 B 群对这个人的态度。
      */
     @Query(
         "SELECT * FROM inner_thoughts WHERE senderId = :senderId " +
             "AND (:personaId IS NULL OR personaId = :personaId) " +
+            "AND (:groupId IS NULL OR groupId = :groupId) " +
             "ORDER BY createdAt DESC, id DESC LIMIT 1",
     )
     suspend fun lastFor(
         senderId: String,
         personaId: Long?,
+        groupId: String? = null,
     ): InnerThoughtEntity?
 
     /** 只留最近 [keep] 条，避免长期挂机把库撑大。 */

@@ -388,6 +388,34 @@ class MemoryPipelineTest {
         }
 
     @Test
+    fun `忘掉关键词同时删除同名的人设设定`() =
+        runTest {
+            val lore = InMemoryLoreStore()
+            lore.save(
+                LoreEntry(
+                    personaId = 7L,
+                    kind = LoreKind.PERSON,
+                    name = "胡萝卜",
+                    note = "老张的外号",
+                ),
+            )
+            val withLore =
+                MemoryPipeline(
+                    identities = identities,
+                    facts = facts,
+                    roomContext = room,
+                    configProvider = { MemoryConfig() },
+                    clock = { clock.now },
+                    personaIdProvider = { 7L },
+                    loreStore = lore,
+                )
+
+            val outcome = withLore.handleMemoryCommand(message("忘掉胡萝卜"), "忘掉胡萝卜")
+            assertTrue("兜底文案应确认删除", outcome!!.fallback.contains("已忘掉"))
+            assertTrue("人设设定也应被删掉", lore.all().isEmpty())
+        }
+
+    @Test
     fun `忘掉未命中的关键词不删任何东西`() =
         runTest {
             pipeline.buildContext(message("我喜欢吃辣"), "bot", "我喜欢吃辣")

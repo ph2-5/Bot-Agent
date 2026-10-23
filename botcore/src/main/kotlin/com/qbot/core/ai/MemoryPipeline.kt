@@ -156,6 +156,14 @@ class MemoryPipeline(
      * 关闭时连调用都不发生，避免无谓的数据库查询。
      */
     private val personaIdProvider: (suspend (com.qbot.core.model.IncomingMessage) -> Long?)? = null,
+    /**
+     * 人设设定库（梗 / 认识的人 / 关系）。
+     *
+     * 「忘掉 X」除了删事实，也要删人设里与 X 相关的设定——
+     * 否则用户说"忘掉"，模型下一轮还会从设定里把它读回来（审计 M7）。
+     * 为 null 时只操作事实库。
+     */
+    private val loreStore: LoreStore? = null,
 ) {
     companion object {
         /** 查看自己记忆的指令 */
@@ -678,17 +686,37 @@ class MemoryPipeline(
             if (keyword.isNotEmpty()) {
                 val matched = facts.facts(senderId).filter { it.text.contains(keyword) }
                 matched.forEach { facts.delete(it.id) }
+                // 人设设定里也可能写着同一件事：一并删掉，否则下一轮又会被注入
+                val loreHit =
+                    runCatching {
+                        val personaId = personaIdProvider?.invoke(message)
+                        val store = loreStore
+                        if (personaId == null || store == null) {
+                            emptyList()
+                        } else {
+                            val hits =
+                                store.all().filter {
+                                    it.personaId == personaId &&
+                                        (it.name.contains(keyword) || it.note.contains(keyword))
+                                }
+                            hits.forEach { store.delete(it.id) }
+                            hits
+                        }
+                    }.getOrDefault(emptyList())
+                val total = matched.size + loreHit.size
                 return CommandOutcome(
-                    directive = if (matched.isEmpty()) {
-                        "对方让你忘掉关于「$keyword」的记忆，" +
-                            "但你没有找到相关记录，什么也没有删除。"
-                    } else {
-                        "你刚刚忘掉了关于「$keyword」的 ${matched.size} 条记忆。"
+                    directive = when (total) {
+                        0 ->
+                            "对方让你忘掉关于「$keyword」的记忆，" +
+                                "但你没有找到相关记录，什么也没有删除。"
+                        else ->
+                            "你刚刚忘掉了关于「$keyword」的 $total 条记忆" +
+                                (if (loreHit.isEmpty()) "" else "（其中 ${loreHit.size} 条是人设设定）") +
+                                "。"
                     },
-                    fallback = if (matched.isEmpty()) {
-                        "我没有找到关于「$keyword」的记忆。"
-                    } else {
-                        "已忘掉关于「$keyword」的 ${matched.size} 条记忆。"
+                    fallback = when (total) {
+                        0 -> "我没有找到关于「$keyword」的记忆。"
+                        else -> "已忘掉关于「$keyword」的 $total 条记忆。"
                     },
                 )
             }
