@@ -43,8 +43,7 @@ jobs:
           EOF
 
       - name: 运行协议层测试
-        # botcore 是纯 JVM 模块，无需 Android SDK，183 个用例先行把关，
-        # 测试不过就不浪费后面的全量构建时间。
+        # botcore 是纯 JVM 模块，无需 Android SDK；测试不过就不浪费后面的全量构建时间。
         run: ./gradlew :botcore:test --no-daemon
 
       - name: 构建 Release APK
