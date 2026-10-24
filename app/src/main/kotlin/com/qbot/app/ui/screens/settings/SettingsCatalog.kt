@@ -12,6 +12,7 @@ import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -59,6 +60,13 @@ fun settingsEntries(onRequestBatteryWhitelist: () -> Unit): List<SettingsEntry> 
 @Composable
 private fun builtinEntries(onRequestBatteryWhitelist: () -> Unit): List<SettingsEntry> =
     listOf(
+        SettingsEntry(
+            id = "bots",
+            group = "接入",
+            title = "机器人管理",
+            icon = Icons.Filled.SmartToy,
+            subtitle = { BotManageSubtitle() },
+        ) { onBack -> BotManagePage(onBack = onBack) },
         SettingsEntry(
             id = "credentials",
             group = "接入",
@@ -160,7 +168,8 @@ private fun builtinEntries(onRequestBatteryWhitelist: () -> Unit): List<Settings
 private fun CredentialsSubtitle(): String {
     val context = LocalContext.current
     val app = context.applicationContext as BotApplication
-    val creds = remember { app.settings.credentials() }
+    val currentId by app.bots.currentBotId.collectAsState()
+    val creds = remember(currentId) { app.bots.currentSettings.credentials() }
     return if (creds.appId.isBlank()) "未配置" else "AppID 尾号 ${creds.appId.takeLast(4)}"
 }
 

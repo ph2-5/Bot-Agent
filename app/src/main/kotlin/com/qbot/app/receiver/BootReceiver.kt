@@ -3,13 +3,12 @@ package com.qbot.app.receiver
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import com.qbot.app.data.repo.SettingsRepository
+import com.qbot.app.BotApplication
 import com.qbot.app.service.BotForegroundService
 import com.qbot.app.service.ResurrectorJobService
 import com.qbot.app.service.SurvivalSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 /**
@@ -55,13 +54,10 @@ class BootReceiver : BroadcastReceiver() {
         val pendingResult = goAsync()
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                // DataStore 的 flow 会立刻发出当前值，first() 取到后自动取消订阅
-                val enabled =
-                    SettingsRepository(context)
-                        .autoStart
-                        .first()
-
-                if (enabled) {
+                // 只要有任意一个启用的机器人打开了自启，就把整个服务拉起来；
+                // 服务内部再按每个机器人自己的开关决定是否连接。
+                val app = context.applicationContext as BotApplication
+                if (app.bots.anyAutoStart()) {
                     BotForegroundService.start(context, SurvivalSource.BOOT)
                 }
             } finally {

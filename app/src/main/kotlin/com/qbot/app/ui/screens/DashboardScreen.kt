@@ -58,13 +58,21 @@ fun DashboardScreen(
     onRequestBatteryWhitelist: () -> Unit,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val controller = (context.applicationContext as BotApplication).controller
-    val survivalStats by (context.applicationContext as BotApplication).survivalStats.stats
+    val app = context.applicationContext as BotApplication
+    val controller = app.controller
+    val accounts by app.bots.accounts.collectAsState()
+    val statuses by app.bots.statuses.collectAsState()
+    val currentId by app.bots.currentBotId.collectAsState()
+    val survivalStats by app.survivalStats.stats
         .collectAsState()
 
     val status by controller.status.collectAsState()
     val aiConfig by controller.aiConfig.collectAsState()
     val aiUsage by controller.aiUsage.collectAsState()
+
+    val enabledBots = accounts.count { it.enabled }
+    val anyRunning = status.state != ConnectionState.IDLE ||
+        statuses.any { (id, s) -> id != currentId && s.state != ConnectionState.IDLE }
 
     // 在线时长需要持续跳动，每秒刷新一次时间基准
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -96,7 +104,8 @@ fun DashboardScreen(
         SurvivalCard(stats = survivalStats)
 
         ControlButtons(
-            isRunning = status.state != ConnectionState.IDLE,
+            isRunning = anyRunning,
+            multi = enabledBots > 1,
             onStart = onStartService,
             onStop = onStopService,
         )
@@ -394,6 +403,7 @@ private fun StatCard(
 @Composable
 private fun ControlButtons(
     isRunning: Boolean,
+    multi: Boolean,
     onStart: () -> Unit,
     onStop: () -> Unit,
 ) {
@@ -406,7 +416,7 @@ private fun ControlButtons(
             enabled = !isRunning,
             modifier = Modifier.weight(1f).height(52.dp),
         ) {
-            Text("启动机器人", fontSize = 16.sp)
+            Text(if (multi) "启动全部" else "启动机器人", fontSize = 16.sp)
         }
 
         OutlinedButton(
@@ -418,7 +428,7 @@ private fun ControlButtons(
                     contentColor = StatusError,
                 ),
         ) {
-            Text("停止", fontSize = 16.sp)
+            Text(if (multi) "停止全部" else "停止", fontSize = 16.sp)
         }
     }
 }

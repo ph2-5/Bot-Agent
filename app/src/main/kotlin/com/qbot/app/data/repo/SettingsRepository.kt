@@ -8,7 +8,8 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.preferencesDataStoreFile
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.qbot.core.ai.AiConfig
@@ -31,7 +32,34 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
-private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
+/**
+ * 每个机器人一个设置文件。
+ *
+ * DataStore 不允许同一个文件同时存在两个活动实例，所以按名字缓存；
+ * 默认机器人（namespace 为 null）沿用历史文件 `settings`，
+ * 老用户的配置在升级后原样可用。
+ */
+private object SettingsStores {
+    private val stores = mutableMapOf<String, DataStore<Preferences>>()
+
+    fun get(
+        context: Context,
+        name: String,
+    ): DataStore<Preferences> =
+        synchronized(stores) {
+            stores.getOrPut(name) {
+                PreferenceDataStoreFactory.create(
+                    scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+                    produceFile = { context.preferencesDataStoreFile(name) },
+                )
+            }
+        }
+
+    /** 机器人被移除后丢掉缓存，避免同一文件出现第二个活动实例。 */
+    fun forget(name: String) {
+        synchronized(stores) { stores.remove(name) }
+    }
+}
 
 /** 机器人凭证。 */
 data class BotCredentials(
@@ -60,8 +88,18 @@ data class GreetingConfig(
  *   底层由 Android Keystore 加密，即使设备被 root 也不易直接读出明文。
  * - **运行偏好与 AI 非敏感参数**（模型名、系统提示词、触发模式等）无敏感性，
  *   存普通 DataStore 即可，读取走 Flow，界面可实时响应。
+ *
+ * [botId] 用于多机器人：为 null 表示默认机器人，沿用历史文件；
+ * 其他机器人各自使用 `settings_<id>` / `qbot_secrets_<id>`，互不串配置。
  */
-class SettingsRepository(private val context: Context) {
+class SettingsRepository(
+    private val context: Context,
+    botId: String? = null,
+) {
+    private val suffix = botId?.takeIf { it.isNotBlank() }
+
+    private val dataStore: DataStore<Preferences> =
+        SettingsStores.get(context, suffix?.let { "settings_$it" } ?: "settings")
     private object Keys {
         val AUTO_START = booleanPreferencesKey("auto_start")
         val POWER_SAVING = booleanPreferencesKey("power_saving")
@@ -132,12 +170,21 @@ class SettingsRepository(private val context: Context) {
         val PERSONA_LEGACY_IMPORTED = booleanPreferencesKey("persona_legacy_imported")
     }
 
-    private companion object {
-        const val SECRET_FILE = "qbot_secrets"
-        const val KEY_APP_ID = "app_id"
-        const val KEY_CLIENT_SECRET = "client_secret"
-        const val KEY_AI_API_KEY = "ai_api_key"
+    companion object {
+        private const val LEGACY_SECRET_FILE = "qbot_secrets"
+        private const val KEY_APP_ID = "app_id"
+        private const val KEY_CLIENT_SECRET = "client_secret"
+        private const val KEY_AI_API_KEY = "ai_api_key"
+
+        /** 删除机器人时释放设置文件缓存（DataStore 同一文件只能有一个活动实例）。 */
+        fun forget(botId: String?) {
+            val suffix = botId?.takeIf { it.isNotBlank() }
+            SettingsStores.forget(suffix?.let { "settings_$it" } ?: "settings")
+        }
     }
+
+    private val secretFile: String =
+        suffix?.let { "${LEGACY_SECRET_FILE}_$it" } ?: LEGACY_SECRET_FILE
 
     private val encryptedPrefs by lazy {
         val masterKey =
@@ -147,7 +194,7 @@ class SettingsRepository(private val context: Context) {
 
         EncryptedSharedPreferences.create(
             context,
-            SECRET_FILE,
+            secretFile,
             masterKey,
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
@@ -220,7 +267,7 @@ class SettingsRepository(private val context: Context) {
         // DataStore 的变更合并进 StateFlow；加密偏好里的 apiKey 每次重新读，
         // 保证用户在设置页改完 Key 后保存即可生效。
         scope.launch {
-            context.dataStore.data.collect { prefs ->
+            dataStore.data.collect { prefs ->
                 _aiConfig.value = readAiConfig(prefs)
                 _memoryConfig.value = readMemoryConfig(prefs)
                 _greetingConfig.value = readGreetingConfig(prefs)
@@ -254,7 +301,7 @@ class SettingsRepository(private val context: Context) {
     fun saveMemoryConfig(config: MemoryConfig) {
         _memoryConfig.value = config
         scope.launch {
-            context.dataStore.edit { prefs ->
+            dataStore.edit { prefs ->
                 prefs[Keys.MEMORY_ENABLED] = config.enabled
                 prefs[Keys.MEMORY_FACTS_PER_PERSON] = config.factsPerPerson
                 prefs[Keys.MEMORY_ROOM_CONTEXT] = config.roomContextEnabled
@@ -281,7 +328,7 @@ class SettingsRepository(private val context: Context) {
     fun saveGreetingConfig(config: GreetingConfig) {
         _greetingConfig.value = config
         scope.launch {
-            context.dataStore.edit { prefs ->
+            dataStore.edit { prefs ->
                 prefs[Keys.GREETING_ENABLED] = config.enabled
                 prefs[Keys.GREETING_TEXT] = config.text
             }
@@ -296,13 +343,13 @@ class SettingsRepository(private val context: Context) {
      * [aiConfig] 是 StateFlow，进程刚起来时可能还没收到第一次发射（值是默认值），
      * 迁移判断不能依赖它，否则会把"出厂默认"误判成用户写的人格。
      */
-    suspend fun loadAiConfigOnce(): AiConfig = readAiConfig(context.dataStore.data.first())
+    suspend fun loadAiConfigOnce(): AiConfig = readAiConfig(dataStore.data.first())
 
     suspend fun legacyPersonaImported(): Boolean =
-        context.dataStore.data.first()[Keys.PERSONA_LEGACY_IMPORTED] ?: false
+        dataStore.data.first()[Keys.PERSONA_LEGACY_IMPORTED] ?: false
 
     suspend fun markLegacyPersonaImported() {
-        context.dataStore.edit { it[Keys.PERSONA_LEGACY_IMPORTED] = true }
+        dataStore.edit { it[Keys.PERSONA_LEGACY_IMPORTED] = true }
     }
 
     private fun readChitchatConfig(prefs: Preferences): ChitchatConfig {
@@ -361,7 +408,7 @@ class SettingsRepository(private val context: Context) {
     fun saveChitchatConfig(config: ChitchatConfig) {
         _chitchatConfig.value = config
         scope.launch {
-            context.dataStore.edit { prefs ->
+            dataStore.edit { prefs ->
                 prefs[Keys.CHITCHAT_ENABLED] = config.enabled
                 prefs[Keys.CHITCHAT_AI_JUDGE] = config.aiJudge
                 prefs[Keys.CHITCHAT_COOLDOWN_SECONDS] = (config.baseCooldownMillis / 1000).toInt()
@@ -467,7 +514,7 @@ class SettingsRepository(private val context: Context) {
         _aiConfig.value = config.copy(apiKey = config.apiKey.trim())
 
         scope.launch {
-            context.dataStore.edit { prefs ->
+            dataStore.edit { prefs ->
                 prefs[Keys.AI_ENABLED] = config.enabled
                 prefs[Keys.AI_BASE_URL] = config.baseUrl.trim()
                 prefs[Keys.AI_MODEL] = config.model.trim()
@@ -488,25 +535,25 @@ class SettingsRepository(private val context: Context) {
     // ---------- 运行偏好 ----------
 
     val autoStart: Flow<Boolean> =
-        context.dataStore.data.map { it[Keys.AUTO_START] ?: true }
+        dataStore.data.map { it[Keys.AUTO_START] ?: true }
 
     suspend fun setAutoStart(enabled: Boolean) {
-        context.dataStore.edit { it[Keys.AUTO_START] = enabled }
+        dataStore.edit { it[Keys.AUTO_START] = enabled }
     }
 
     /** 省电模式：只订阅消息事件，减少唤醒次数。 */
     val powerSaving: Flow<Boolean> =
-        context.dataStore.data.map { it[Keys.POWER_SAVING] ?: false }
+        dataStore.data.map { it[Keys.POWER_SAVING] ?: false }
 
     suspend fun setPowerSaving(enabled: Boolean) {
-        context.dataStore.edit { it[Keys.POWER_SAVING] = enabled }
+        dataStore.edit { it[Keys.POWER_SAVING] = enabled }
     }
 
     val logRetentionDays: Flow<Int> =
-        context.dataStore.data.map { it[Keys.LOG_RETENTION_DAYS] ?: 3 }
+        dataStore.data.map { it[Keys.LOG_RETENTION_DAYS] ?: 3 }
 
     suspend fun setLogRetentionDays(days: Int) {
-        context.dataStore.edit { it[Keys.LOG_RETENTION_DAYS] = days }
+        dataStore.edit { it[Keys.LOG_RETENTION_DAYS] = days }
     }
 
     /** 记住上次手动发送的目标，避免每次重填。 */
@@ -514,14 +561,14 @@ class SettingsRepository(private val context: Context) {
         kind: String,
         targetId: String,
     ) {
-        context.dataStore.edit {
+        dataStore.edit {
             it[Keys.LAST_TARGET_KIND] = kind
             it[Keys.LAST_TARGET_ID] = targetId
         }
     }
 
     suspend fun lastTarget(): Pair<String, String> {
-        val prefs = context.dataStore.data.first()
+        val prefs = dataStore.data.first()
         return (prefs[Keys.LAST_TARGET_KIND] ?: "GROUP") to (prefs[Keys.LAST_TARGET_ID] ?: "")
     }
 }

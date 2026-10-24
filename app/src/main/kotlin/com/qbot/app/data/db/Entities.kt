@@ -1,5 +1,6 @@
 package com.qbot.app.data.db
 
+import android.content.Context
 import androidx.room.Dao
 import androidx.room.Database
 import androidx.room.Delete
@@ -7,6 +8,7 @@ import androidx.room.Entity
 import androidx.room.Insert
 import androidx.room.PrimaryKey
 import androidx.room.Query
+import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
@@ -193,6 +195,37 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun styleRuleDao(): StyleRuleDao
 
     companion object {
+        /**
+         * 打开一个机器人的数据库。
+         *
+         * 多机器人采用「每个机器人一个库文件」而不是给所有表加 botId：
+         * 人格、记忆、群档案、日志天然隔离，迁移风险为零。
+         * 默认机器人沿用历史文件 `qbot.db`，升级后数据原样可用。
+         */
+        fun create(
+            context: Context,
+            fileName: String,
+        ): AppDatabase =
+            Room.databaseBuilder(context, AppDatabase::class.java, fileName)
+                // 刻意不挂 fallbackToDestructiveMigration：它会在 schema
+                // 校验失败时静默清库，人设与记忆会一起消失。
+                .addMigrations(
+                    MIGRATION_2_3,
+                    MIGRATION_3_4,
+                    MIGRATION_4_5,
+                    MIGRATION_5_6,
+                    MIGRATION_6_7,
+                    MIGRATION_7_8,
+                    MIGRATION_8_9,
+                    MIGRATION_9_10,
+                    MIGRATION_10_11,
+                    MIGRATION_11_12,
+                    MIGRATION_12_13,
+                    MIGRATION_13_14,
+                    MIGRATION_14_15,
+                )
+                .build()
+
         /**
          * v2 → v3：记忆系统与人设表。
          *

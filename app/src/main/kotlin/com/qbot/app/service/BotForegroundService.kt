@@ -44,7 +44,7 @@ import kotlinx.coroutines.launch
 class BotForegroundService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    private lateinit var controller: com.qbot.app.runtime.BotController
+    private lateinit var bots: com.qbot.app.runtime.BotManager
     private lateinit var networkMonitor: NetworkMonitor
 
     /** 用户是否显式点了停止。用于区分"被系统回收"与"主动关闭"。 */
@@ -60,15 +60,15 @@ class BotForegroundService : Service() {
     /** 重连期间的短暂 WakeLock：给握手与鉴权争取 CPU 时间。 */
     private var reconnectWakeLock: PowerManager.WakeLock? = null
 
-    /** 上一次观察到的连接状态，用于只在状态跃迁时点 WakeLock。 */
-    private var lastObservedState: ConnectionState? = null
+    /** 上一次是否有机器人在连接中，用于只在状态跃迁时点 WakeLock。 */
+    private var lastAnyConnecting: Boolean = false
 
     override fun onCreate() {
         super.onCreate()
 
         isAlive = true
 
-        controller = (application as BotApplication).controller
+        bots = (application as BotApplication).bots
         createNotificationChannel()
 
         // 必须在 5 秒内调用 startForeground，否则系统会判定服务启动超时并杀掉它。
@@ -76,29 +76,32 @@ class BotForegroundService : Service() {
         ServiceCompat.startForeground(
             this,
             NOTIFICATION_ID,
-            buildNotification(controller.status.value),
+            buildNotification(emptyMap()),
             android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
         )
 
         acquireWifiLock()
 
-        controller.start()
+        // 启动所有启用的机器人：每个实例有自己的库、设置与网关连接
+        bots.startAll()
 
         networkMonitor =
             NetworkMonitor(
                 context = this,
                 scope = scope,
                 onAvailable = {
-                    if (controller.isRunning()) controller.onNetworkRestored()
+                    if (bots.statuses.value.values.any { it.state != ConnectionState.IDLE }) {
+                        bots.onNetworkRestored()
+                    }
                 },
             )
         networkMonitor.start()
 
-        // 状态变化 → 更新常驻通知；跃迁到连接中时点一下 WakeLock
+        // 状态变化 → 更新常驻通知；任一机器人跃迁到连接中时点一下 WakeLock
         scope.launch {
-            controller.status.collect { status ->
-                updateNotification(status)
-                onStatusChanged(status)
+            bots.statuses.collect { statuses ->
+                updateNotification(statuses)
+                onStatusesChanged(statuses)
             }
         }
 
@@ -113,7 +116,7 @@ class BotForegroundService : Service() {
         when (intent?.action) {
             ACTION_STOP -> {
                 stoppedByUser = true
-                controller.stop()
+                bots.stopAll()
                 // 用户显式停止：连定时复活任务一起取消，不然 15 分钟后又被拉起来
                 ResurrectorJobService.cancel(applicationContext)
                 stopForegroundCompat()
@@ -122,7 +125,7 @@ class BotForegroundService : Service() {
             }
 
             ACTION_RESTART -> {
-                controller.restart()
+                bots.restartAll()
             }
         }
 
@@ -153,8 +156,9 @@ class BotForegroundService : Service() {
             while (isActive) {
                 delay(WATCHDOG_INTERVAL_MILLIS)
                 if (stoppedByUser) break
-                if (!controller.isRunning() && networkMonitor.isOnline()) {
-                    controller.start()
+                if (networkMonitor.isOnline()) {
+                    // 逐个检查：某一个机器人掉线不影响其他机器人
+                    bots.reviveOffline()
                 }
             }
         }
@@ -168,18 +172,17 @@ class BotForegroundService : Service() {
      * 表现为"锁屏十几分钟后消息才恢复"。
      * 锁带 15 秒超时自动释放，不会忘释放。
      */
-    private fun onStatusChanged(status: GatewayStatus) {
-        val state = status.state
-        if (state == lastObservedState) return
-        lastObservedState = state
-
+    private fun onStatusesChanged(statuses: Map<String, GatewayStatus>) {
         val connecting =
-            state == ConnectionState.CONNECTING ||
-                state == ConnectionState.IDENTIFYING ||
-                state == ConnectionState.RECONNECTING
-        if (connecting) {
+            statuses.values.any {
+                it.state == ConnectionState.CONNECTING ||
+                    it.state == ConnectionState.IDENTIFYING ||
+                    it.state == ConnectionState.RECONNECTING
+            }
+        if (connecting && !lastAnyConnecting) {
             pokeReconnectWakeLock()
         }
+        lastAnyConnecting = connecting
     }
 
     private fun acquireWifiLock() {
@@ -243,6 +246,9 @@ class BotForegroundService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         isAlive = false
+        // 服务被销毁时统一停掉所有机器人：没有前台服务兜底，
+        // 连接留着也活不久，且会被系统当成后台滥用。
+        if (::bots.isInitialized) runCatching { bots.stopAll() }
         networkMonitor.stop()
         releaseLocks()
         scope.cancel()
@@ -266,34 +272,13 @@ class BotForegroundService : Service() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
-    private fun updateNotification(status: GatewayStatus) {
+    private fun updateNotification(statuses: Map<String, GatewayStatus>) {
         val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, buildNotification(status))
+        manager.notify(NOTIFICATION_ID, buildNotification(statuses))
     }
 
-    private fun buildNotification(status: GatewayStatus): Notification {
-        val text =
-            when (status.state) {
-                ConnectionState.READY -> {
-                    val uptime = status.readySinceMillis?.let { formatUptime(System.currentTimeMillis() - it) }
-                    if (uptime != null) {
-                        getString(R.string.notification_text_online) + " · 已在线 $uptime"
-                    } else {
-                        getString(R.string.notification_text_online)
-                    }
-                }
-
-                ConnectionState.CONNECTING, ConnectionState.IDENTIFYING ->
-                    getString(R.string.notification_text_connecting)
-
-                ConnectionState.RECONNECTING ->
-                    getString(R.string.notification_text_reconnecting, status.reconnectCount)
-
-                ConnectionState.FATAL ->
-                    status.lastError ?: getString(R.string.notification_text_idle)
-
-                else -> getString(R.string.notification_text_idle)
-            }
+    private fun buildNotification(statuses: Map<String, GatewayStatus>): Notification {
+        val text = summaryText(statuses)
 
         val openIntent =
             Intent(this, MainActivity::class.java).apply {
@@ -335,6 +320,52 @@ class BotForegroundService : Service() {
     private fun stopForegroundCompat() {
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
     }
+
+    /**
+     * 常驻通知文案。
+     *
+     * 单机器人时保留原来的细节（在线时长 / 重连次数 / 错误原因）；
+     * 多机器人时只报「几个在线」——一条通知塞不下 N 行状态，
+     * 具体每个机器人的状态在应用内的机器人列表里看。
+     */
+    private fun summaryText(statuses: Map<String, GatewayStatus>): String {
+        val enabled = bots.accounts.value.filter { it.enabled }
+        if (enabled.isEmpty()) return "没有启用的机器人"
+        if (enabled.size == 1) {
+            val status = statuses[enabled.first().id]
+                ?: return getString(R.string.notification_text_idle)
+            return statusText(status)
+        }
+        val online = enabled.count { statuses[it.id]?.state == ConnectionState.READY }
+        return if (online == enabled.size) {
+            "${enabled.size} 个机器人全部在线"
+        } else {
+            "$online/${enabled.size} 个机器人在线"
+        }
+    }
+
+    private fun statusText(status: GatewayStatus): String =
+        when (status.state) {
+            ConnectionState.READY -> {
+                val uptime = status.readySinceMillis?.let { formatUptime(System.currentTimeMillis() - it) }
+                if (uptime != null) {
+                    getString(R.string.notification_text_online) + " · 已在线 $uptime"
+                } else {
+                    getString(R.string.notification_text_online)
+                }
+            }
+
+            ConnectionState.CONNECTING, ConnectionState.IDENTIFYING ->
+                getString(R.string.notification_text_connecting)
+
+            ConnectionState.RECONNECTING ->
+                getString(R.string.notification_text_reconnecting, status.reconnectCount)
+
+            ConnectionState.FATAL ->
+                status.lastError ?: getString(R.string.notification_text_idle)
+
+            else -> getString(R.string.notification_text_idle)
+        }
 
     private fun formatUptime(millis: Long): String {
         val totalMinutes = millis / 60_000

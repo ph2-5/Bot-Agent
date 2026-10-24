@@ -974,6 +974,16 @@ class BotController(
         start()
     }
 
+    /**
+     * 机器人被从列表移除时释放资源：停连接并取消所有协程。
+     *
+     * 数据库由 [BotManager] 负责关闭——它才是库的持有者。
+     */
+    fun close() {
+        stop()
+        scope.cancel()
+    }
+
     /** 网络恢复时由广播调用，跳过退避等待立即重连。 */
     fun onNetworkRestored() {
         gateway?.reconnectNow("网络已恢复")
