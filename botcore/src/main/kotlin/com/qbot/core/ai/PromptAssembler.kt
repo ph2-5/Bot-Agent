@@ -13,8 +13,9 @@ package com.qbot.core.ai
  *    内容短且极少变化，位置同样在动态内容之前。
  * 3. **群聊背景（system）**：动态内容，每条消息都变，注定无法缓存，
  *    因此放在事实之后、历史之前——它打断缓存的代价被控制在最小范围。
+ * 3.5. **本轮说话人（system）**：只声明「谁在说」，不把名字拼进正文。
  * 4. **会话历史（user/assistant）**：按人隔离的对话线程。
- * 5. **本轮问题（user）**：带 `[展示名]` 前缀，固定最后。
+ * 5. **本轮问题（user）**：原话，固定最后。
  *
  * 预算不足时的降级顺序：先砍群聊背景，再砍历史（成对丢弃），
  * 事实保底保留前 [MIN_FACTS_KEPT] 条，人设与本轮问题永不丢弃。
@@ -51,7 +52,7 @@ class PromptAssembler {
      * @param history 按人隔离的会话历史（正序）
      * @param question 本轮问题（已剥离 /ai 前缀与 @ 前缀）
      * @param tokenBudget 「人设 + 事实 + 背景 + 历史 + 问题」的总量上限
-     * @param senderPrefix 是否给本轮问题加 `[展示名]` 前缀
+     * @param senderPrefix 是否在系统块里点名「现在和你说话的人」（不再把名字塞进消息正文）
      */
     fun assemble(
         personaPrompt: String,
@@ -270,7 +271,7 @@ class PromptAssembler {
             for (msg in personal.takeLast(PERSONAL_DIGEST_LIMIT)) {
                 val speaker = if (msg.role == "assistant") "你" else who
                 val body = msg.content.replace("\n", " ").take(DIGEST_ENTRY_MAX)
-                val line = "[$speaker] $body"
+                val line = TranscriptRender.Line(speaker, body).render()
                 val lineCost = TokenEstimator.estimate(line)
                 if (cost + lineCost > cap && lines.isNotEmpty()) break
                 if (cost + lineCost > cap && lines.isEmpty()) break
@@ -281,6 +282,7 @@ class PromptAssembler {
                 val block =
                     "你和「$who」之前的对话（只属于你们两个人；" +
                         "这里没有别人的话，别把群背景里其他人的事算到他头上）：\n" +
+                        TranscriptRender.FORMAT_HINT + "\n" +
                         lines.joinToString("\n")
                 result += ChatMessage(role = "system", content = block)
                 remaining -= TokenEstimator.estimate(block)
@@ -294,21 +296,47 @@ class PromptAssembler {
             val lines = mutableListOf<String>()
             var cost = 0
             for (msg in digest.takeLast(DIGEST_ENTRY_LIMIT)) {
-                val who = msg.senderName?.takeIf { it.isNotBlank() }
-                    ?: if (msg.role == "assistant") "机器人" else "某人"
+                // 机器人自己的行必须显示成「你」：存的时候 senderName 是 null，
+                // 旧代码回退成「机器人」，模型会把它当成群里的另一个 bot。
+                val who =
+                    if (msg.role == "assistant") {
+                        "你"
+                    } else {
+                        msg.senderName?.takeIf { it.isNotBlank() } ?: "某人"
+                    }
                 val body = msg.content.replace("\n", " ").take(DIGEST_ENTRY_MAX)
-                val line = "[$who] $body"
+                val line =
+                    TranscriptRender.Line(
+                        who = who,
+                        body = body,
+                        meta = if (msg.isAt) "@你" else null,
+                    ).render()
                 val lineCost = TokenEstimator.estimate(line)
                 if (cost + lineCost > digestCap) break
                 lines += line
                 cost += lineCost
             }
             if (lines.isNotEmpty()) {
-                val block = "以下是所在群/频道里最近的对话（可能包含其他人）：\n" +
-                    lines.joinToString("\n")
+                val block =
+                    "以下是所在群/频道里最近的对话（可能包含其他人）：\n" +
+                        TranscriptRender.FORMAT_HINT + "\n" +
+                        lines.joinToString("\n")
                 result += ChatMessage(role = "system", content = block)
                 remaining -= TokenEstimator.estimate(block)
             }
+        }
+
+        // 3.5) 本轮说话人：名字只作为元信息声明，不拼进消息正文。
+        // 过去把名字拼成 `[小明] 问题` 塞进 user 消息，模型常把方括号当成
+        // 对方说的话的一部分；音视频/多人群聊时指代更容易乱。
+        // 放在历史之前，保持所有 system 块连续，不影响历史前缀缓存。
+        val label = memory?.senderLabel?.takeIf { it.isNotBlank() }
+        if (senderPrefix && label != null) {
+            result +=
+                ChatMessage(
+                    role = "system",
+                    content = "这一轮跟你说话的人是「$label」；最后一条 user 消息是他的原话，人名不在正文里。",
+                )
         }
 
         // 4) 历史：成对丢弃（一问一答算一对），保证配对完整
@@ -329,11 +357,8 @@ class PromptAssembler {
         }
         result += kept
 
-        // 5) 本轮问题：带展示名前缀，固定最后
-        val label = memory?.senderLabel?.takeIf { it.isNotBlank() }
-        val finalQuestion =
-            if (senderPrefix && label != null) "[$label] $question" else question
-        result += ChatMessage(role = "user", content = finalQuestion)
+        // 5) 本轮问题：正文保持原样，固定最后
+        result += ChatMessage(role = "user", content = question)
 
         return result
     }

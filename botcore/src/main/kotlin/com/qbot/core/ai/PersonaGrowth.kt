@@ -424,6 +424,7 @@ class PersonaGrowth(private val client: LlmClient) {
                 }
                 if (transcript.isNotBlank()) {
                     append("最近的群聊样本（只参考语气与节奏，不要照抄内容）：\n")
+                    append(TranscriptRender.FORMAT_HINT).append("\n")
                     append(transcript).append("\n\n")
                 }
                 append("请写出完整的人格六段。")
@@ -480,6 +481,7 @@ class PersonaGrowth(private val client: LlmClient) {
                 append("- 新增 ").append(stats.pendingMessages).append(" 条群消息\n\n")
                 if (transcript.isNotBlank()) {
                     append("群聊样本（只参考语气与话题，不要照抄内容）：\n")
+                    append(TranscriptRender.FORMAT_HINT).append("\n")
                     append(transcript).append("\n\n")
                 }
                 append("这批对话值得吸收就输出六段人格，不值得就只输出 NO_CHANGE。")
@@ -552,12 +554,15 @@ class PersonaGrowth(private val client: LlmClient) {
 
     /** 样本转录：带名字，每条 100 字，最多 40 条。 */
     private fun renderSamples(samples: List<RoomMessage>): String =
-        samples
-            .takeLast(40)
-            .joinToString("\n") { message ->
+        TranscriptRender.render(
+            samples.takeLast(40).map { message ->
                 val who =
                     message.senderName?.takeIf { it.isNotBlank() }
                         ?: if (message.role == "assistant") "机器人" else "群友"
-                "[$who] ${message.content.replace("\n", " ").take(100)}"
-            }
+                TranscriptRender.Line(
+                    who = if (message.role == "assistant") "你" else who,
+                    body = message.content.take(100),
+                )
+            },
+        )
 }

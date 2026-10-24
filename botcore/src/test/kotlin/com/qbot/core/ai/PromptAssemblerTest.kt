@@ -12,7 +12,7 @@ import org.junit.Test
  * 1. 人设必须在最前面且永不丢弃；
  * 2. 事实块在人设之后、群聊背景之前；
  * 3. 群聊背景是动态内容，预算紧张时最先牺牲；
- * 4. 本轮问题固定最后，且带 [展示名] 前缀。
+ * 4. 本轮问题固定最后；说话人作为系统块声明，名字不拼进正文。
  */
 class PromptAssemblerTest {
     private val assembler = PromptAssembler()
@@ -69,16 +69,17 @@ class PromptAssemblerTest {
                 tokenBudget = 10_000,
             )
 
-        assertEquals(6, messages.size)
+        assertEquals(7, messages.size)
         assertEquals("system", messages[0].role)
         assertEquals("你是助手", messages[0].content)
         assertTrue(messages[1].content.contains("喜欢吃辣"))
         assertTrue(messages[2].content.contains("小红"))
-        assertEquals("user", messages[3].role)
-        assertEquals("assistant", messages[4].role)
-        assertEquals("user", messages[5].role)
-        // 本轮问题带展示名前缀，固定最后
-        assertEquals("[小明] 新问题", messages[5].content)
+        assertTrue("说话人应作为系统块声明", messages[3].content.contains("「小明」"))
+        assertEquals("user", messages[4].role)
+        assertEquals("assistant", messages[5].role)
+        assertEquals("user", messages[6].role)
+        // 本轮问题是原话，名字不进正文
+        assertEquals("新问题", messages[6].content)
     }
 
     @Test
@@ -247,13 +248,14 @@ class PromptAssemblerTest {
                 tokenBudget = 10_000,
             )
 
-        assertEquals(5, messages.size)
+        assertEquals(6, messages.size)
         assertEquals("人设", messages[0].content)
         assertTrue(messages[1].content.contains("喜欢吃辣"))
         assertTrue("群画像应包含本群昵称", messages[2].content.contains("小助手"))
         assertTrue("群画像应包含成员数", messages[2].content.contains("12"))
         assertTrue(messages[3].content.contains("小红"))
-        assertEquals("user", messages[4].role)
+        assertTrue("说话人块在历史/问题之前", messages[4].content.contains("「小明」"))
+        assertEquals("user", messages[5].role)
     }
 
     @Test
@@ -573,8 +575,8 @@ class PromptAssemblerTest {
             )
 
         val block = messages.first { it.content.contains("只属于你们两个人") }
-        assertTrue("应带上他说过的话", block.content.contains("[小明] 我答应过你少熬夜"))
-        assertTrue("应带上机器人自己的回复", block.content.contains("[你] 记住了"))
+        assertTrue("应带上他说过的话", block.content.contains("[小明]\n我答应过你少熬夜"))
+        assertTrue("应带上机器人自己的回复", block.content.contains("[你]\n记住了"))
         assertTrue("应提醒别把别人的事算到他头上", block.content.contains("别把群背景里其他人的事算到他头上"))
     }
 
@@ -603,5 +605,66 @@ class PromptAssemblerTest {
         assertTrue("应带上认识的人", block.content.contains("「老爹」"))
         assertTrue("应带上特殊说法", block.content.contains("「大肥鱼」"))
         assertTrue("应说明是设定背景", block.content.contains("不要主动向群里复述"))
+    }
+
+    @Test
+    fun `群聊背景把说话人和正文分成两行`() {
+        // 旧格式 `[陈泽] 我爸在绥棱种地呢` 让名字和正文挤在同一行，
+        // 正文本身以名字或方括号开头时，模型会把说话人读成内容的一部分。
+        val messages =
+            assembler.assemble(
+                personaPrompt = "",
+                memory =
+                    memory(
+                        digest =
+                            listOf(
+                                roomMsg("陈泽", "我爸在绥棱种地呢"),
+                                RoomMessage(
+                                    senderId = null,
+                                    senderName = null,
+                                    role = "assistant",
+                                    content = "你少来，我爹没这么欠",
+                                    timestampMillis = 0,
+                                ),
+                            ),
+                    ),
+                history = emptyList(),
+                question = "在吗",
+                tokenBudget = 10_000,
+            )
+
+        val block = messages.first { it.content.contains("最近的对话") }
+        assertTrue("说话人单独一行", block.content.contains("[陈泽]\n我爸在绥棱种地呢"))
+        assertTrue("机器人自己的行用「你」", block.content.contains("[你]\n你少来"))
+        assertFalse("不能把自己当成群里的另一个机器人", block.content.contains("[机器人]"))
+        assertTrue("块首声明格式", block.content.contains(TranscriptRender.FORMAT_HINT))
+    }
+
+    @Test
+    fun `群聊背景标出艾特了机器人的消息`() {
+        val messages =
+            assembler.assemble(
+                personaPrompt = "",
+                memory =
+                    memory(
+                        digest =
+                            listOf(
+                                RoomMessage(
+                                    senderId = "s",
+                                    senderName = "小红",
+                                    role = "user",
+                                    content = "阿远在吗",
+                                    timestampMillis = 0,
+                                    isAt = true,
+                                ),
+                            ),
+                    ),
+                history = emptyList(),
+                question = "在吗",
+                tokenBudget = 10_000,
+            )
+
+        val block = messages.first { it.content.contains("最近的对话") }
+        assertTrue("应标出 @你", block.content.contains("[小红 · @你]\n阿远在吗"))
     }
 }

@@ -206,13 +206,19 @@ class SlangJudge(private val client: LlmClient) {
                 append("\n\n")
                 if (samples.isNotEmpty()) {
                     append("最近的群聊（只看语境，不要照抄）：\n")
+                    append(TranscriptRender.FORMAT_HINT).append("\n")
                     append(
-                        samples.takeLast(20).joinToString("\n") { message ->
-                            val who =
-                                message.senderName?.takeIf { it.isNotBlank() }
-                                    ?: if (message.role == "assistant") "机器人" else "群友"
-                            "[$who] ${message.content.replace("\n", " ").take(60)}"
-                        },
+                        TranscriptRender.render(
+                            samples.takeLast(20).map { message ->
+                                val who =
+                                    message.senderName?.takeIf { it.isNotBlank() }
+                                        ?: if (message.role == "assistant") "机器人" else "群友"
+                                TranscriptRender.Line(
+                                    who = if (message.role == "assistant") "你" else who,
+                                    body = message.content.take(60),
+                                )
+                            },
+                        ),
                     )
                 }
             }

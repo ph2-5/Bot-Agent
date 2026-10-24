@@ -79,12 +79,15 @@ class PersonaEvolver(
         config: AiConfig,
     ): PersonaEvolution {
         val transcript =
-            samples.takeLast(30).joinToString("\n") { msg ->
-                val who =
-                    msg.senderName?.takeIf { it.isNotBlank() }
-                        ?: if (msg.role == "assistant") "机器人" else "群友"
-                "[$who] ${msg.content.replace("\n", " ").take(120)}"
-            }
+            TranscriptRender.render(
+                samples.takeLast(30).map { msg ->
+                    val who = msg.senderName?.takeIf { it.isNotBlank() } ?: "群友"
+                    TranscriptRender.Line(
+                        who = if (msg.role == "assistant") "你" else who,
+                        body = msg.content.take(120),
+                    )
+                },
+            )
         val system =
             "你是人设编辑器，负责改进一条 QQ 机器人的人设提示词。\n" +
                 "硬性要求：\n" +
@@ -99,6 +102,7 @@ class PersonaEvolver(
                 append("当前提示词：\n---\n").append(currentPrompt.take(4000)).append("\n---\n\n")
                 if (transcript.isNotBlank()) {
                     append("最近的群聊样本（供参考语气与场景，不要照抄内容）：\n")
+                    append(TranscriptRender.FORMAT_HINT).append("\n")
                     append(transcript).append("\n\n")
                 }
                 val extra = instruction?.trim().orEmpty()

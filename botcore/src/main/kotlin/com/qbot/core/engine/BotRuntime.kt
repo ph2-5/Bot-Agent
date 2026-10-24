@@ -36,6 +36,7 @@ import com.qbot.core.ai.SlangLearner
 import com.qbot.core.ai.SocialContextProvider
 import com.qbot.core.ai.StyleRule
 import com.qbot.core.ai.StyleRuleSource
+import com.qbot.core.ai.TranscriptRender
 import com.qbot.core.ai.RoomMessage
 import com.qbot.core.ai.describe
 import com.qbot.core.api.MsgType
@@ -715,14 +716,22 @@ class BotRuntime(
 
     /** 把最近几条群消息压成一段转录，供复盘页还原"当时的局面"。 */
     private fun buildContextSnippet(recent: List<RoomMessage>): String =
-        recent
-            .takeLast(8)
-            .joinToString("\n") { msg ->
-                val who =
-                    msg.senderName?.takeIf { it.isNotBlank() }
-                        ?: if (msg.role == "assistant") botName.ifBlank { "机器人" } else "某人"
-                "[$who] ${msg.content.replace("\n", " ").take(60)}"
-            }.take(400)
+        TranscriptRender
+            .render(
+                recent.takeLast(8).map { msg ->
+                    val who =
+                        msg.senderName?.takeIf { it.isNotBlank() }
+                            ?: if (msg.role == "assistant") botName.ifBlank { "机器人" } else "某人"
+                    // 机器人自己的行统一显示成「你」：复盘与反思都要能分清
+                    // "它说过的" 和 "别人说过的"。
+                    val speaker = if (msg.role == "assistant") "你" else who
+                    TranscriptRender.Line(
+                        who = speaker,
+                        body = msg.content.take(60),
+                        meta = if (msg.isAt) "@你" else null,
+                    )
+                },
+            ).take(400)
 
     /** 把判断失败的原因压成一句人话，写进日志与决策记录。 */
     private fun describeFailure(error: Throwable?): String {

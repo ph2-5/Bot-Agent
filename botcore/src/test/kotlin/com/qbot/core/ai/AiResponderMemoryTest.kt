@@ -118,7 +118,8 @@ class AiResponderMemoryTest {
             val body = server.takeRequest().body.readUtf8()
             assertTrue("应注入事实", body.contains("喜欢吃辣"))
             assertTrue("应注入事实", body.contains("在备考研究生"))
-            assertTrue("本轮问题应带展示名前缀", body.contains("[小明] 推荐道菜"))
+            assertTrue("说话人应作为元信息声明", body.contains("跟你说话的人是「小明」"))
+            assertFalse("名字不应拼进正文", body.contains("[小明] 推荐道菜"))
         }
 
     @Test

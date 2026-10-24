@@ -556,16 +556,19 @@ class AiResponder(
         // 以当前消息时间为基准算相对时间：模型靠间隔判断冷场还是两人快速对聊
         val now = message.timestampMillis.takeIf { it > 0L } ?: System.currentTimeMillis()
         val transcript =
-            recent.joinToString("\n") { msg ->
-                val who =
-                    if (msg.role == "assistant") {
-                        "你"
-                    } else {
-                        msg.senderName?.takeIf { it.isNotBlank() } ?: "某人"
-                    }
-                val ago = humanAgo((now - msg.timestampMillis).coerceAtLeast(0L))
-                "[$who · $ago] ${msg.content.replace("\n", " ").take(120)}"
-            }
+            TranscriptRender.render(
+                recent.map { msg ->
+                    val who =
+                        if (msg.role == "assistant") {
+                            "你"
+                        } else {
+                            msg.senderName?.takeIf { it.isNotBlank() } ?: "某人"
+                        }
+                    val ago = humanAgo((now - msg.timestampMillis).coerceAtLeast(0L))
+                    val meta = if (msg.isAt) "$ago · @你" else ago
+                    TranscriptRender.Line(who, msg.content.take(120), meta)
+                },
+            )
         val personaBlock =
             personaPrompt?.takeIf { it.isNotBlank() }?.let { persona ->
                 "你的性格：「${persona.take(300)}」\n" +
@@ -608,8 +611,12 @@ class AiResponder(
                 "不要输出其它内容。"
         val user =
             buildString {
-                if (transcript.isNotBlank()) append("最近消息：\n").append(transcript).append("\n\n")
-                append("现在 [").append(speaker).append("] 说：「")
+                if (transcript.isNotBlank()) {
+                    append("最近消息：\n")
+                        .append(TranscriptRender.FORMAT_HINT).append("\n")
+                        .append(transcript).append("\n\n")
+                }
+                append("现在「").append(speaker).append("」说：「")
                     .append(message.content.take(160)).append("」")
             }
 

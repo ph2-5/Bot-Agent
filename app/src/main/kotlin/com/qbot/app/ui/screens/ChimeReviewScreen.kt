@@ -553,7 +553,8 @@ private fun DecisionCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    record.contextSnippet.lines().takeLast(4).joinToString("\n"),
+                    // 转录是「说话人一行 + 正文一行」，6 行正好还原最近 3 条
+                    record.contextSnippet.lines().takeLast(6).joinToString("\n"),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
