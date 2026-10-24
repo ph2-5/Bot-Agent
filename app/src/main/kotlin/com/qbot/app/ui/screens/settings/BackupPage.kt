@@ -27,6 +27,7 @@ fun BackupPage(onBack: () -> Unit) {
     val context = LocalContext.current
     val app = context.applicationContext as BotApplication
     val controller = remember { app.controller }
+    val botName = app.bots.currentAccount.name
     val scope = rememberCoroutineScope()
     var hint by remember { mutableStateOf<String?>(null) }
 
@@ -71,12 +72,13 @@ fun BackupPage(onBack: () -> Unit) {
 
     SettingsPageScaffold(
         title = "数据与备份",
-        subtitle = "换机或备份用：配置、人格、长期记忆与训练成果",
+        subtitle = "当前机器人：$botName（只备份这一个机器人）",
         onBack = onBack,
     ) {
         SettingsCard {
             HintText(
-                "导出内容包含机器人凭证、AI Key 与全部长期记忆（事实、最近对话、内心戏），" +
+                "只备份当前机器人。多机器人时请逐个切换后分别导出。\n" +
+                    "导出内容包含机器人凭证、AI Key 与全部长期记忆（事实、最近对话、内心戏），" +
                     "均为明文 JSON，备份文件请妥善保管。\n" +
                     "导入按「合并」进行：规则 / 说话约束按 id 覆盖，群档案按群覆盖" +
                     "（含群名片、在群状态、主动发言权限），人格档案按名称更新，" +
@@ -86,7 +88,8 @@ fun BackupPage(onBack: () -> Unit) {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 OutlinedButton(
                     onClick = {
-                        val name = "qbot-config-%tF.json".format(java.util.Date())
+                        val safeName = botName.replace(Regex("[^\\w\\u4e00-\\u9fa5-]"), "_")
+                        val name = "qbot-$safeName-%tF.json".format(java.util.Date())
                         exportLauncher.launch(name)
                     },
                     modifier = Modifier.weight(1f),

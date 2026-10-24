@@ -7,6 +7,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -23,18 +24,20 @@ import com.qbot.app.BotApplication
 fun CredentialsPage(onBack: () -> Unit) {
     val context = LocalContext.current
     val app = context.applicationContext as BotApplication
-    val settings = remember { app.settings }
-    val controller = remember { app.controller }
-    val initial = remember { settings.credentials() }
+    val bots = app.bots
+    val currentId by bots.currentBotId.collectAsState()
+    val account = remember(currentId) { bots.currentAccount }
+    val settings = remember(currentId) { bots.currentSettings }
+    val initial = remember(currentId) { settings.credentials() }
 
-    var appId by rememberSaveable { mutableStateOf(initial.appId) }
+    var appId by rememberSaveable(currentId) { mutableStateOf(initial.appId) }
     // 密钥不进 savedInstanceState，旋屏后从加密存储重读（未保存的改动会丢，属预期）
-    var clientSecret by remember { mutableStateOf(initial.clientSecret) }
+    var clientSecret by remember(currentId) { mutableStateOf(initial.clientSecret) }
     var hint by remember { mutableStateOf<String?>(null) }
 
     SettingsPageScaffold(
         title = "机器人凭证",
-        subtitle = "在 QQ 开放平台创建机器人后获得",
+        subtitle = "当前：${account.name} · 在 QQ 开放平台创建机器人后获得",
         onBack = onBack,
     ) {
         SettingsCard {
@@ -63,13 +66,13 @@ fun CredentialsPage(onBack: () -> Unit) {
             Button(
                 onClick = {
                     settings.saveCredentials(appId.trim(), clientSecret.trim())
-                    controller.restart()
-                    hint = "已保存，机器人正在重新连接"
+                    bots.restartBot(account.id)
+                    hint = "已保存。该机器人在运行中会自动重连，其他机器人不受影响。"
                 },
                 enabled = appId.isNotBlank() && clientSecret.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("保存并重启")
+                Text("保存并重连")
             }
 
             hint?.let {

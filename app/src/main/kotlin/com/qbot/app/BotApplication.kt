@@ -2,10 +2,10 @@ package com.qbot.app
 
 import android.app.Application
 import android.util.Log
-import androidx.room.Room
 import com.qbot.app.data.db.AppDatabase
 import com.qbot.app.data.repo.SettingsRepository
 import com.qbot.app.runtime.BotController
+import com.qbot.app.runtime.BotManager
 import com.qbot.app.service.ResurrectorJobService
 import com.qbot.app.service.SurvivalStatsStore
 import com.qbot.core.util.Logger
@@ -44,14 +44,23 @@ class AndroidLogger : Logger {
 }
 
 class BotApplication : Application() {
-    lateinit var database: AppDatabase
+    /**
+     * 多机器人管理器：账号目录、当前选中、每个机器人的库 / 设置 / 运行时。
+     *
+     * 下面三个兼容属性让维护端继续写 `app.controller` / `app.settings` / `app.database`，
+     * 实际指向「当前选中的机器人」，切换机器人后由界面重建读取新实例。
+     */
+    lateinit var bots: BotManager
         private set
 
-    lateinit var settings: SettingsRepository
-        private set
+    val database: AppDatabase
+        get() = bots.currentDatabase
 
-    lateinit var controller: BotController
-        private set
+    val settings: SettingsRepository
+        get() = bots.currentSettings
+
+    val controller: BotController
+        get() = bots.currentController
 
     /** 存活统计：机器人一直在靠谁续命（手动/开机/定时复活/系统重建）。 */
     lateinit var survivalStats: SurvivalStatsStore
@@ -60,33 +69,7 @@ class BotApplication : Application() {
     override fun onCreate() {
         super.onCreate()
 
-        database =
-            Room.databaseBuilder(applicationContext, AppDatabase::class.java, "qbot.db")
-                // 记忆系统表（v3）与群感知表（v4）都走增量迁移，
-                // 老用户的日志/规则/AI 历史/身份/事实全部保留。
-                //
-                // 刻意不再挂 fallbackToDestructiveMigration：它会在 schema
-                // 校验失败或版本未知时**静默清库**——人设、记忆、经验一起没了。
-                // 宁可启动时报错让人看见，也不能把用户长期养出来的数据当兜底燃料。
-                .addMigrations(
-                    AppDatabase.MIGRATION_2_3,
-                    AppDatabase.MIGRATION_3_4,
-                    AppDatabase.MIGRATION_4_5,
-                    AppDatabase.MIGRATION_5_6,
-                    AppDatabase.MIGRATION_6_7,
-                    AppDatabase.MIGRATION_7_8,
-                    AppDatabase.MIGRATION_8_9,
-                    AppDatabase.MIGRATION_9_10,
-                    AppDatabase.MIGRATION_10_11,
-                    AppDatabase.MIGRATION_11_12,
-                    AppDatabase.MIGRATION_12_13,
-                    AppDatabase.MIGRATION_13_14,
-                    AppDatabase.MIGRATION_14_15,
-                )
-                .build()
-
-        settings = SettingsRepository(applicationContext)
-        controller = BotController(applicationContext, database, settings, AndroidLogger())
+        bots = BotManager(applicationContext, AndroidLogger())
         survivalStats = SurvivalStatsStore(applicationContext)
 
         // 注册定时复活任务：进程被 ROM 整体杀掉后，到点由系统把 App 拉起来。
