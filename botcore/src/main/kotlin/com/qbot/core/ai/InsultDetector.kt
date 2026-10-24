@@ -49,7 +49,11 @@ class InsultDetector {
         names: Collection<String>,
         extraWords: List<String> = emptyList(),
     ): Boolean {
-        if (!BotNameMatcher.mentioned(text, names)) return false
+        // 名字被提及不等于在说机器人：「我和陈泽说话关你阿远什么事」
+        // 里既有名字又有"你"，过去会被判成指名冒犯，于是机器人非但不闭嘴，
+        // 还要回一句「骂人就关我事」（真实群聊截图）。划界句一律不算冒犯。
+        if (BotNameMatcher.isRefusal(text)) return false
+        if (!BotNameMatcher.called(text, names)) return false
         return SECOND_PERSON.any { text.contains(it) } || isInsult(text, extraWords)
     }
 

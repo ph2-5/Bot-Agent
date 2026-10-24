@@ -185,4 +185,61 @@ class AddresseeDetectorTest {
             )
         assertEquals(AddresseeKind.BOT, addressee.kind)
     }
+
+    @Test
+    fun `两个人一来一回时认为是在跟对方说`() {
+        // 真实群聊：两个人在拌嘴，机器人没有 @ 也插了一句
+        val history =
+            listOf(
+                RoomMessage(
+                    senderId = "u-chen",
+                    senderName = "陈泽",
+                    role = "user",
+                    content = "我爸在绥棱种地呢",
+                    timestampMillis = 1000L,
+                ),
+                RoomMessage(
+                    senderId = "u-chao",
+                    senderName = "潮水",
+                    role = "user",
+                    content = "你排不上",
+                    timestampMillis = 2000L,
+                ),
+                RoomMessage(
+                    senderId = "u-chen",
+                    senderName = "陈泽",
+                    role = "user",
+                    content = "你少来",
+                    timestampMillis = 3000L,
+                ),
+            )
+        val addressee =
+            AddresseeDetector.infer(
+                message("骂人就关我事", senderId = "u-chao", senderName = "潮水"),
+                history,
+                botNames = listOf("阿远"),
+                selfId = "bot-1",
+            )
+        assertEquals(AddresseeKind.MEMBER, addressee.kind)
+        assertEquals("陈泽", addressee.name)
+        assertTrue(addressee.evidence.contains("两人"))
+    }
+
+    @Test
+    fun `三个人在场时不判成两人对话`() {
+        val history =
+            listOf(
+                RoomMessage("u-a", "甲", "user", "今晚吃什么", 1000L),
+                RoomMessage("u-b", "乙", "user", "火锅", 2000L),
+                RoomMessage("u-c", "丙", "user", "也行", 3000L),
+            )
+        val addressee =
+            AddresseeDetector.infer(
+                message("那就火锅", senderId = "u-a", senderName = "甲"),
+                history,
+                botNames = listOf("阿远"),
+                selfId = "bot-1",
+            )
+        assertEquals(AddresseeKind.GROUP, addressee.kind)
+    }
 }

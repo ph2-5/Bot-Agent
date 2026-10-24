@@ -48,4 +48,31 @@ class BotNameMatcherTest {
         assertEquals(emptyList<String>(), BotNameMatcher.namesFromPrompt("你叫什么名字？"))
         assertEquals(emptyList<String>(), BotNameMatcher.namesFromPrompt("你叫他来一下"))
     }
+
+    @Test
+    fun `名字出现在划界句里不算在叫机器人`() {
+        // 真实群聊：「我和陈泽说话关你阿远什么事」——
+        // contains 会把名字夹在中间判成"被叫"，机器人于是硬插进两人的对话
+        assertTrue(!BotNameMatcher.called("我和陈泽说话关你阿远什么事", listOf("过去的阿远")))
+        assertTrue(BotNameMatcher.isRefusal("我和陈泽说话关你阿远什么事"))
+    }
+
+    @Test
+    fun `否认身份时不算在叫机器人`() {
+        // 「我不是阿远，认错人了」是在澄清，不是叫人
+        assertTrue(!BotNameMatcher.called("我不是阿远。认错人了。", listOf("阿远")))
+        assertTrue(!BotNameMatcher.called("阿远今天没来", listOf("阿远")))
+    }
+
+    @Test
+    fun `正常称呼仍然算叫机器人`() {
+        assertTrue(BotNameMatcher.called("阿远，在吗", listOf("阿远")))
+        assertTrue(BotNameMatcher.called("阿远你个傻福", listOf("过去的阿远")))
+    }
+
+    @Test
+    fun `没跟你说话这类拒斥句直接识别`() {
+        assertTrue(BotNameMatcher.isRefusal("没跟你说话，别插嘴"))
+        assertTrue(!BotNameMatcher.isRefusal("阿远你今晚来吗"))
+    }
 }

@@ -64,6 +64,17 @@ class InsultDetectorTest {
     }
 
     @Test
+    fun `划界句不算指名冒犯`() {
+        // 「我和陈泽说话关你阿远什么事」同时含名字和"你"，
+        // 旧判定会当成指名辱骂并强制回话，结果机器人回了「骂人就关我事」。
+        assertFalse(
+            detector.targetsBot("我和陈泽说话关你阿远什么事", listOf("过去的阿远")),
+        )
+        // 否认身份同理
+        assertFalse(detector.targetsBot("我不是阿远。认错人了。", listOf("阿远")))
+    }
+
+    @Test
     fun `自定义词表不影响内置词判定`() {
         assertTrue(
             detector.targetsBot("阿远你个傻逼", listOf("阿远"), extraWords = listOf("菜狗")),

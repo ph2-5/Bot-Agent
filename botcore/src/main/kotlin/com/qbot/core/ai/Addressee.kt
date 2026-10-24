@@ -100,6 +100,22 @@ object AddresseeDetector {
             }
         }
 
+        // 4.5) 最近几条在两个人之间来回：本条即便没 @ 谁，
+        //      也是在跟另一个人说话，而不是对全群说。
+        //      这是"两个人拌嘴，机器人硬插进去劝架/站队"的直接解药。
+        val pair = twoPartyExchange(recent)
+        if (pair != null && message.senderId != null && message.senderId in pair) {
+            val other =
+                recent.lastOrNull {
+                    it.role != "assistant" && it.senderId != message.senderId
+                }
+            return Addressee(
+                AddresseeKind.MEMBER,
+                other?.senderName ?: "另一位群友",
+                "最近几条是你们两人在对话",
+            )
+        }
+
         // 5) 上一条是提问、本条很短——在接那个人的话
         val prev = recent.lastOrNull()
         if (prev != null &&
@@ -142,6 +158,24 @@ object AddresseeDetector {
                 head.startsWith("$candidate：") ||
                 head.startsWith("$candidate:")
         }
+    }
+
+    /**
+     * 最近几条是否构成「两个人之间的对话」。
+     *
+     * 全部满足才认：窗口内没有机器人的发言（它已入场就不是第三方视角）、
+     * 只出现两个发送者，且最后 3 条都在这两人之间。
+     */
+    private fun twoPartyExchange(recent: List<RoomMessage>): Set<String>? {
+        if (recent.any { it.role == "assistant" }) return null
+        val window = recent.takeLast(6)
+        if (window.size < 3) return null
+        val senders =
+            window.mapNotNull { it.senderId?.takeIf { id -> id.isNotBlank() } }.distinct()
+        if (senders.size != 2) return null
+        val tail = window.takeLast(3)
+        if (tail.any { it.senderId.isNullOrBlank() || it.senderId !in senders }) return null
+        return senders.toSet()
     }
 
     private fun nameLookup(recent: List<RoomMessage>): Map<String, String> =

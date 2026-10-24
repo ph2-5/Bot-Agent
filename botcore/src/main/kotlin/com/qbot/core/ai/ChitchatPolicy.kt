@@ -261,8 +261,9 @@ class ChitchatPolicy(
 
         // 名字提及不受冷却限制，但仍有最小间隔与配额——
         // 否则群名恰好叫「小白」时会被刷屏。
-        // 用共享匹配器：完整名与短昵称（名字后缀）都能认出来。
-        val named = config.answerOnName && BotNameMatcher.mentioned(text, botNames)
+        // 用共享匹配器：完整名与短昵称（名字后缀）都能认出来；
+        // called 还会排除「我不是阿远」「关你阿远什么事」这类语境。
+        val named = config.answerOnName && BotNameMatcher.called(text, botNames)
 
         mutex.withLock {
             val state = stateOf(groupId)
@@ -279,7 +280,15 @@ class ChitchatPolicy(
                 return ChitchatGate.Skip("本日已达上限 ${config.maxPerDay} 次")
             }
 
-            // 被指名冒犯是最高优先级：这是"人设是否可信"的问题，
+            // 对方已经明确划界（「关你什么事」「没跟你说话」）：
+            // 名字出现了也不接。这类句子里名字常被夹在中间，只按字面匹配
+            // 会被判成"叫了名字"或"被指名冒犯"，于是越被推开越要插话——
+            // 所以划界的优先级高于冒犯回应。
+            if (BotNameMatcher.isRefusal(text)) {
+                return ChitchatGate.Skip("对方明确不需要你插话")
+            }
+
+            // 被指名冒犯是次高优先级：这是"人设是否可信"的问题，
             // 不能交给概率和 AI 判断。仍保留最小间隔，避免对骂刷屏。
             if (insulted) {
                 if (now - state.lastSpokeAt < NAME_MIN_GAP_MILLIS) {

@@ -59,6 +59,27 @@ class ChitchatPolicyTest {
         }
 
     @Test
+    fun `对方划界时名字出现也不接`() =
+        runTest {
+            // 「关你阿远什么事」：名字被夹在中间，过去会被判成"叫了名字"强制接话
+            val gate =
+                policy.gate(
+                    "g1",
+                    "我和陈泽说话关你阿远什么事",
+                    listOf("阿远"),
+                    config(),
+                )
+            assertTrue("划界句不该触发接话，实际=$gate", gate is ChitchatGate.Skip)
+        }
+
+    @Test
+    fun `否认身份时不触发强制接话`() =
+        runTest {
+            val gate = policy.gate("g1", "我不是阿远，认错人了", listOf("阿远"), config())
+            assertTrue("否认不是叫人，实际=$gate", gate !is ChitchatGate.Forced)
+        }
+
+    @Test
     fun `冷却下限为 1 秒`() =
         runTest {
             // 配置 1 秒时，冷场 ×0.6 不应算出 0 或负数
@@ -185,6 +206,22 @@ class ChitchatPolicyTest {
             val gate =
                 policy.gate("g1", "阿远你个傻逼", listOf("过去的阿远"), config(), insulted = true)
             assertTrue("刚说过话时骂人回应也不该刷屏，实际=$gate", gate is ChitchatGate.Skip)
+        }
+
+    @Test
+    fun `划界句即使被当成冒犯也优先闭嘴`() =
+        runTest {
+            // 上游 detectors 可能同时给出 insulted=true（名字 + "你" 同在）。
+            // 用户明确说「关你什么事」时，宁可闭嘴，也不要回嘴。
+            val gate =
+                policy.gate(
+                    "g1",
+                    "我和陈泽说话关你阿远什么事",
+                    listOf("过去的阿远"),
+                    config(),
+                    insulted = true,
+                )
+            assertTrue("划界优先于冒犯回应，实际=$gate", gate is ChitchatGate.Skip)
         }
 
     @Test
