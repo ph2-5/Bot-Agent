@@ -290,6 +290,7 @@ class LlmMemoryReranker(
                 .distinct()
                 .take(limit)
                 .map { candidates[it - 1] }
+                .toList()
 
         // 模型一个都没选（或格式跑偏）时保留本地排序，避免整块记忆变空
         return if (picked.isEmpty()) null else picked
