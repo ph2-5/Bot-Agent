@@ -14,8 +14,8 @@ object GenerationLimits {
     /** 与设置页滑杆下限一致 */
     const val MIN = 200
 
-    /** 上限：主流服务商的单次输出上限普遍不超过 8k */
-    const val MAX = 8000
+    /** 上限：主流服务商的单次输出上限普遍不超过 32k */
+    const val MAX = 32000
 
     /** 本次调用实际可用的输出额度。 */
     fun forConfig(config: AiConfig): Int = config.maxTokens.coerceIn(MIN, MAX)

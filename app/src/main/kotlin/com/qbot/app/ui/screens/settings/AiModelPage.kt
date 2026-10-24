@@ -29,6 +29,7 @@ import androidx.compose.ui.unit.dp
 import com.qbot.app.BotApplication
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
+import com.qbot.core.ai.AuxAiConfig
 import com.qbot.core.ai.LlmClient
 import com.qbot.core.ai.ThinkingMode
 import com.qbot.core.ai.TokenEstimator
@@ -64,6 +65,13 @@ fun AiModelPage(onBack: () -> Unit) {
     var webSearch by rememberSaveable { mutableStateOf(initial.webSearch) }
     var tokenBudget by rememberSaveable { mutableFloatStateOf(initial.contextTokenBudget.toFloat()) }
     var maxTokens by rememberSaveable { mutableStateOf(initial.maxTokens) }
+    // 辅助模型（记忆精排）：地址 / 模型留空则沿用主配置
+    val auxInitial = remember { settings.auxAiConfig.value }
+    var auxBaseUrl by rememberSaveable { mutableStateOf(auxInitial.baseUrl) }
+    var auxModel by rememberSaveable { mutableStateOf(auxInitial.model) }
+    var auxApiKey by remember { mutableStateOf(auxInitial.apiKey) }
+    var auxTimeout by rememberSaveable { mutableStateOf(auxInitial.timeoutSeconds.toString()) }
+    var auxMaxTokens by rememberSaveable { mutableStateOf(auxInitial.maxTokens.toString()) }
     var hint by remember { mutableStateOf<String?>(null) }
     var testing by remember { mutableStateOf(false) }
 
@@ -83,6 +91,15 @@ fun AiModelPage(onBack: () -> Unit) {
             contextTokenBudget = tokenBudget.toInt(),
             visionModel = visionModel.trim(),
             webSearch = webSearch,
+        )
+
+    fun buildAuxConfig() =
+        AuxAiConfig(
+            baseUrl = auxBaseUrl.trim(),
+            model = auxModel.trim(),
+            apiKey = auxApiKey.trim(),
+            timeoutSeconds = auxTimeout.toLongOrNull()?.coerceIn(5, 120) ?: 12,
+            maxTokens = auxMaxTokens.toIntOrNull()?.coerceIn(32, 2000) ?: 160,
         )
 
     SettingsPageScaffold(
@@ -185,6 +202,59 @@ fun AiModelPage(onBack: () -> Unit) {
             )
         }
 
+        SectionHeader("辅助模型", "记忆精排用的第二套 API（可留空沿用主模型）")
+        SettingsCard {
+            OutlinedTextField(
+                value = auxBaseUrl,
+                onValueChange = { auxBaseUrl = it },
+                label = { Text("服务地址（可留空）") },
+                placeholder = { Text("留空：用上面的主模型") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = auxModel,
+                onValueChange = { auxModel = it },
+                label = { Text("模型名（可留空）") },
+                placeholder = { Text("留空：用上面的主模型") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = auxApiKey,
+                onValueChange = { auxApiKey = it },
+                label = { Text("API Key（可留空）") },
+                placeholder = { Text("留空：用主模型的 Key") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(
+                    value = auxTimeout,
+                    onValueChange = { auxTimeout = it.filter { c -> c.isDigit() } },
+                    label = { Text("超时(秒)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.weight(1f),
+                )
+                OutlinedTextField(
+                    value = auxMaxTokens,
+                    onValueChange = { auxMaxTokens = it.filter { c -> c.isDigit() } },
+                    label = { Text("输出上限") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            HintText(
+                "只用于「记忆检索 → 辅助模型精排」：候选记忆交给它挑相关度，只要几个编号，" +
+                    "输出上限 160 就够。填了独立地址/模型就走这套（更便宜或更快），" +
+                    "否则沿用主模型。精排失败会静默退回本地排序，不影响回复。",
+            )
+        }
+
         SectionHeader("触发方式", "决定哪些消息交给 AI")
         SettingsCard {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -276,8 +346,8 @@ fun AiModelPage(onBack: () -> Unit) {
             Slider(
                 value = tokenBudget,
                 onValueChange = { tokenBudget = it },
-                valueRange = 1000f..8000f,
-                steps = 13,
+                valueRange = 1000f..64000f,
+                steps = 62,
             )
             HintText(
                 "提示词 + 历史 + 本轮问题的总量上限，超出时从最早的对话开始丢弃。" +
@@ -291,8 +361,8 @@ fun AiModelPage(onBack: () -> Unit) {
             Slider(
                 value = maxTokens.toFloat(),
                 onValueChange = { maxTokens = it.toInt() },
-                valueRange = 200f..4000f,
-                steps = 37,
+                valueRange = 200f..32000f,
+                steps = 158,
             )
             HintText(
                 "统计的是「思考 + 正文」的总量：开启思考时，思维链会先消耗额度，" +
@@ -337,6 +407,7 @@ fun AiModelPage(onBack: () -> Unit) {
                 Button(
                     onClick = {
                         settings.saveAiConfig(buildConfig())
+                        settings.saveAuxAiConfig(buildAuxConfig())
                         hint = "已保存，新设置对下一条消息立即生效"
                     },
                     enabled =

@@ -14,6 +14,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
+import com.qbot.core.ai.AuxAiConfig
 import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.MemoryConfig
@@ -122,6 +123,11 @@ class SettingsRepository(
         val AI_CONTEXT_TOKEN_BUDGET = intPreferencesKey("ai_context_token_budget")
         val AI_VISION_MODEL = stringPreferencesKey("ai_vision_model")
         val AI_WEB_SEARCH = booleanPreferencesKey("ai_web_search")
+        /** 辅助模型（记忆精排）：留空时沿用主模型 */
+        val AI_AUX_BASE_URL = stringPreferencesKey("ai_aux_base_url")
+        val AI_AUX_MODEL = stringPreferencesKey("ai_aux_model")
+        val AI_AUX_TIMEOUT_SECONDS = intPreferencesKey("ai_aux_timeout_seconds")
+        val AI_AUX_MAX_TOKENS = intPreferencesKey("ai_aux_max_tokens")
 
         // ---- 记忆系统 ----
         val MEMORY_ENABLED = booleanPreferencesKey("memory_enabled")
@@ -135,6 +141,15 @@ class SettingsRepository(
         val MEMORY_PERSONAL_THREAD_SIZE = intPreferencesKey("memory_personal_thread_size")
         /** 按人设分开记忆：换档案后不继承旧人格的对话、经验与关系 */
         val MEMORY_PERSONA_SCOPED = booleanPreferencesKey("memory_persona_scoped")
+        /** 记忆检索：用索引找相关旧记忆，而不是只按时间取最近几条 */
+        val MEMORY_SEARCH_ENABLED = booleanPreferencesKey("memory_search_enabled")
+        val MEMORY_SEARCH_TOP_K = intPreferencesKey("memory_search_top_k")
+        val MEMORY_SEARCH_HALF_LIFE = intPreferencesKey("memory_search_half_life")
+        /** 辅助模型精排（独立开关，与索引开关解耦） */
+        val MEMORY_AUX_RANK = booleanPreferencesKey("memory_aux_rank")
+        val MEMORY_AUX_RANK_CANDIDATES = intPreferencesKey("memory_aux_rank_candidates")
+        /** 高级参数是否展开（只影响界面，不影响行为） */
+        val MEMORY_ADVANCED_VISIBLE = booleanPreferencesKey("memory_advanced_visible")
 
         // ---- 群感知 ----
         val GREETING_ENABLED = booleanPreferencesKey("greeting_enabled")
@@ -175,6 +190,7 @@ class SettingsRepository(
         private const val KEY_APP_ID = "app_id"
         private const val KEY_CLIENT_SECRET = "client_secret"
         private const val KEY_AI_API_KEY = "ai_api_key"
+        private const val KEY_AUX_AI_API_KEY = "aux_ai_api_key"
 
         /** 删除机器人时释放设置文件缓存（DataStore 同一文件只能有一个活动实例）。 */
         fun forget(botId: String?) {
@@ -245,6 +261,18 @@ class SettingsRepository(
     val memoryConfig: StateFlow<MemoryConfig> = _memoryConfig.asStateFlow()
 
     /**
+     * 辅助模型配置（记忆精排用）。
+     *
+     * 与 [aiConfig] 分开是刻意的：精排只需要短输出，
+     * 用户可以指向更便宜/更快的模型，而不动主对话模型。
+     */
+    private val _auxAiConfig =
+        MutableStateFlow(
+            AuxAiConfig(apiKey = encryptedPrefs.getString(KEY_AUX_AI_API_KEY, "").orEmpty()),
+        )
+    val auxAiConfig: StateFlow<AuxAiConfig> = _auxAiConfig.asStateFlow()
+
+    /**
      * 加群问候语配置。
      *
      * 与 [memoryConfig] 同一套机制：DataStore 出字段，
@@ -269,6 +297,7 @@ class SettingsRepository(
         scope.launch {
             dataStore.data.collect { prefs ->
                 _aiConfig.value = readAiConfig(prefs)
+                _auxAiConfig.value = readAuxAiConfig(prefs)
                 _memoryConfig.value = readMemoryConfig(prefs)
                 _greetingConfig.value = readGreetingConfig(prefs)
                 _chitchatConfig.value = readChitchatConfig(prefs)
@@ -294,6 +323,14 @@ class SettingsRepository(
             personalThreadSize =
                 prefs[Keys.MEMORY_PERSONAL_THREAD_SIZE] ?: defaults.personalThreadSize,
             personaScoped = prefs[Keys.MEMORY_PERSONA_SCOPED] ?: defaults.personaScoped,
+            searchEnabled = prefs[Keys.MEMORY_SEARCH_ENABLED] ?: defaults.searchEnabled,
+            searchTopK = prefs[Keys.MEMORY_SEARCH_TOP_K] ?: defaults.searchTopK,
+            searchHalfLifeDays =
+                prefs[Keys.MEMORY_SEARCH_HALF_LIFE] ?: defaults.searchHalfLifeDays,
+            auxRankEnabled = prefs[Keys.MEMORY_AUX_RANK] ?: defaults.auxRankEnabled,
+            auxRankCandidates =
+                prefs[Keys.MEMORY_AUX_RANK_CANDIDATES] ?: defaults.auxRankCandidates,
+            advancedVisible = prefs[Keys.MEMORY_ADVANCED_VISIBLE] ?: defaults.advancedVisible,
         )
     }
 
@@ -312,6 +349,41 @@ class SettingsRepository(
                 prefs[Keys.MEMORY_PERSONAL_THREAD] = config.personalThreadEnabled
                 prefs[Keys.MEMORY_PERSONAL_THREAD_SIZE] = config.personalThreadSize
                 prefs[Keys.MEMORY_PERSONA_SCOPED] = config.personaScoped
+                prefs[Keys.MEMORY_SEARCH_ENABLED] = config.searchEnabled
+                prefs[Keys.MEMORY_SEARCH_TOP_K] = config.searchTopK
+                prefs[Keys.MEMORY_SEARCH_HALF_LIFE] = config.searchHalfLifeDays
+                prefs[Keys.MEMORY_AUX_RANK] = config.auxRankEnabled
+                prefs[Keys.MEMORY_AUX_RANK_CANDIDATES] = config.auxRankCandidates
+                prefs[Keys.MEMORY_ADVANCED_VISIBLE] = config.advancedVisible
+            }
+        }
+    }
+
+    private fun readAuxAiConfig(prefs: Preferences): AuxAiConfig {
+        val defaults = AuxAiConfig()
+        return AuxAiConfig(
+            enabled = defaults.enabled,
+            baseUrl = prefs[Keys.AI_AUX_BASE_URL] ?: defaults.baseUrl,
+            apiKey = encryptedPrefs.getString(KEY_AUX_AI_API_KEY, "").orEmpty(),
+            model = prefs[Keys.AI_AUX_MODEL] ?: defaults.model,
+            timeoutSeconds =
+                (prefs[Keys.AI_AUX_TIMEOUT_SECONDS] ?: defaults.timeoutSeconds.toInt()).toLong(),
+            maxTokens = prefs[Keys.AI_AUX_MAX_TOKENS] ?: defaults.maxTokens,
+        )
+    }
+
+    /** 保存辅助模型配置。apiKey 单独走加密存储。 */
+    fun saveAuxAiConfig(config: AuxAiConfig) {
+        encryptedPrefs.edit()
+            .putString(KEY_AUX_AI_API_KEY, config.apiKey.trim())
+            .apply()
+        _auxAiConfig.value = config.copy(apiKey = config.apiKey.trim())
+        scope.launch {
+            dataStore.edit { prefs ->
+                prefs[Keys.AI_AUX_BASE_URL] = config.baseUrl.trim()
+                prefs[Keys.AI_AUX_MODEL] = config.model.trim()
+                prefs[Keys.AI_AUX_TIMEOUT_SECONDS] = config.timeoutSeconds.toInt()
+                prefs[Keys.AI_AUX_MAX_TOKENS] = config.maxTokens
             }
         }
     }

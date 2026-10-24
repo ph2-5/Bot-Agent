@@ -58,6 +58,28 @@ data class MemoryConfig(
      * 群友说过的事实始终共享（那是关于他们自己的信息，不该随人设丢失）。
      */
     val personaScoped: Boolean = false,
+    /**
+     * 本地索引检索：按「相关度」而不再只按「最近」取记忆。
+     *
+     * 默认开启。索引是派生物，关掉后立刻退回旧行为（按人全取 + 最近 N 条），
+     * 检索任何一步失败也会自动回退，不会因为索引没建好就不回复。
+     */
+    val searchEnabled: Boolean = true,
+    /** 每次检索注入几条相关记忆（事实与群背景各自独立计算） */
+    val searchTopK: Int = 8,
+    /** 相关度的时间半衰期（天）：越短越偏向新事 */
+    val searchHalfLifeDays: Int = 14,
+    /** 辅助 API 精排：候选多时用第二个模型挑相关性（默认关，省钱） */
+    val auxRankEnabled: Boolean = false,
+    /** 送进精排的候选条数上限 */
+    val auxRankCandidates: Int = 20,
+    /**
+     * 设置页是否展开高级参数。
+     *
+     * 纯展示状态，但跟着每个机器人存——一个号调过参数，
+     * 切到另一个号不该突然冒出一堆滑杆。
+     */
+    val advancedVisible: Boolean = false,
 )
 
 /**
@@ -164,6 +186,20 @@ class MemoryPipeline(
      * 为 null 时只操作事实库。
      */
     private val loreStore: LoreStore? = null,
+    /**
+     * 索引检索（可选）。
+     *
+     * 为 null 或 [MemoryConfig.searchEnabled] 关闭时，整条链路与旧版一致：
+     * 事实按人全取、群背景按时间取最近 N 条。
+     */
+    private val searcher: MemorySearcher? = null,
+    /**
+     * 辅助 API 精排（可选）。
+     *
+     * 只在 [MemoryConfig.auxRankEnabled] 打开且候选足够多时调用；
+     * 返回 null 或抛异常都视为「这次不精排」，保留本地排序结果。
+     */
+    private val reranker: MemoryReranker? = null,
 ) {
     companion object {
         /** 查看自己记忆的指令 */
@@ -192,6 +228,12 @@ class MemoryPipeline(
 
         /** 私人对话线程至少保留的条数（含机器人自己那一半） */
         private const val MIN_PERSON_THREAD_KEEP = 30
+
+        /** 群背景里无论检索结果如何都要保留的最近条数（防止刚说的话被漏掉） */
+        private const val MIN_RECENT_DIGEST = 6
+
+        /** 候选少于这个数就不值得多付一次精排调用 */
+        private const val MIN_RERANK_CANDIDATES = 6
     }
 
     /** 本条消息的记忆上下文（回复前调用）。 */
@@ -239,9 +281,22 @@ class MemoryPipeline(
         // 开启按人设分开记忆时，别人格的 assistant 行不算「你和他的过往」。
         val personaId = scopedPersonaId(message, config)
 
+        // 相关度检索：把“旧但相关”的记忆提到注入列表前面。
+        // 失败或关闭时返回空表，下面两个 merge 会原样保留旧行为。
+        val recalled = recallMemories(cleanText, message, senderId, config, personaId)
+
         val digest =
             if (config.roomContextEnabled) {
-                roomContext.recent(ConversationKeys.room(message), config.roomContextSize, personaId)
+                mergeRoomDigest(
+                    recent =
+                        roomContext.recent(
+                            ConversationKeys.room(message),
+                            config.roomContextSize,
+                            personaId,
+                        ),
+                    hits = recalled[MemoryKind.ROOM].orEmpty(),
+                    config = config,
+                )
             } else {
                 emptyList()
             }
@@ -260,13 +315,16 @@ class MemoryPipeline(
         // 群画像：只有群聊且装了这个群的档案才注入
         val groupDigest = loadGroupDigest(message)
 
-        // 引用关系：把它回复的那条原文找出来（在 200 条群背景里按 id 查）
+        // 引用关系：优先按平台消息 id 直查；索引/直查不可用时再扫最近 200 条。
         val quoted =
             if (config.roomContextEnabled) {
                 message.quotedMessageId?.let { id ->
-                    roomContext.recent(ConversationKeys.room(message), 200, personaId)
-                        .lastOrNull { it.externalId == id }
-                        ?.let { QuotedMessage(senderName = it.senderName, content = it.content) }
+                    val roomKey = ConversationKeys.room(message)
+                    val hit =
+                        roomContext.findByExternalId(roomKey, id)
+                            ?: roomContext.recent(roomKey, 200, personaId)
+                                .lastOrNull { it.externalId == id }
+                    hit?.let { QuotedMessage(senderName = it.senderName, content = it.content) }
                 }
             } else {
                 null
@@ -274,13 +332,131 @@ class MemoryPipeline(
 
         return MemoryContext(
             senderLabel = label,
-            facts = personFacts,
+            facts = mergeFacts(personFacts, recalled[MemoryKind.FACT].orEmpty(), config.searchTopK),
             personalDigest = personalDigest,
             roomDigest = digest,
             group = groupDigest,
             quoted = quoted,
             insult = insult,
         )
+    }
+
+    /**
+     * 相关度检索（任何一步失败都返回空表，调用方自动回退到时间取法）。
+     *
+     * 关闭开关时连查询都不发，省掉数据库与（可选的）辅助 API 开销。
+     */
+    private suspend fun recallMemories(
+        query: String,
+        message: IncomingMessage,
+        senderId: String,
+        config: MemoryConfig,
+        personaId: Long?,
+    ): Map<MemoryKind, List<MemoryCandidate>> {
+        val engine = searcher ?: return emptyMap()
+        if (!config.searchEnabled || query.isBlank()) return emptyMap()
+
+        return runCatching {
+            val raw =
+                engine.recall(
+                    query = query,
+                    scopes =
+                        listOf(
+                            ConversationKeys.room(message),
+                            ConversationKeys.factScope(senderId),
+                        ),
+                    kinds = setOf(MemoryKind.FACT, MemoryKind.ROOM),
+                    // 多取一些再做精排：本地排序只看到打分，模型能看到原文
+                    limit = (config.searchTopK * 6).coerceAtLeast(24),
+                ).filter { it.visibleTo(personaId) }
+
+            val ranked =
+                MemoryRanker.pick(
+                    candidates = raw,
+                    limit = config.auxRankCandidates.coerceAtLeast(config.searchTopK),
+                    nowMillis = clock(),
+                    halfLifeDays = config.searchHalfLifeDays,
+                )
+
+            val ranker = reranker
+            val refined =
+                if (config.auxRankEnabled && ranker != null && ranked.size >= MIN_RERANK_CANDIDATES) {
+                    // 精排失败不算错：本地排序已经是可用的结果
+                    runCatching {
+                        ranker.rerank(query, ranked, config.searchTopK * 2)
+                    }.getOrNull() ?: ranked
+                } else {
+                    ranked
+                }
+
+            refined.groupBy { it.kind }
+        }.getOrDefault(emptyMap())
+    }
+
+    /**
+     * 事实注入顺序：命中的相关事实在前，其余按原顺序（新的在前）补齐。
+     *
+     * 不删除任何原有事实——预算不足时 PromptAssembler 会截断，
+     * 这里只负责把最该被看到的排到前面。
+     */
+    private fun mergeFacts(
+        base: List<UserFact>,
+        hits: List<MemoryCandidate>,
+        relevant: Int,
+    ): List<UserFact> {
+        if (hits.isEmpty()) return base
+        val byId = base.associateBy { it.id }
+        val relevantFacts = hits.take(relevant).mapNotNull { byId[it.refId] }
+        // 用「id + 正文」判断重复：内存实现里 id 可能都是 0，只比 id 会误合并
+        val rest =
+            base.filterNot { fact ->
+                relevantFacts.any { it.id == fact.id && it.text == fact.text }
+            }
+        return relevantFacts.distinctBy { it.text } + rest
+    }
+
+    /**
+     * 群背景注入顺序：最近几条保底 + 检索命中的旧消息，按时间正序输出。
+     *
+     * 保底条数是硬性的——检索再准也不能把「刚刚说的话」挤掉，
+     * 否则模型会答非所问地接着半小时前的话题聊。
+     */
+    private fun mergeRoomDigest(
+        recent: List<RoomMessage>,
+        hits: List<MemoryCandidate>,
+        config: MemoryConfig,
+    ): List<RoomMessage> {
+        if (hits.isEmpty() || recent.isEmpty()) return recent
+
+        val keepRecent = recent.takeLast(MIN_RECENT_DIGEST)
+        val budget = (config.roomContextSize - keepRecent.size).coerceAtLeast(0)
+        if (budget == 0) return recent
+
+        val seen = keepRecent.map { it.id }.toMutableSet()
+        val extra =
+            hits.take(config.searchTopK)
+                .mapNotNull { hit ->
+                    if (hit.role == null) return@mapNotNull null
+                    if (!seen.add(hit.refId)) return@mapNotNull null
+                    RoomMessage(
+                        senderId = hit.senderId,
+                        senderName = hit.senderName,
+                        role = hit.role,
+                        content = hit.text,
+                        timestampMillis = hit.updatedAt,
+                        externalId = hit.externalId,
+                        personaId = hit.personaId,
+                        id = hit.refId,
+                    )
+                }.take(budget)
+
+        return (keepRecent + extra).sortedBy { it.timestampMillis }
+    }
+
+    /** 别人格的 assistant 行不参与本次检索（与 [RoomMessage.visibleTo] 同一规则）。 */
+    private fun MemoryCandidate.visibleTo(personaId: Long?): Boolean {
+        if (personaId == null || role != "assistant" || this.personaId == null) return true
+        return this.personaId == personaId
     }
 
     /**

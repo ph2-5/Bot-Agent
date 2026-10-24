@@ -151,8 +151,9 @@ interface AiHistoryDao {
         MemeEntity::class,
         LoreEntity::class,
         StyleRuleEntity::class,
+        MemoryTermEntity::class,
     ],
-    version = 15,
+    version = 16,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -194,6 +195,8 @@ abstract class AppDatabase : RoomDatabase() {
 
     abstract fun styleRuleDao(): StyleRuleDao
 
+    abstract fun memoryTermDao(): MemoryTermDao
+
     companion object {
         /**
          * 打开一个机器人的数据库。
@@ -223,6 +226,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_12_13,
                     MIGRATION_13_14,
                     MIGRATION_14_15,
+                    MIGRATION_15_16,
                 )
                 .build()
 
@@ -736,6 +740,45 @@ abstract class AppDatabase : RoomDatabase() {
                     )
                     db.execSQL("DROP TABLE `affinities`")
                     db.execSQL("ALTER TABLE `affinities_new` RENAME TO `affinities`")
+                }
+            }
+
+        /**
+         * v15 → v16：记忆倒排索引。
+         *
+         * 索引是派生物：老库升级时只建空表，内容由后台回填任务重建。
+         * 同时给 `room_messages.externalId` 补索引——引用回复的原文
+         * 从「每次扫最近 200 条」改成按 id 直查。
+         */
+        val MIGRATION_15_16 =
+            object : androidx.room.migration.Migration(15, 16) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS `memory_terms` (
+                            `kind` TEXT NOT NULL,
+                            `refId` INTEGER NOT NULL,
+                            `term` TEXT NOT NULL,
+                            `scopeKey` TEXT NOT NULL,
+                            `senderId` TEXT,
+                            `personaId` INTEGER,
+                            `updatedAt` INTEGER NOT NULL,
+                            `importance` INTEGER NOT NULL,
+                            PRIMARY KEY(`kind`, `refId`, `term`))
+                        """.trimIndent(),
+                    )
+                    db.execSQL("CREATE INDEX IF NOT EXISTS `index_memory_terms_term` ON `memory_terms` (`term`)")
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_memory_terms_scopeKey` ON `memory_terms` (`scopeKey`)",
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_memory_terms_kind_refId` " +
+                            "ON `memory_terms` (`kind`, `refId`)",
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_room_messages_externalId` " +
+                            "ON `room_messages` (`externalId`)",
+                    )
                 }
             }
     }

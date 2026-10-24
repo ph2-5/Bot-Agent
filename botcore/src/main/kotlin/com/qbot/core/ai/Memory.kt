@@ -125,6 +125,13 @@ data class RoomMessage(
      * 避免新人格接着旧人格的话茬说；关闭时整列不参与过滤。
      */
     val personaId: Long? = null,
+    /**
+     * 数据库主键（内存实现里为 0）。
+     *
+     * 检索结果要用它回查原文与去重，因此读出来时必须带上；
+     * 新增字段带默认值，旧的构造点无需改动。
+     */
+    val id: Long = 0,
 ) {
     /**
      * 这条记录对某个人格是否可见。
@@ -169,6 +176,17 @@ interface RoomContextStore {
         externalId: String,
         decision: String,
     ) = Unit
+
+    /**
+     * 按平台消息 id 直查一条（引用回复的原文）。
+     *
+     * 默认返回 null，调用方会退回到「扫最近 N 条」的旧实现；
+     * 数据库实现应覆写成带索引的直查，避免每条回复都线性扫一遍。
+     */
+    suspend fun findByExternalId(
+        scopeKey: String,
+        externalId: String,
+    ): RoomMessage? = null
 
     /**
      * 实时观察某个范围的消息（维护端查看群消息用）。
@@ -440,4 +458,12 @@ object ConversationKeys {
         roomKey: String,
         senderId: String,
     ): String = "$roomKey@p:$senderId"
+
+    /**
+     * 某个人事实的索引作用域键。
+     *
+     * 事实表本身没有 scopeKey 列，但索引表要把「关于谁」当成检索范围，
+     * 因此统一约定一个不含歧义的命名空间，避免和群 id 撞车。
+     */
+    fun factScope(senderId: String): String = "f:$senderId"
 }

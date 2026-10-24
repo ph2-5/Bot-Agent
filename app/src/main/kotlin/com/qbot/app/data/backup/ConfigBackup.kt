@@ -64,7 +64,7 @@ data class ConfigBackup(
          * 导入时据此判断备份是否来自更新版本：字段能忽略，但语义不能猜，
          * 所以旧版 App 导入新版备份要明确提示"部分内容未导入"，而不是静默丢掉。
          */
-        const val CURRENT_VERSION = 6
+        const val CURRENT_VERSION = 7
 
         private val json =
             Json {
@@ -98,6 +98,12 @@ data class AiBackup(
     @SerialName("reply_on_error") val replyOnError: String,
     @SerialName("thinking_mode") val thinkingMode: String,
     @SerialName("context_token_budget") val contextTokenBudget: Int,
+    // ---- 2.10.1 新增：记忆精排用的辅助模型（旧备份按默认值导入） ----
+    @SerialName("aux_base_url") val auxBaseUrl: String = "",
+    @SerialName("aux_model") val auxModel: String = "",
+    @SerialName("aux_api_key") val auxApiKey: String = "",
+    @SerialName("aux_timeout_seconds") val auxTimeoutSeconds: Int = 12,
+    @SerialName("aux_max_tokens") val auxMaxTokens: Int = 160,
 )
 
 @Serializable
@@ -114,6 +120,13 @@ data class MemoryBackup(
     @SerialName("personal_thread_size") val personalThreadSize: Int = 12,
     // ---- 2.9.0 新增：按人设分开记忆（旧备份按默认值导入） ----
     @SerialName("persona_scoped") val personaScoped: Boolean = false,
+    // ---- 2.10.1 新增：索引检索与辅助模型精排（旧备份按默认值导入） ----
+    @SerialName("search_enabled") val searchEnabled: Boolean = true,
+    @SerialName("search_top_k") val searchTopK: Int = 8,
+    @SerialName("search_half_life_days") val searchHalfLifeDays: Int = 14,
+    @SerialName("aux_rank_enabled") val auxRankEnabled: Boolean = false,
+    @SerialName("aux_rank_candidates") val auxRankCandidates: Int = 20,
+    @SerialName("advanced_visible") val advancedVisible: Boolean = false,
 )
 
 @Serializable

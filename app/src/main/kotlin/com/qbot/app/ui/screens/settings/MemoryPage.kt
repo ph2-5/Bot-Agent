@@ -94,6 +94,95 @@ fun MemoryPage(onBack: () -> Unit) {
                 onCheckedChange = { update(config.copy(personaScoped = it)) },
                 enabled = config.enabled,
             )
+            SwitchRow(
+                title = "记忆检索",
+                desc = "按当前这句话去索引里找相关的旧记忆，而不是只按时间取最近几条；" +
+                    "关闭后不再建索引（省 IO），行为回到旧版",
+                checked = config.searchEnabled,
+                onCheckedChange = { update(config.copy(searchEnabled = it)) },
+                enabled = config.enabled,
+            )
+            SwitchRow(
+                title = "高级参数",
+                desc = "调整检索条数、时间衰减，以及是否让第二个模型参与精排",
+                checked = config.advancedVisible,
+                onCheckedChange = { update(config.copy(advancedVisible = it)) },
+            )
+            if (config.advancedVisible) {
+                var searchTopK by remember(config.searchTopK) {
+                    mutableFloatStateOf(config.searchTopK.toFloat())
+                }
+                Text(
+                    "每次最多注入 ${searchTopK.toInt()} 条命中记忆",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Slider(
+                    value = searchTopK,
+                    onValueChange = { searchTopK = it },
+                    valueRange = 2f..20f,
+                    steps = 17,
+                    enabled = config.enabled && config.searchEnabled,
+                    onValueChangeFinished = {
+                        update(config.copy(searchTopK = searchTopK.toInt().coerceIn(2, 20)))
+                    },
+                )
+
+                var halfLife by remember(config.searchHalfLifeDays) {
+                    mutableFloatStateOf(config.searchHalfLifeDays.toFloat())
+                }
+                Text(
+                    "时间衰减半衰期 ${halfLife.toInt()} 天（越旧得分越低）",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Slider(
+                    value = halfLife,
+                    onValueChange = { halfLife = it },
+                    valueRange = 3f..60f,
+                    steps = 56,
+                    enabled = config.enabled && config.searchEnabled,
+                    onValueChangeFinished = {
+                        update(
+                            config.copy(
+                                searchHalfLifeDays = halfLife.toInt().coerceIn(3, 60),
+                            ),
+                        )
+                    },
+                )
+
+                SwitchRow(
+                    title = "辅助模型精排",
+                    desc = "把候选记忆交给第二个模型挑相关度；地址留空则沿用主模型",
+                    checked = config.auxRankEnabled,
+                    onCheckedChange = { update(config.copy(auxRankEnabled = it)) },
+                    enabled = config.enabled && config.searchEnabled,
+                )
+
+                var rankCandidates by remember(config.auxRankCandidates) {
+                    mutableFloatStateOf(config.auxRankCandidates.toFloat())
+                }
+                Text(
+                    "精排前候选 ${rankCandidates.toInt()} 条（候选少于 4 条不调用）",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Slider(
+                    value = rankCandidates,
+                    onValueChange = { rankCandidates = it },
+                    valueRange = 6f..60f,
+                    steps = 53,
+                    enabled = config.enabled && config.searchEnabled && config.auxRankEnabled,
+                    onValueChangeFinished = {
+                        update(
+                            config.copy(
+                                auxRankCandidates = rankCandidates.toInt().coerceIn(6, 60),
+                            ),
+                        )
+                    },
+                )
+                HintText(
+                    "辅助模型的地址 / 模型 / Key 在「AI → 模型」页设置；不填则用主模型，限流共享。",
+                    modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+                )
+            }
         }
 
         SectionHeader("容量", "记太多会稀释相关性，记太少又不够用")

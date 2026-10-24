@@ -78,6 +78,17 @@ interface FactDao {
     @Insert
     suspend fun insert(fact: FactEntity): Long
 
+    /** 检索命中后按主键批量取回原文 */
+    @Query("SELECT * FROM facts WHERE id IN (:ids)")
+    suspend fun byIds(ids: List<Long>): List<FactEntity>
+
+    /** 索引回填：按 id 递增分页（不受 updatedAt 重复影响） */
+    @Query("SELECT * FROM facts WHERE id > :afterId ORDER BY id ASC LIMIT :limit")
+    suspend fun after(
+        afterId: Long,
+        limit: Int,
+    ): List<FactEntity>
+
     @Query("DELETE FROM facts WHERE id = :id")
     suspend fun deleteById(id: Long)
 
@@ -121,7 +132,7 @@ interface FactDao {
  */
 @Entity(
     tableName = "room_messages",
-    indices = [Index("scopeKey")],
+    indices = [Index("scopeKey"), Index("externalId")],
 )
 data class RoomMessageEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -180,7 +191,32 @@ interface RoomMessageDao {
     ): kotlinx.coroutines.flow.Flow<List<RoomMessageEntity>>
 
     @Insert
-    suspend fun insert(message: RoomMessageEntity)
+    suspend fun insert(message: RoomMessageEntity): Long
+
+    /** 引用回复：按平台消息 id 直查（externalId 已建索引） */
+    @Query(
+        "SELECT * FROM room_messages WHERE scopeKey = :scopeKey " +
+            "AND externalId = :externalId ORDER BY id DESC LIMIT 1",
+    )
+    suspend fun findByExternalId(
+        scopeKey: String,
+        externalId: String,
+    ): RoomMessageEntity?
+
+    /** 检索命中后按主键批量取回原文 */
+    @Query("SELECT * FROM room_messages WHERE id IN (:ids)")
+    suspend fun byIds(ids: List<Long>): List<RoomMessageEntity>
+
+    /** 索引回填：某个会话内按 id 递增分页 */
+    @Query(
+        "SELECT * FROM room_messages WHERE scopeKey = :scopeKey AND id > :afterId " +
+            "ORDER BY id ASC LIMIT :limit",
+    )
+    suspend fun after(
+        scopeKey: String,
+        afterId: Long,
+        limit: Int,
+    ): List<RoomMessageEntity>
 
     /** 备份导出：最近 [limit] 条（按 id 倒序，调用方自行反转） */
     @Query("SELECT * FROM room_messages ORDER BY id DESC LIMIT :limit")

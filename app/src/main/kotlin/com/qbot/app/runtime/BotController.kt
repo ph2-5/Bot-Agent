@@ -40,6 +40,9 @@ import com.qbot.app.data.repo.RoomGroupStore
 import com.qbot.app.data.repo.RoomIdentityStore
 import com.qbot.app.data.repo.RoomInnerThoughtSink
 import com.qbot.app.data.repo.RoomLoreStore
+import com.qbot.app.data.repo.LlmMemoryReranker
+import com.qbot.app.data.repo.RoomMemoryIndexer
+import com.qbot.app.data.repo.RoomMemorySearcher
 import com.qbot.app.data.repo.RoomSocialStore
 import com.qbot.app.data.repo.RoomStyleRuleStore
 import com.qbot.core.api.DeepSeekSearch
@@ -75,6 +78,7 @@ import com.qbot.core.ai.LlmClient
 import com.qbot.core.ai.MemeHarvester
 import com.qbot.core.ai.MemeImage
 import com.qbot.core.ai.MemoryConfig
+import com.qbot.core.ai.MemoryKind
 import com.qbot.core.ai.MemoryPipeline
 import com.qbot.core.ai.Persona
 import com.qbot.core.ai.PersonaGrowth
@@ -120,6 +124,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -162,6 +167,9 @@ class BotController(
 
         /** 备份里最多带多少条内心戏 */
         private const val BACKUP_INNER_THOUGHTS = 500
+
+        /** 索引回填每批行数：太小事务多，太大会长时间占着数据库 */
+        private const val BACKFILL_BATCH = 200
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -211,11 +219,44 @@ class BotController(
     /** 身份存储，供维护端「备注名 / 忘掉某人」与管线共用。 */
     private val identityStore = RoomIdentityStore(database.identityDao())
 
+    /**
+     * 记忆索引：事实与群消息的中文 bigram 倒排表。
+     *
+     * 开关由「记忆检索」控制：关掉时写入也停（省 IO），
+     * 读取侧会走回「按时间取最近几条」的旧路径。
+     */
+    private val memoryIndexer =
+        RoomMemoryIndexer(
+            dao = database.memoryTermDao(),
+            enabled = { settings.memoryConfig.value.searchEnabled },
+            logger = { logger.d("MemoryIndex", it) },
+        )
+
+    /** 检索器：索引命中后回查原文，交给管线做最终注入。 */
+    private val memorySearcher =
+        RoomMemorySearcher(
+            termDao = database.memoryTermDao(),
+            factDao = database.factDao(),
+            roomDao = database.roomMessageDao(),
+        )
+
+    /** 精排器：只有「辅助模型精排」开关打开时才会被管线调用。 */
+    private val memoryReranker by lazy {
+        LlmMemoryReranker(http = http) {
+            // enabled 跟记忆页的精排开关走：用户只开开关、不填第二套地址也能生效
+            val aux =
+                settings.auxAiConfig.value.copy(
+                    enabled = settings.memoryConfig.value.auxRankEnabled,
+                )
+            settings.aiConfig.value to aux
+        }
+    }
+
     /** 事实存储，供维护端「删除某条记忆」与管线共用。 */
-    private val factStore = RoomFactStore(database.factDao())
+    private val factStore = RoomFactStore(database.factDao(), memoryIndexer)
 
     /** 共享背景存储，与管线共用。 */
-    private val roomContextStore = RoomSharedContextStore(database.roomMessageDao())
+    private val roomContextStore = RoomSharedContextStore(database.roomMessageDao(), memoryIndexer)
 
     /**
      * 群档案存储（机器人进过哪些群、群里见过谁、群名片、主动消息权限）。
@@ -254,6 +295,9 @@ class BotController(
             botNameProvider = { runtime?.botName?.takeIf { it.isNotBlank() } },
             // 「忘掉 X」同时清掉这个人设下与 X 相关的设定，避免下一轮又被注入
             loreStore = loreStore,
+            // 检索层：索引关闭 / 未就绪时管线内部自动退回旧路径
+            searcher = memorySearcher,
+            reranker = memoryReranker,
         )
 
     /**
@@ -883,6 +927,15 @@ class BotController(
             runCatching { memoryPipeline.trimAll() }
         }
 
+        // 索引回填：打开「记忆检索」时，把还没有索引的历史事实与群消息补上。
+        // 只在开关从关变开（含首次启动即为开）时跑一次，索引是派生物，不阻塞回复。
+        scope.launch {
+            settings.memoryConfig
+                .map { it.searchEnabled }
+                .distinctUntilChanged()
+                .collect { enabled -> if (enabled) runCatching { backfillMemoryIndex() } }
+        }
+
         // 启动时收敛训练数据：决策日志 7 天 / 2000 条，经验库 40 条
         scope.launch {
             val before = System.currentTimeMillis() - CHIME_RETENTION_DAYS * 24 * 3600 * 1000
@@ -899,6 +952,42 @@ class BotController(
             }
         }
 
+    }
+
+    /**
+     * 索引回填：把还没进索引的历史事实与群消息补上。
+     *
+     * 游标取自索引表里的最大 refId——索引关闭期间只写业务表不写索引，
+     * 因此重启/重新打开后从游标往后补即可，不会重扫全部历史。
+     * 单行索引写入失败只会漏掉那一条，下次回填仍会覆盖（主键 REPLACE 幂等）。
+     */
+    private suspend fun backfillMemoryIndex() {
+        val termDao = database.memoryTermDao()
+
+        var factCursor = termDao.maxRefId(MemoryKind.FACT.name) ?: 0L
+        while (true) {
+            val batch = database.factDao().after(factCursor, BACKFILL_BATCH)
+            if (batch.isEmpty()) break
+            memoryIndexer.indexFactsBatch(batch)
+            factCursor = batch.last().id
+            if (batch.size < BACKFILL_BATCH) break
+        }
+
+        val roomCursor = termDao.maxRefId(MemoryKind.ROOM.name) ?: 0L
+        val roomDao = database.roomMessageDao()
+        val scopes = roomDao.allScopes()
+        scopes.forEach { scope ->
+            var cursor = roomCursor
+            while (true) {
+                val batch = roomDao.after(scope, cursor, BACKFILL_BATCH)
+                if (batch.isEmpty()) break
+                memoryIndexer.indexRoomBatch(scope, batch)
+                cursor = batch.last().id
+                if (batch.size < BACKFILL_BATCH) break
+            }
+        }
+        // 顺带清掉上次退出时 trim 遗留下来的孤儿索引
+        scopes.forEach { runCatching { memoryIndexer.pruneRoom(it) } }
     }
 
     /** 保证成长轮询在跑；重复调用是幂等的。 */
@@ -1335,6 +1424,11 @@ class BotController(
                         replyOnError = ai.replyOnError,
                         thinkingMode = ai.thinkingMode.name,
                         contextTokenBudget = ai.contextTokenBudget,
+                        auxBaseUrl = settings.auxAiConfig.value.baseUrl,
+                        auxModel = settings.auxAiConfig.value.model,
+                        auxApiKey = settings.auxAiConfig.value.apiKey,
+                        auxTimeoutSeconds = settings.auxAiConfig.value.timeoutSeconds.toInt(),
+                        auxMaxTokens = settings.auxAiConfig.value.maxTokens,
                     ),
                 memory =
                     MemoryBackup(
@@ -1348,6 +1442,12 @@ class BotController(
                         personalThreadEnabled = memory.personalThreadEnabled,
                         personalThreadSize = memory.personalThreadSize,
                         personaScoped = memory.personaScoped,
+                        searchEnabled = memory.searchEnabled,
+                        searchTopK = memory.searchTopK,
+                        searchHalfLifeDays = memory.searchHalfLifeDays,
+                        auxRankEnabled = memory.auxRankEnabled,
+                        auxRankCandidates = memory.auxRankCandidates,
+                        advancedVisible = memory.advancedVisible,
                     ),
                 greeting = GreetingBackup(enabled = greeting.enabled, text = greeting.text),
                 chitchat =
@@ -1603,6 +1703,16 @@ class BotController(
                     contextTokenBudget = dto.contextTokenBudget,
                 ),
             )
+            // 辅助模型单独一套配置：旧备份里没有这几项，导入后保持本机现值
+            settings.saveAuxAiConfig(
+                settings.auxAiConfig.value.copy(
+                    baseUrl = dto.auxBaseUrl,
+                    model = dto.auxModel,
+                    apiKey = dto.auxApiKey,
+                    timeoutSeconds = dto.auxTimeoutSeconds.toLong().coerceIn(5L, 120L),
+                    maxTokens = dto.auxMaxTokens.coerceIn(32, 2000),
+                ),
+            )
             applied++
         }
 
@@ -1619,6 +1729,12 @@ class BotController(
                     personalThreadEnabled = it.personalThreadEnabled,
                     personalThreadSize = it.personalThreadSize,
                     personaScoped = it.personaScoped,
+                    searchEnabled = it.searchEnabled,
+                    searchTopK = it.searchTopK,
+                    searchHalfLifeDays = it.searchHalfLifeDays,
+                    auxRankEnabled = it.auxRankEnabled,
+                    auxRankCandidates = it.auxRankCandidates,
+                    advancedVisible = it.advancedVisible,
                 ),
             )
             applied++
@@ -1928,6 +2044,11 @@ class BotController(
                 }
             }
             if (messageCount > 0) applied++
+        }
+
+        // 导入的行是新 id，落在索引游标之后：补一次回填，否则新导入的记忆搜不到
+        if (factCount > 0 || messageCount > 0) {
+            runCatching { backfillMemoryIndex() }
         }
 
         var thoughtCount = 0

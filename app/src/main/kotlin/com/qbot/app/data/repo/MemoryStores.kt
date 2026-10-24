@@ -6,11 +6,13 @@ import com.qbot.app.data.db.IdentityDao
 import com.qbot.app.data.db.IdentityEntity
 import com.qbot.app.data.db.RoomMessageDao
 import com.qbot.app.data.db.RoomMessageEntity
+import com.qbot.core.ai.ConversationKeys
 import com.qbot.core.ai.FactKind
 import com.qbot.core.ai.FactSource
 import com.qbot.core.ai.IdentityEntry
 import com.qbot.core.ai.IdentityStore
 import com.qbot.core.ai.KnownPerson
+import com.qbot.core.ai.MemoryKind
 import com.qbot.core.ai.MemoryStore
 import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.RoomContextStore
@@ -87,27 +89,34 @@ class RoomIdentityStore(
 /** 基于 Room 的长期事实存储。 */
 class RoomFactStore(
     private val dao: FactDao,
+    /** 索引写入（可选）：为 null 时不建索引，行为与旧版一致 */
+    private val indexer: RoomMemoryIndexer? = null,
 ) : MemoryStore {
     override suspend fun facts(senderId: String): List<UserFact> =
         dao.forSender(senderId).map { it.toFact() }
 
-    override suspend fun add(fact: UserFact): Long =
-        dao.insert(
+    override suspend fun add(fact: UserFact): Long {
+        val entity =
             FactEntity(
                 senderId = fact.senderId,
                 text = fact.text,
                 kind = fact.kind.name,
                 source = fact.source.name,
                 updatedAt = fact.updatedAt,
-            ),
-        )
+            )
+        val id = dao.insert(entity)
+        indexer?.indexFact(entity.copy(id = id))
+        return id
+    }
 
     override suspend fun delete(factId: Long) {
         dao.deleteById(factId)
+        indexer?.forgetFact(factId)
     }
 
     override suspend fun deleteAll(senderId: String) {
         dao.deleteAllForSender(senderId)
+        indexer?.clearScope(ConversationKeys.factScope(senderId), MemoryKind.FACT)
     }
 
     override suspend fun trimTo(
@@ -115,12 +124,14 @@ class RoomFactStore(
         keep: Int,
     ) {
         dao.trimTo(senderId, keep)
+        indexer?.pruneFacts(senderId)
     }
 
     override suspend fun trimAll(keep: Int) {
         // 逐个发送者收敛：老版本 SQLite 没有窗口函数，拆成循环最稳妥
         dao.allSenders().forEach { sender ->
             dao.trimTo(sender, keep)
+            indexer?.pruneFacts(sender)
         }
     }
 
@@ -144,6 +155,8 @@ class RoomFactStore(
  */
 class RoomSharedContextStore(
     private val dao: RoomMessageDao,
+    /** 索引写入（可选）：为 null 时不建索引，行为与旧版一致 */
+    private val indexer: RoomMemoryIndexer? = null,
 ) : RoomContextStore {
     override suspend fun recent(
         scopeKey: String,
@@ -160,7 +173,7 @@ class RoomSharedContextStore(
         scopeKey: String,
         message: RoomMessage,
     ) {
-        dao.insert(
+        val entity =
             RoomMessageEntity(
                 scopeKey = scopeKey,
                 senderId = message.senderId,
@@ -172,8 +185,9 @@ class RoomSharedContextStore(
                 externalId = message.externalId,
                 decision = message.decision,
                 personaId = message.personaId,
-            ),
-        )
+            )
+        val id = dao.insert(entity)
+        indexer?.indexRoomMessage(scopeKey, entity.copy(id = id))
     }
 
     override suspend fun trim(
@@ -181,7 +195,14 @@ class RoomSharedContextStore(
         keep: Int,
     ) {
         dao.trim(scopeKey, keep)
+        // 裁掉的老消息对应的索引条目一并清掉，否则检索会命中不存在的行
+        indexer?.pruneRoom(scopeKey)
     }
+
+    override suspend fun findByExternalId(
+        scopeKey: String,
+        externalId: String,
+    ): RoomMessage? = dao.findByExternalId(scopeKey, externalId)?.toRoomMessage()
 
     override suspend fun updateDecision(
         scopeKey: String,
@@ -211,5 +232,6 @@ class RoomSharedContextStore(
             externalId = externalId,
             decision = decision,
             personaId = personaId,
+            id = id,
         )
 }
