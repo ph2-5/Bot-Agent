@@ -49,6 +49,10 @@ data class BotMoodEntity(
     val value: Int = 50,
     val updatedAt: Long = 0,
     val reason: String? = null,
+    /** 最后一次开口时间（自主开口的"刚说完"判定用）；null 表示还没说过 */
+    val lastSpokeAt: Long? = null,
+    /** 连续忍住没说的次数：吃相太急时用来降速 */
+    val suppressedCount: Int = 0,
 )
 
 /**

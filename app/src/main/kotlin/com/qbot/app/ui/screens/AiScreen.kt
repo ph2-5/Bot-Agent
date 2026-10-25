@@ -51,6 +51,7 @@ import androidx.compose.ui.unit.dp
 import com.qbot.app.BotApplication
 import com.qbot.app.data.repo.GroupSummary
 import com.qbot.app.data.repo.observeSummaries
+import com.qbot.core.ai.AutonomyMode
 import com.qbot.core.ai.KnownPerson
 import com.qbot.core.ai.NameSource
 import com.qbot.core.ai.Persona
@@ -1335,6 +1336,9 @@ private fun GroupTab() {
 
     val gatewayStatus by controller.status.collectAsState()
     val summaries by groupStore.observeSummaries().collectAsState(initial = emptyList())
+    // 按群覆盖的自主档位：只存"单独设过"的群，没存过的回落全局
+    val groupBehaviors by controller.observeGroupBehaviors().collectAsState(initial = emptyMap())
+    val globalAutonomy by controller.autonomyConfig.collectAsState()
 
     var expandedGroup by remember { mutableStateOf<String?>(null) }
     var members by remember { mutableStateOf<List<MemberSample>>(emptyList()) }
@@ -1411,6 +1415,18 @@ private fun GroupTab() {
                     scope.launch { groupStore.delete(group.groupId) }
                 },
                 onShowMessages = { messagesGroup = group },
+                // null = 跟随全局；其余为按群覆盖
+                autonomyMode = groupBehaviors[group.groupId],
+                globalAutonomyMode = globalAutonomy.mode,
+                onAutonomyChange = { mode ->
+                    scope.launch {
+                        if (mode == null) {
+                            controller.clearGroupAutonomy(group.groupId)
+                        } else {
+                            controller.setGroupAutonomy(group.groupId, mode.name)
+                        }
+                    }
+                },
             )
         }
 
@@ -1652,6 +1668,9 @@ private fun GroupCard(
     onRename: () -> Unit,
     onDelete: () -> Unit,
     onShowMessages: () -> Unit = {},
+    autonomyMode: String? = null,
+    globalAutonomyMode: AutonomyMode = AutonomyMode.PASSIVE,
+    onAutonomyChange: (AutonomyMode?) -> Unit = {},
 ) {
     val timeFormat = remember { SimpleDateFormat("MM-dd HH:mm", Locale.CHINA) }
     Card(
@@ -1698,6 +1717,37 @@ private fun GroupCard(
             }
 
             if (expanded) {
+                Spacer(Modifier.height(8.dp))
+
+                // 此群行为：默认跟随全局，也可以单独压成静音或放开成自主
+                val overrideMode = autonomyMode?.let { AutonomyMode.parse(it) }
+                Text(
+                    "此群开口档位（全局：${globalAutonomyMode.label()}）",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilterChip(
+                        selected = overrideMode == null,
+                        onClick = { onAutonomyChange(null) },
+                        label = { Text("跟随全局") },
+                    )
+                    AutonomyMode.entries.forEach { mode ->
+                        FilterChip(
+                            selected = overrideMode == mode,
+                            onClick = { onAutonomyChange(mode) },
+                            label = { Text(mode.label()) },
+                        )
+                    }
+                }
+                Text(
+                    if (overrideMode == null) {
+                        "没单独设过：改全局默认时这个群会跟着变。"
+                    } else {
+                        "已单独设为 ${overrideMode.label()}；其余群不受影响。"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 Spacer(Modifier.height(8.dp))
                 if (members.isEmpty()) {
                     Text(
@@ -1815,3 +1865,11 @@ private fun EmptyHint(
         }
     }
 }
+
+/** 三档模式的中文名。 */
+private fun AutonomyMode.label(): String =
+    when (this) {
+        AutonomyMode.OFF -> "纯响应"
+        AutonomyMode.PASSIVE -> "被动参与"
+        AutonomyMode.ACTIVE -> "自主"
+    }

@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
@@ -45,6 +46,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.qbot.app.BotApplication
 import com.qbot.app.data.repo.observeSummaries
+import com.qbot.core.ai.AutonomousRecord
 import com.qbot.core.ai.ChimeDecision
 import com.qbot.core.ai.ChimeDecisionRecord
 import com.qbot.core.ai.ChimeLesson
@@ -94,7 +96,9 @@ fun ChimeReviewScreen() {
     val lessons by controller.observeChimeLessons().collectAsState(initial = emptyList())
     val chitchat by controller.chitchatConfig.collectAsState()
     val thoughts by controller.observeInnerThoughts(30).collectAsState(initial = emptyList())
+    val autonomous by controller.observeAutonomousDecisions(30).collectAsState(initial = emptyList())
     var showThoughts by rememberSaveable { mutableStateOf(false) }
+    var showAutonomy by rememberSaveable { mutableStateOf(false) }
 
     // 反馈落库后 Flow 会重发，统计随之刷新
     LaunchedEffect(decisions, lessons) {
@@ -158,6 +162,37 @@ fun ChimeReviewScreen() {
                     ThoughtCard(
                         thought = thought,
                         groupName = thought.groupId?.let { groupNames[it] } ?: "单聊",
+                    )
+                }
+            }
+        }
+
+        item(key = "autonomy-header") {
+            AutonomyHeader(
+                count = autonomous.size,
+                expanded = showAutonomy,
+                onToggle = { showAutonomy = !showAutonomy },
+            )
+        }
+
+        if (showAutonomy) {
+            if (autonomous.isEmpty()) {
+                item(key = "autonomy-empty") {
+                    Text(
+                        "还没有记录。把「设置 → 记忆系统 → 自主开口」调到「自主」后，" +
+                            "每次它想开口又忍住（或真的说了）都会记一条。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                itemsIndexed(
+                    autonomous,
+                    key = { index, item -> "autonomy-${item.createdAt}-$index" },
+                ) { _, record ->
+                    AutonomousDecisionCard(
+                        record = record,
+                        groupName = groupNames[record.groupId] ?: "群",
                     )
                 }
             }
@@ -482,6 +517,96 @@ private fun ThoughtCard(thought: InnerThought, groupName: String) {
                 "嘴上：${thought.spoken}",
                 style = MaterialTheme.typography.bodyMedium,
             )
+        }
+    }
+}
+
+/** 自主决策入口：和内心戏一样默认收起，只在调阈值时才需要看。 */
+@Composable
+private fun AutonomyHeader(
+    count: Int,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onToggle),
+        colors =
+            CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            ),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "自主开口",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    "$count 条",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    if (expanded) "收起" else "展开",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+            Text(
+                "它自己想接一句时的记录：分数过线才可能开口，过线后还要经一次便宜模型判定。" +
+                    "这里只看不参与，用来判断阈值该调高还是调低。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/** 一条自主决策：说了还是忍了、多少分、为什么。 */
+@Composable
+private fun AutonomousDecisionCard(record: AutonomousRecord, groupName: String) {
+    val timeFormat = remember { SimpleDateFormat("MM-dd HH:mm", Locale.CHINA) }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (record.spoken) "说了" else "忍住",
+                    style = MaterialTheme.typography.labelMedium,
+                    color =
+                        if (record.spoken) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "$groupName · 分数 ${"%.2f".format(Locale.US, record.score)} · " +
+                        timeFormat.format(Date(record.createdAt)),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            record.reason?.takeIf { it.isNotBlank() }?.let { reason ->
+                Text(reason, style = MaterialTheme.typography.bodySmall)
+            }
+            record.fingerprint?.takeIf { it.isNotBlank() }?.let { fingerprint ->
+                Text(
+                    "话题指纹：$fingerprint",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }

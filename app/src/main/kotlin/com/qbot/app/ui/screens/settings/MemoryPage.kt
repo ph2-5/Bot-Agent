@@ -1,9 +1,14 @@
 package com.qbot.app.ui.screens.settings
 
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -12,11 +17,14 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.padding
 import com.qbot.app.BotApplication
+import com.qbot.core.ai.AutonomyMode
+import com.qbot.core.ai.DriveSensitivity
 import com.qbot.core.ai.MemoryConfig
 
 @Composable
@@ -24,6 +32,7 @@ fun MemoryPage(onBack: () -> Unit) {
     val context = LocalContext.current
     val app = context.applicationContext as BotApplication
     val config by app.controller.memoryConfig.collectAsState()
+    val autonomy by app.controller.autonomyConfig.collectAsState()
 
     var peopleCount by remember { mutableStateOf(0) }
     var factCount by remember { mutableStateOf(0) }
@@ -245,6 +254,92 @@ fun MemoryPage(onBack: () -> Unit) {
             )
         }
 
+        SectionHeader("自主开口", "由情绪、关系和话题决定它要不要插一句，而不只看有没有人叫它")
+        SettingsCard {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                AutonomyMode.entries.forEach { mode ->
+                    FilterChip(
+                        selected = autonomy.mode == mode,
+                        onClick = { app.settings.saveAutonomyConfig(autonomy.copy(mode = mode)) },
+                        label = { Text(mode.label()) },
+                    )
+                }
+            }
+            HintText(
+                when (autonomy.mode) {
+                    AutonomyMode.OFF ->
+                        "只在被 @ / 叫名字 / 明确对话时回复，连轻度插话也停止。"
+                    AutonomyMode.PASSIVE ->
+                        "被叫必回 + 群里有明确话题时轻度插话。这是默认档，与升级前的行为一致。"
+                    AutonomyMode.ACTIVE ->
+                        "在被动参与之上，会自己在群里偶尔接一句；仍走引用回复，不消耗主动消息额度。"
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+            )
+            if (autonomy.mode == AutonomyMode.ACTIVE) {
+                var quiet by remember(autonomy.quietHours) { mutableStateOf(autonomy.quietHours) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = quiet,
+                        onValueChange = { quiet = it },
+                        label = { Text("安静时段（HH:mm-HH:mm，跨零点）") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f).padding(top = 8.dp),
+                    )
+                    TextButton(
+                        onClick = {
+                            app.settings.saveAutonomyConfig(autonomy.copy(quietHours = quiet.trim()))
+                        },
+                        enabled = quiet.trim() != autonomy.quietHours,
+                    ) { Text("保存") }
+                }
+                HintText(
+                    "此区间内只忍不说；留空表示不限。",
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
+                var perHour by remember(autonomy.maxSpeaksPerHour) {
+                    mutableFloatStateOf(autonomy.maxSpeaksPerHour.toFloat())
+                }
+                Text(
+                    "每群每小时最多开口 ${perHour.toInt()} 次（0 表示不限制）",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Slider(
+                    value = perHour,
+                    onValueChange = { perHour = it },
+                    valueRange = 0f..6f,
+                    steps = 5,
+                    onValueChangeFinished = {
+                        app.settings.saveAutonomyConfig(
+                            autonomy.copy(maxSpeaksPerHour = perHour.toInt().coerceIn(0, 6)),
+                        )
+                    },
+                )
+
+                Text("开口阈值（越高越挑剔）", style = MaterialTheme.typography.labelMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    DriveSensitivity.entries.forEach { sensitivity ->
+                        FilterChip(
+                            selected =
+                                DriveSensitivity.fromThreshold(autonomy.threshold) == sensitivity,
+                            onClick = {
+                                app.settings.saveAutonomyConfig(
+                                    autonomy.copy(threshold = sensitivity.threshold),
+                                )
+                            },
+                            label = { Text(sensitivity.label()) },
+                        )
+                    }
+                }
+                HintText(
+                    "阈值低更容易被话题勾住。每条自主决策的分数与理由在「AI → 接话」里可查，" +
+                        "觉得太吵就调高、太闷就调低。",
+                    modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+                )
+            }
+        }
+
         SectionHeader("存量", "查看与删除具体记忆在「AI → 记忆」")
         SettingsCard {
             Text(
@@ -259,3 +354,18 @@ fun MemoryPage(onBack: () -> Unit) {
         }
     }
 }
+
+/** 档位在人话里的名字；与 `AiScreen` 里的按群覆盖保持同一套措辞。 */
+private fun AutonomyMode.label(): String =
+    when (this) {
+        AutonomyMode.OFF -> "纯响应"
+        AutonomyMode.PASSIVE -> "被动参与"
+        AutonomyMode.ACTIVE -> "自主"
+    }
+
+private fun DriveSensitivity.label(): String =
+    when (this) {
+        DriveSensitivity.LOW -> "挑剔"
+        DriveSensitivity.MEDIUM -> "标准"
+        DriveSensitivity.HIGH -> "活跃"
+    }

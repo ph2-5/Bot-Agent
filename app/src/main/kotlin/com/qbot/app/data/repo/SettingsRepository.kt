@@ -14,9 +14,12 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
+import com.qbot.core.ai.AutonomyMode
 import com.qbot.core.ai.AuxAiConfig
 import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChitchatConfig
+import com.qbot.core.ai.DriveConfig
+import com.qbot.core.ai.DriveSensitivity
 import com.qbot.core.ai.MemoryConfig
 import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.ThinkingMode
@@ -181,6 +184,16 @@ class SettingsRepository(
         val CHITCHAT_MAX_INJECTED = intPreferencesKey("chitchat_max_injected")
         val CHITCHAT_JUDGE_CONTEXT = intPreferencesKey("chitchat_judge_context")
 
+        // ---------- 自主开口 ----------
+        /** OFF / PASSIVE / ACTIVE；缺省即 PASSIVE（老用户升级零变化） */
+        val AUTONOMY_MODE = stringPreferencesKey("autonomy_mode")
+        /** 安静时段，如 23:00-08:00 */
+        val AUTONOMY_QUIET_HOURS = stringPreferencesKey("autonomy_quiet_hours")
+        /** ACTIVE 档每群每小时最多开口次数 */
+        val AUTONOMY_MAX_PER_HOUR = intPreferencesKey("autonomy_max_per_hour")
+        /** 高级项：ACTIVE 档的开口阈值 */
+        val AUTONOMY_THRESHOLD = floatPreferencesKey("autonomy_threshold")
+
         // ---- 人格（2.3.0） ----
         val PERSONA_LEGACY_IMPORTED = booleanPreferencesKey("persona_legacy_imported")
     }
@@ -291,6 +304,15 @@ class SettingsRepository(
     private val _chitchatConfig = MutableStateFlow(ChitchatConfig())
     val chitchatConfig: StateFlow<ChitchatConfig> = _chitchatConfig.asStateFlow()
 
+    /**
+     * 自主开口配置（全局默认档）。
+     *
+     * 默认 PASSIVE：老用户升级后行为与 2.11.x 完全一致，
+     * 不会"升级完突然开始自己说话"。按群覆盖走 `group_behavior` 表。
+     */
+    private val _autonomyConfig = MutableStateFlow(DriveConfig())
+    val autonomyConfig: StateFlow<DriveConfig> = _autonomyConfig.asStateFlow()
+
     init {
         // DataStore 的变更合并进 StateFlow；加密偏好里的 apiKey 每次重新读，
         // 保证用户在设置页改完 Key 后保存即可生效。
@@ -301,6 +323,7 @@ class SettingsRepository(
                 _memoryConfig.value = readMemoryConfig(prefs)
                 _greetingConfig.value = readGreetingConfig(prefs)
                 _chitchatConfig.value = readChitchatConfig(prefs)
+                _autonomyConfig.value = readAutonomyConfig(prefs)
             }
         }
     }
@@ -515,6 +538,38 @@ class SettingsRepository(
                         config.MIN_JUDGE_CONTEXT,
                         config.MAX_JUDGE_CONTEXT,
                     )
+            }
+        }
+    }
+
+    private fun readAutonomyConfig(prefs: Preferences): DriveConfig {
+        val defaults = DriveConfig()
+        val rawThreshold = prefs[Keys.AUTONOMY_THRESHOLD]
+        return DriveConfig(
+            // 没存过就是 PASSIVE：老用户升级后行为零变化
+            mode = AutonomyMode.parse(prefs[Keys.AUTONOMY_MODE]),
+            // 阈值只可能是档位值（0.45 / 0.62 / 0.75）；高级用户存了别的数就按最近的档位取，
+            // 避免界面上三个档位与实际分数对不上
+            threshold =
+                rawThreshold
+                    ?.takeIf { it.isFinite() && it > 0f && it < 1f }
+                    ?.let { DriveSensitivity.fromThreshold(it.toDouble()).threshold }
+                    ?: defaults.threshold,
+            quietHours = prefs[Keys.AUTONOMY_QUIET_HOURS] ?: defaults.quietHours,
+            maxSpeaksPerHour =
+                (prefs[Keys.AUTONOMY_MAX_PER_HOUR] ?: defaults.maxSpeaksPerHour).coerceIn(0, 12),
+        )
+    }
+
+    /** 保存自主开口配置（全局默认档；按群覆盖走 group_behavior 表）。 */
+    fun saveAutonomyConfig(config: DriveConfig) {
+        _autonomyConfig.value = config
+        scope.launch {
+            dataStore.edit { prefs ->
+                prefs[Keys.AUTONOMY_MODE] = config.mode.name
+                prefs[Keys.AUTONOMY_QUIET_HOURS] = config.quietHours.trim()
+                prefs[Keys.AUTONOMY_MAX_PER_HOUR] = config.maxSpeaksPerHour.coerceIn(0, 12)
+                prefs[Keys.AUTONOMY_THRESHOLD] = config.threshold.toFloat()
             }
         }
     }

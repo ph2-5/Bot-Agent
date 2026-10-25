@@ -152,8 +152,10 @@ interface AiHistoryDao {
         LoreEntity::class,
         StyleRuleEntity::class,
         MemoryTermEntity::class,
+        AutonomousDecisionEntity::class,
+        GroupBehaviorEntity::class,
     ],
-    version = 17,
+    version = 18,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -197,6 +199,10 @@ abstract class AppDatabase : RoomDatabase() {
 
     abstract fun memoryTermDao(): MemoryTermDao
 
+    abstract fun autonomousDecisionDao(): AutonomousDecisionDao
+
+    abstract fun groupBehaviorDao(): GroupBehaviorDao
+
     companion object {
         /**
          * 打开一个机器人的数据库。
@@ -228,6 +234,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_14_15,
                     MIGRATION_15_16,
                     MIGRATION_16_17,
+                    MIGRATION_17_18,
                 )
                 .build()
 
@@ -793,6 +800,56 @@ abstract class AppDatabase : RoomDatabase() {
             object : androidx.room.migration.Migration(16, 17) {
                 override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
                     db.execSQL("ALTER TABLE `meme_images` ADD COLUMN `path` TEXT")
+                }
+            }
+
+        /**
+         * v17 → v18：自主开口。
+         *
+         * 三件事：
+         * 1. `bot_mood` 加两列（最后开口时间 / 连续忍住次数）——情绪与"忍住"是同一份状态，
+         *    不另建表；
+         * 2. 新建 `autonomous_decisions`：SPOKEN 与 HELD 都记，调阈值要看"本来想说但忍住了"；
+         * 3. 新建 `group_behavior`：按群覆盖全局档位。
+         *
+         * 两列都带默认值/可空，老库直接升级，不需要回填。
+         */
+        val MIGRATION_17_18 =
+            object : androidx.room.migration.Migration(17, 18) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL("ALTER TABLE `bot_mood` ADD COLUMN `lastSpokeAt` INTEGER")
+                    db.execSQL(
+                        "ALTER TABLE `bot_mood` ADD COLUMN `suppressedCount` INTEGER NOT NULL DEFAULT 0",
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS `autonomous_decisions` (
+                            `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            `groupId` TEXT NOT NULL,
+                            `personaId` INTEGER,
+                            `score` REAL NOT NULL,
+                            `outcome` TEXT NOT NULL,
+                            `reason` TEXT,
+                            `fingerprint` TEXT,
+                            `createdAt` INTEGER NOT NULL)
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_autonomous_decisions_groupId` " +
+                            "ON `autonomous_decisions` (`groupId`)",
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_autonomous_decisions_fingerprint` " +
+                            "ON `autonomous_decisions` (`fingerprint`)",
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS `group_behavior` (
+                            `groupId` TEXT NOT NULL PRIMARY KEY,
+                            `autonomyMode` TEXT NOT NULL,
+                            `updatedAt` INTEGER NOT NULL)
+                        """.trimIndent(),
+                    )
                 }
             }
     }

@@ -192,6 +192,13 @@ class BotRuntime(
     private val insultDetector: InsultDetector = InsultDetector(),
     /** 概率源，测试里可注入固定值 */
     private val random: () -> Double = { kotlin.random.Random.nextDouble() },
+    /**
+     * 一条群消息处理完（无论回没回）之后的回调。
+     *
+     * 自主开口调度器用它做「消息后顺带评估」的触发点：内部应该延迟
+     * 20~40 秒再评估，不要在这里做任何耗时操作——它跑在消息协程的收尾。
+     */
+    private val onGroupMessageHandled: ((String) -> Unit)? = null,
 ) : SimpleGatewayListener() {
     companion object {
         private const val TAG = "Runtime"
@@ -221,6 +228,14 @@ class BotRuntime(
     private val seenMessageIds = ArrayDeque<String>()
     private val seenMessageIdSet = HashSet<String>()
     private val seenLock = Any()
+
+    /**
+     * 本群最近一次开口时间（chime 与自主共用）。
+     *
+     * 调度器据此避免「chime 刚回完，自主又接一句」——两条链路抢答
+     * 是自主式最容易被群友骂的地方。
+     */
+    private val spokeAtMillis = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     /** 启动运行时。会同时拉起网关连接。 */
     fun start() {
@@ -255,7 +270,22 @@ class BotRuntime(
 
         // 整条处理链放进协程：身份解析与记忆装载都是挂起函数（要查库），
         // 网关回调线程必须尽快返回，否则会堵塞后续事件读取。
-        scope.launch { processMessage(message, text) }
+        scope.launch {
+            try {
+                processMessage(message, text)
+            } finally {
+                // 自主开口的触发点：不管这条回没回，群里刚有过对话，
+                // 就有"想一想要不要接一句"的素材。回调本身必须轻量。
+                if (message.kind == MessageKind.GROUP_MESSAGE ||
+                    message.kind == MessageKind.GROUP_AT ||
+                    message.kind == MessageKind.GUILD
+                ) {
+                    message.targetId?.takeIf { it.isNotBlank() }?.let { groupId ->
+                        runCatching { onGroupMessageHandled?.invoke(groupId) }
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -679,6 +709,7 @@ class BotRuntime(
                 // 内心戏：说出口的已经发出去了，没说出口的落在这里
                 recordThought(message, answer)
                 chitchatPolicy.markSpoke(groupId)
+                spokeAtMillis[groupId] = System.currentTimeMillis()
                 // 机器人这条已由 sendReply 统一写入群上下文
                 pipeline.markChitchatDecision(message, "已接话（$why）")
                 action = ChimeDecisionRecord.ACTION_SPOKE
@@ -1208,6 +1239,85 @@ class BotRuntime(
             false
         }
     }
+
+    /** 本群最近一次开口时间；没说过返回 null。 */
+    fun lastSpokeAtMillis(groupId: String): Long? = spokeAtMillis[groupId]
+
+    /**
+     * 自主开口：由调度器判定「想说」之后调用。
+     *
+     * 全链路走**引用回复**（`replyMessageId` = 最近一条群消息的 msg_id）：
+     * 在群友看来是它自己接了一句，在平台看来是回复已有消息，
+     * 因此不消耗主动消息额度。
+     *
+     * 第一批不做「群里完全安静时主动发起」——那种用法要主动消息配额，
+     * 需要单独的产品决策，见下方的 TODO。
+     *
+     * @return 是否真的发出去了
+     */
+    suspend fun autonomousSpeak(
+        groupId: String,
+        anchor: RoomMessage,
+        recent: List<RoomMessage>,
+        thoughts: List<String> = emptyList(),
+        topic: String? = null,
+    ): Boolean {
+        val aiConfig = aiConfigProvider?.invoke() ?: return false
+        if (!aiConfig.enabled || !aiConfig.isReady) return false
+        if (aiConfig.mode == AiMode.COMMAND_ONLY) return false
+        val responder = aiResponder ?: return false
+        // 没有可引用的消息 id 就不开口：第一批只在"接着聊"的场景说话
+        val quoteId = anchor.externalId?.takeIf { it.isNotBlank() } ?: return false
+
+        val proxy = incomingForAutonomy(groupId, anchor, quoteId)
+        val personaPrompt = runCatching { personaPromptProvider?.invoke(proxy) }.getOrNull()
+        val memory = runCatching { buildMemory(proxy, anchor.content, null) }.getOrNull()
+        val answer =
+            runCatching {
+                responder.speakOnOwn(
+                    recent = recent,
+                    thoughts = thoughts,
+                    topic = topic,
+                    config = aiConfig,
+                    personaPrompt = personaPrompt,
+                    memory = memory,
+                )
+            }.onFailure {
+                log(LogLevel.WARN, TAG, "自主开口生成失败：${it.message}")
+            }.getOrNull() ?: return false
+
+        // TODO(proactiveSend)：群里超过 5 分钟没人说话且 drive 极高时，
+        //  这里改走真正主动消息 api.sendGroupMessage(groupId, ...) ——会消耗主动消息配额。
+
+        sendReply(proxy, answer.content, answer.memeUrl)
+        spokeAtMillis[groupId] = System.currentTimeMillis()
+        runCatching { chitchatPolicy.markSpoke(groupId) }
+        log(
+            LogLevel.INFO,
+            TAG,
+            "自主开口（引用 ${anchor.senderName?.takeIf { it.isNotBlank() } ?: "群友"}）：" +
+                answer.content.take(40),
+        )
+        return true
+    }
+
+    /** 为自主开口构造一条"代表被引用消息"的入参，让回复/记忆链路可以直接复用。 */
+    private fun incomingForAutonomy(
+        groupId: String,
+        anchor: RoomMessage,
+        quoteId: String,
+    ): IncomingMessage =
+        IncomingMessage(
+            kind = MessageKind.GROUP_MESSAGE,
+            eventType = "GROUP_MESSAGE_CREATE",
+            messageId = quoteId,
+            content = anchor.content,
+            targetId = groupId,
+            senderId = anchor.senderId,
+            senderName = anchor.senderName,
+            timestampMillis = anchor.timestampMillis,
+            raw = JsonObject(emptyMap()),
+        )
 
     /** 手动向指定目标推送一条消息（供维护端"手动发言"使用）。 */
     suspend fun sendManual(

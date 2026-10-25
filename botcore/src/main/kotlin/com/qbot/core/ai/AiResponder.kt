@@ -344,6 +344,17 @@ class AiResponder(
          */
         const val JUDGE_PROMPT_TAG = "【接话判断】"
 
+        /**
+         * 自主开口提示词的固定标记。
+         *
+         * 它和「接话判断」是两种任务：一个判断"这条值不值得接"，
+         * 一个生成"自己想说的那句话"。测试与日志靠这个标记区分。
+         */
+        const val AUTONOMY_PROMPT_TAG = "【自主开口】"
+
+        /** 模型认为没什么可说时的输出；调用方据此当作沉默。 */
+        const val AUTONOMY_SILENCE = "（沉默）"
+
         /** 会话锁表上限：超过后回收空闲锁，避免长期运行时 map 无限膨胀。 */
         private const val MAX_LOCKS = 128
 
@@ -519,6 +530,94 @@ class AiResponder(
                 memeUrl = memeUrl,
             )
         }
+    }
+
+    /**
+     * 自主开口：没有人叫，机器人自己想接一句。
+     *
+     * 与 [replyDetailed] 的区别：
+     * 1. 没有"用户问题"，输入是最近一段群聊 + 没说出口的内心戏；
+     * 2. **不写会话历史**——自主发言不是某个人的对话线程，
+     *    说出口的内容由发送链路记进群背景（`room_messages`），足够了；
+     * 3. 模型可以输出 [AUTONOMY_SILENCE] 表示"其实没什么想说的"，
+     *    调用方会当作这次不开口。
+     *
+     * @return null 表示沉默 / 生成失败；非 null 时由调用方发送
+     */
+    suspend fun speakOnOwn(
+        recent: List<RoomMessage>,
+        thoughts: List<String> = emptyList(),
+        topic: String? = null,
+        config: AiConfig,
+        personaPrompt: String? = null,
+        memory: MemoryContext? = null,
+    ): AiReply? {
+        if (recent.isEmpty() && thoughts.isEmpty()) return null
+
+        val now = System.currentTimeMillis()
+        val transcript =
+            TranscriptRender.render(
+                recent.takeLast(10).map { msg ->
+                    val who =
+                        if (msg.role == "assistant") {
+                            "你"
+                        } else {
+                            msg.senderName?.takeIf { it.isNotBlank() } ?: "某人"
+                        }
+                    TranscriptRender.Line(
+                        who = who,
+                        body = msg.content.take(160),
+                        meta = humanAgo((now - msg.timestampMillis).coerceAtLeast(0L)),
+                    )
+                },
+            )
+        val personaBlock =
+            personaPrompt?.takeIf { it.isNotBlank() }?.let { "你的性格：「${it.take(300)}」\n" }.orEmpty()
+        val thoughtsBlock =
+            thoughts.take(3).filter { it.isNotBlank() }.joinToString("\n") { "- $it" }
+                .takeIf { it.isNotBlank() }
+                ?.let { "你心里刚才在想：\n$it\n" }
+                .orEmpty()
+        val system =
+            AUTONOMY_PROMPT_TAG + "\n" +
+                "你在 QQ 群里，没有人叫你。**是你自己想接一句**。\n" +
+                personaBlock +
+                thoughtsBlock +
+                "怎么开口：\n" +
+                "1) 接着他们正在聊的内容说，别另起话题、别总结复述；\n" +
+                "2) 一两句，像群友随口接的话，不是客服发言；\n" +
+                "3) 不要解释你为什么开口，也不要提「你在旁听」；\n" +
+                "4) 两个人正在互怼、有人明确说「关你什么事」、或者你刚说过话时，别开口；\n" +
+                "5) 没什么想说的就只输出「$AUTONOMY_SILENCE」——忍住完全正常。\n" +
+                "只输出你要发的那句话。"
+        val user =
+            buildString {
+                if (transcript.isNotBlank()) {
+                    append("最近群里的对话：\n")
+                        .append(TranscriptRender.FORMAT_HINT).append("\n")
+                        .append(transcript).append("\n\n")
+                }
+                topic?.takeIf { it.isNotBlank() }?.let { append("你被什么勾住了：").append(it).append("\n") }
+                append("现在写你想接的那一句。")
+            }
+
+        val messages =
+            assembler.assemble(
+                personaPrompt = personaPrompt?.takeIf { it.isNotBlank() } ?: config.systemPrompt,
+                memory = memory,
+                history = emptyList(),
+                question = user,
+                tokenBudget = config.contextTokenBudget,
+            )
+        // 失败（网络/限流）由调用方判断：自主开口失败只记日志，不回群
+        val reply = executeChat(messages, config, imageUrl = null, useTools = false)
+        val (spoken, meme) = MemeMarker.parse(reply.content)
+        if (spoken.contains(AUTONOMY_SILENCE) || (spoken.isBlank() && meme == null)) return null
+        return AiReply(
+            content = truncate(spoken),
+            reasoning = reply.reasoning?.takeIf { it.isNotBlank() },
+            memeUrl = meme,
+        )
     }
 
     /**

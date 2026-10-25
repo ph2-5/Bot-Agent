@@ -35,7 +35,9 @@ import com.qbot.app.data.repo.RoomChimeDecisionStore
 import com.qbot.app.data.repo.RoomChimeLessonStore
 import com.qbot.app.data.repo.RoomChimeTrainer
 import com.qbot.app.data.repo.RoomAiHistoryStore
+import com.qbot.app.data.repo.RoomDriveStore
 import com.qbot.app.data.repo.RoomFactStore
+import com.qbot.app.data.repo.RoomGroupBehaviorStore
 import com.qbot.app.data.repo.RoomGroupStore
 import com.qbot.app.data.repo.RoomIdentityStore
 import com.qbot.app.data.repo.RoomInnerThoughtSink
@@ -53,6 +55,7 @@ import com.qbot.app.data.repo.GreetingConfig
 import com.qbot.core.ai.AiConfig
 import com.qbot.core.ai.AiMode
 import com.qbot.core.ai.AiResponder
+import com.qbot.core.ai.AutonomousRecord
 import com.qbot.core.ai.ChatMessage
 import com.qbot.core.ai.ChimeDecision
 import com.qbot.core.ai.BotMood
@@ -411,6 +414,45 @@ class BotController(
         )
     }
 
+    /** 按群覆盖的自主档位（没设过的群回落全局档）。 */
+    private val groupBehaviorStore = RoomGroupBehaviorStore(database.groupBehaviorDao())
+
+    /** 自主决策记录（复盘页 / 调试页读取用）。 */
+    private val driveStore = RoomDriveStore(database.autonomousDecisionDao())
+
+    /**
+     * 第二道闸门：便宜模型判断"这句该不该说"。
+     *
+     * lazy 构造：PASSIVE / OFF 档下永远不会被用到，
+     * 没必要为它先建一个 OkHttp 客户端。
+     */
+    private val autonomousGate by lazy {
+        LlmAutonomousGate(
+            http = http,
+            configProvider = { settings.aiConfig.value to settings.auxAiConfig.value },
+        )
+    }
+
+    /**
+     * 自主开口调度器。
+     *
+     * 一个机器人一个实例：情绪、决策表、配额都跟着各自的库走，不会串。
+     */
+    private val autonomousScheduler by lazy {
+        AutonomousScheduler(
+            database = database,
+            runtimeProvider = { runtime },
+            personaIdProvider = { personaRepository.active()?.id },
+            globalConfig = { settings.autonomyConfig.value },
+            groupModeProvider = { groupId -> groupBehaviorStore.modeFor(groupId) },
+            auxConfig = { settings.auxAiConfig.value },
+            mainConfig = { settings.aiConfig.value },
+            gate = autonomousGate,
+            personaTextProvider = { personaRepository.active()?.prompt },
+            log = { message -> appendLog(LogLevel.INFO, TAG, message) },
+        )
+    }
+
     /** 引导只跑一次：init 与 start 可能同时触发 */
     private val bootstrapMutex = Mutex()
 
@@ -421,6 +463,9 @@ class BotController(
      * 读库、调模型、写快照——用户以为已经关了。
      */
     private var growthJob: kotlinx.coroutines.Job? = null
+
+    /** 自主开口节拍的 Job（理由同 [growthJob]：停止机器人后不能再自己说话）。 */
+    private var autonomyJob: kotlinx.coroutines.Job? = null
 
     /**
      * 启动代次：每调用一次 start() 递增，stop() 也递增。
@@ -901,6 +946,33 @@ class BotController(
     /** 群聊参与（插话）配置快照。 */
     val chitchatConfig = settings.chitchatConfig
 
+    /** 自主开口配置（全局默认档），供 UI 展示与编辑。 */
+    val autonomyConfig = settings.autonomyConfig
+
+    /** 按群覆盖的档位：groupId → OFF / PASSIVE / ACTIVE。 */
+    fun observeGroupBehaviors(): kotlinx.coroutines.flow.Flow<Map<String, String>> =
+        groupBehaviorStore.observeAll()
+
+    /** 设置某个群的自主档位（写 group_behavior，立即生效）。 */
+    suspend fun setGroupAutonomy(
+        groupId: String,
+        mode: String,
+    ) {
+        groupBehaviorStore.setMode(groupId, mode)
+    }
+
+    /** 清除按群覆盖，回到全局档。 */
+    suspend fun clearGroupAutonomy(groupId: String) {
+        groupBehaviorStore.clear(groupId)
+    }
+
+    /** 复盘页：最近的自主决策（SPOKEN / HELD）。 */
+    fun observeAutonomousDecisions(limit: Int = 30): kotlinx.coroutines.flow.Flow<List<AutonomousRecord>> =
+        driveStore.observeRecent(limit)
+
+    /** 调试页：手动跑一次评估（OFF 档会被拒绝；PASSIVE 档按 ACTIVE 阈值算，可能真的开口）。 */
+    suspend fun forceAutonomousSpeak(groupId: String): Boolean = autonomousScheduler.force(groupId)
+
     /**
      * 最近一次 AI 调用的 token 用量（含缓存命中拆分）。
      *
@@ -1014,6 +1086,15 @@ class BotController(
                 .getOrNull()
     }
 
+    /** 保证自主开口节拍在跑；重复调用是幂等的。 */
+    private fun ensureAutonomyRunning() {
+        if (autonomyJob?.isActive == true) return
+        autonomyJob =
+            runCatching { autonomousScheduler.start(scope) }
+                .onFailure { appendLog(LogLevel.WARN, TAG, "自主开口调度启动失败：${it.message}") }
+                .getOrNull()
+    }
+
     /** 启动机器人（幂等）。 */
     fun start() {
         if (runtime != null) {
@@ -1050,6 +1131,7 @@ class BotController(
             }
             runtime?.start()
             ensureGrowthRunning()
+            ensureAutonomyRunning()
         }
     }
 
@@ -1059,6 +1141,9 @@ class BotController(
         startGeneration++
         growthJob?.cancel()
         growthJob = null
+        autonomyJob?.cancel()
+        autonomyJob = null
+        autonomousScheduler.stop()
         runtime?.stop()
         gateway?.stop()
         statusForwardJob?.cancel()
@@ -2373,6 +2458,9 @@ class BotController(
                 memeLibrary = socialStore,
                 // 发送时优先读本地副本走字节直传，读不到才回退 URL
                 memeReader = socialStore,
+                // 自主开口的触发点：每条群消息处理完（不管回没回）都排一次延迟评估。
+                // 调度器内部再判档位，PASSIVE / OFF 档不会产生任何模型调用。
+                onGroupMessageHandled = { groupId -> autonomousScheduler.onMessageHandled(groupId) },
             )
 
         // 把网关状态转发到控制器自己的流上，

@@ -313,6 +313,31 @@ interface RoomMessageDao {
         externalId: String,
         decision: String,
     )
+
+    // ---------- 自主开口 ----------
+
+    /** 某会话在时间点之后有多少条消息：判断"聊得正热"还是"冷场" */
+    @Query(
+        "SELECT COUNT(*) FROM room_messages WHERE scopeKey = :scopeKey AND timestampMillis >= :sinceMillis",
+    )
+    suspend fun countSinceTime(
+        scopeKey: String,
+        sinceMillis: Long,
+    ): Int
+
+    /**
+     * 最近活跃的会话范围。
+     *
+     * 调度器只评估这些群：死群不该每 10 分钟被算一遍。
+     */
+    @Query(
+        "SELECT scopeKey FROM room_messages WHERE timestampMillis >= :sinceMillis " +
+            "GROUP BY scopeKey ORDER BY MAX(timestampMillis) DESC LIMIT :limit",
+    )
+    suspend fun activeScopesSince(
+        sinceMillis: Long,
+        limit: Int,
+    ): List<String>
 }
 
 /**
