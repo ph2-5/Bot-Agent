@@ -153,7 +153,7 @@ interface AiHistoryDao {
         StyleRuleEntity::class,
         MemoryTermEntity::class,
     ],
-    version = 16,
+    version = 17,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -227,6 +227,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_13_14,
                     MIGRATION_14_15,
                     MIGRATION_15_16,
+                    MIGRATION_16_17,
                 )
                 .build()
 
@@ -779,6 +780,19 @@ abstract class AppDatabase : RoomDatabase() {
                         "CREATE INDEX IF NOT EXISTS `index_room_messages_externalId` " +
                             "ON `room_messages` (`externalId`)",
                     )
+                }
+            }
+
+        /**
+         * v16 → v17：表情包本地副本。
+         *
+         * 只加一列，默认 null：老表情包没有本地字节，发送时仍按 URL 回退，
+         * 能发就发、发不出就跳过——不会因为升级把老图库变成失败源。
+         */
+        val MIGRATION_16_17 =
+            object : androidx.room.migration.Migration(16, 17) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL("ALTER TABLE `meme_images` ADD COLUMN `path` TEXT")
                 }
             }
     }

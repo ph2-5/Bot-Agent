@@ -18,6 +18,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.util.Base64
 
 /** OpenAPI 调用失败。 */
 class ApiException(message: String, val code: Int? = null, val httpStatus: Int? = null) :
@@ -87,6 +88,9 @@ class OpenApi(
     companion object {
         private const val TAG = "OpenApi"
         const val DEFAULT_BASE_URL = "https://api.sgroup.qq.com"
+
+        /** 官方图片大小硬限制：5MB（原始字节）。 */
+        private const val MAX_IMAGE_BYTES = 5 * 1024 * 1024
     }
 
     private val jsonMediaType = "application/json".toMediaType()
@@ -194,6 +198,49 @@ class OpenApi(
         userOpenId: String,
         imageUrl: String,
     ): String? = uploadImage("/v2/users/$userOpenId/files", userOpenId, imageUrl)
+
+    /**
+     * 直接上传图片字节到群聊（`file_data` 模式），返回 file_info。
+     *
+     * QQ CDN 的图片链接带签名、几小时失效，还有防盗链；由平台服务器去拉
+     * 那个链接，存得越久失败率越高。把字节捏在自己手里才稳。
+     */
+    suspend fun uploadGroupImageBytes(
+        groupOpenId: String,
+        bytes: ByteArray,
+    ): String? = uploadImageBytes("/v2/groups/$groupOpenId/files", groupOpenId, bytes)
+
+    /** 直接上传图片字节到单聊（`file_data` 模式）。 */
+    suspend fun uploadUserImageBytes(
+        userOpenId: String,
+        bytes: ByteArray,
+    ): String? = uploadImageBytes("/v2/users/$userOpenId/files", userOpenId, bytes)
+
+    private suspend fun uploadImageBytes(
+        path: String,
+        targetId: String,
+        bytes: ByteArray,
+    ): String? {
+        if (targetId.isBlank() || bytes.isEmpty()) return null
+        // 5MB 是**原始字节**的硬限制；base64 会再膨胀 33%，不能按编码后长度判断
+        if (bytes.size > MAX_IMAGE_BYTES) return null
+        val payload =
+            buildJsonObject {
+                put("file_type", 1) // 1 = 图片
+                // 官方参数名就是 file_data，值是纯 base64，不带 data:image/... 前缀
+                put("file_data", Base64.getEncoder().encodeToString(bytes))
+                put("srv_send_msg", false)
+            }.toString().toRequestBody(jsonMediaType)
+        val body =
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    call("POST", path, payload, retryOnAuthError = true)
+                }.getOrNull()
+            } ?: return null
+        return runCatching {
+            json.parseToJsonElement(body).jsonObject["file_info"]?.jsonPrimitive?.contentOrNull
+        }.getOrNull()?.takeIf { it.isNotBlank() }
+    }
 
     private suspend fun uploadImage(
         path: String,

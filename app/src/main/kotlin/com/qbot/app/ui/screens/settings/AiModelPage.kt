@@ -181,6 +181,11 @@ fun AiModelPage(onBack: () -> Unit) {
                     "其他服务商则沿用上面的主模型，需要你确认它支持图片。" +
                     "两张模型是分开计费的，看一次图算一次。",
             )
+            // 主模型是 DeepSeek 文本模型、又没单独填视觉模型时，只有官方端点能兜底；
+            // 换成中转/其他服务商的话，看图会静默失败，这里提前提醒。
+            if (visionModel.isBlank() && isTextOnlyModel(model)) {
+                HintText("主模型不接受图片，请填写视觉模型（如 deepseek-flash）。")
+            }
 
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                 Text(
@@ -456,4 +461,10 @@ fun AiModelPage(onBack: () -> Unit) {
             }
         }
     }
+}
+
+/** DeepSeek 的两个文本模型（chat / reasoner）不接收图片输入。 */
+private fun isTextOnlyModel(model: String): Boolean {
+    val name = model.trim().lowercase()
+    return name.startsWith("deepseek-chat") || name.startsWith("deepseek-reasoner")
 }

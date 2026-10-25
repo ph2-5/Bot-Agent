@@ -26,6 +26,7 @@ import com.qbot.core.ai.MemeHarvester
 import com.qbot.core.ai.MemeIntent
 import com.qbot.core.ai.MemeLibrary
 import com.qbot.core.ai.MemeMarker
+import com.qbot.core.ai.MemeReader
 import com.qbot.core.ai.MemoryContext
 import com.qbot.core.ai.MemoryPipeline
 import com.qbot.core.ai.PersonaBias
@@ -170,6 +171,14 @@ class BotRuntime(
      * 为 null 时只保留提示词里的 `[表情:URL]` 约定。
      */
     private val memeLibrary: MemeLibrary? = null,
+    /**
+     * 表情包本地副本读取器。
+     *
+     * 图库里的 `path` 指向落盘的 JPEG；能读到字节就走 `file_data` 直传，
+     * QQ CDN 的签名链接就不会因为过期而把老表情包变成死链。
+     * 为 null 或读不到时回退到按 URL 上传。
+     */
+    private val memeReader: MemeReader? = null,
     /**
      * 说话约束提供者（内置 + 用户自定义 + 插件）。
      *
@@ -1133,9 +1142,12 @@ class BotRuntime(
     }
 
     /**
-     * 发一张表情包：先上传换 file_info，再走富媒体通道（msg_type=7）。
+     * 发一张表情包：先换 file_info，再走富媒体通道（msg_type=7）。
      *
-     * 两条降级路径：上传失败或发送失败都只记日志——
+     * 上传有两条路：本地有副本时直接传字节（`file_data`），没有副本才把 URL
+     * 交给平台去拉。QQ CDN 的链接带签名、几小时就失效，老图按 URL 传基本必挂。
+     *
+     * 多条降级路径：上传失败或发送失败都只记日志——
      * 图是配菜，不能因为它把整条回复搞砸，更不该让群里看到一条报错。
      * 群聊与单聊的上传路径不同（`/groups` 与 `/users`），发送通道也不同。
      */
@@ -1144,17 +1156,31 @@ class BotRuntime(
         imageUrl: String,
     ): Boolean {
         val target = message.targetId?.takeIf { it.isNotBlank() } ?: return false
+        val bytes = runCatching { memeReader?.read(imageUrl) }.getOrNull()
         val fileInfo =
             runCatching {
                 when (message.kind) {
                     MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE, MessageKind.GUILD ->
-                        api.uploadGroupImage(target, imageUrl)
+                        if (bytes != null) {
+                            api.uploadGroupImageBytes(target, bytes)
+                        } else {
+                            api.uploadGroupImage(target, imageUrl)
+                        }
+
                     MessageKind.C2C, MessageKind.DIRECT ->
-                        api.uploadUserImage(target, imageUrl)
+                        if (bytes != null) {
+                            api.uploadUserImageBytes(target, bytes)
+                        } else {
+                            api.uploadUserImage(target, imageUrl)
+                        }
                 }
             }.getOrNull()
         if (fileInfo.isNullOrBlank()) {
-            log(LogLevel.WARN, TAG, "表情包上传失败，跳过：${imageUrl.take(80)}")
+            log(
+                LogLevel.WARN,
+                TAG,
+                "表情包上传失败，跳过（${if (bytes != null) "本地字节" else "远程链接"}）：${imageUrl.take(80)}",
+            )
             return false
         }
         return runCatching {

@@ -39,6 +39,7 @@ import com.qbot.app.data.repo.RoomFactStore
 import com.qbot.app.data.repo.RoomGroupStore
 import com.qbot.app.data.repo.RoomIdentityStore
 import com.qbot.app.data.repo.RoomInnerThoughtSink
+import com.qbot.app.data.media.LocalImageStore
 import com.qbot.app.data.repo.RoomLoreStore
 import com.qbot.app.data.repo.LlmMemoryReranker
 import com.qbot.app.data.repo.RoomMemoryIndexer
@@ -336,6 +337,18 @@ class BotController(
     private val styleRuleComposer =
         StyleRuleComposer(store = styleRuleStore, plugins = listOf(stylePluginHost))
 
+    /**
+     * 表情包本地仓库。
+     *
+     * QQ 图片链接带签名、几小时就过期：收图时就落盘，发送时读字节直传，
+     * 不再指望平台去拉那个早就失效的地址。
+     */
+    private val localImageStore =
+        LocalImageStore(
+            dir = java.io.File(context.filesDir, "memes"),
+            http = http,
+        )
+
     private val socialStore =
         RoomSocialStore(
             affinityDao = database.affinityDao(),
@@ -355,6 +368,8 @@ class BotController(
             },
             // 关系/内心戏是否按人设分开，由维护端开关决定（默认共用）
             isolateMemories = { settings.memoryConfig.value.personaScoped },
+            // 收图落盘 / 发送读字节：只存 URL 的图库活不过一天
+            imageStore = localImageStore,
         )
 
     /** 反思串行化：一次只处理一条反馈，避免并发写入把经验库弄乱 */
@@ -1566,6 +1581,7 @@ class BotController(
                             url = meme.url,
                             source = meme.source,
                             hits = meme.hits,
+                            path = meme.path,
                         )
                     },
                 // 人设设定与说话约束：用户手工调过的东西，换机不该丢
@@ -1873,6 +1889,7 @@ class BotController(
                             url = dto.url,
                             source = dto.source,
                             hits = dto.hits,
+                            path = dto.path,
                         ),
                     )
                 }
@@ -2294,8 +2311,9 @@ class BotController(
                     personaResolver.resolve(message).personaId?.toString()
                 },
                 // QQ 图片链接带签名、会过期，先本地下载转 base64 再给视觉模型；
+                // 转码成 JPEG 是因为不少视觉接口对 png/gif/webp 兼容性参差。
                 // 下载失败时回退原地址，行为与接入前一致。
-                imageInliner = RemoteImageLoader(http),
+                imageInliner = RemoteImageLoader(http, transcoder = localImageStore),
             )
 
         // 把应答器的最近用量转发到控制器流上，重建机器人时 UI 无需重新订阅
@@ -2353,6 +2371,8 @@ class BotController(
                 memeHarvester = memeHarvester,
                 // 明确被要求发图时本地直接挑一张；工具选中的图也在这里计数
                 memeLibrary = socialStore,
+                // 发送时优先读本地副本走字节直传，读不到才回退 URL
+                memeReader = socialStore,
             )
 
         // 把网关状态转发到控制器自己的流上，

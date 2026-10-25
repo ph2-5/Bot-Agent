@@ -95,4 +95,47 @@ class RemoteImageLoaderTest {
             val gif = loader.inline(server.url("/a.gif").toString())
             assertEquals("data:image/gif;base64,${Base64.getEncoder().encodeToString("GIF89a".toByteArray())}", gif)
         }
+
+    @Test
+    fun `注入转码器后先转 JPEG 再内联`() =
+        runBlocking {
+            server.enqueue(
+                MockResponse()
+                    .setBody(Buffer().write(pngBytes))
+                    .setHeader("Content-Type", "image/png"),
+            )
+            val transcoded = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte())
+            val withTranscoder =
+                RemoteImageLoader(
+                    OkHttpClient(),
+                    transcoder =
+                        ImageTranscoder { bytes, _, _ ->
+                            // 确认拿到的确实是下载后的原始字节
+                            assertEquals(pngBytes.size, bytes.size)
+                            transcoded
+                        },
+                )
+
+            val result = withTranscoder.inline(server.url("/a.png").toString())
+
+            assertEquals(
+                "data:image/jpeg;base64,${Base64.getEncoder().encodeToString(transcoded)}",
+                result,
+            )
+        }
+
+    @Test
+    fun `转码失败时退回原始字节`() =
+        runBlocking {
+            server.enqueue(
+                MockResponse()
+                    .setBody(Buffer().write(pngBytes))
+                    .setHeader("Content-Type", "image/png"),
+            )
+            val withTranscoder = RemoteImageLoader(OkHttpClient(), transcoder = ImageTranscoder { _, _, _ -> null })
+
+            val result = withTranscoder.inline(server.url("/a.png").toString())
+
+            assertTrue(result.orEmpty().startsWith("data:image/png;base64,"))
+        }
 }

@@ -8,9 +8,11 @@ import com.qbot.app.data.db.MemeDao
 import com.qbot.app.data.db.MemeEntity
 import com.qbot.app.data.db.SlangDao
 import com.qbot.app.data.db.SlangEntity
+import com.qbot.app.data.media.LocalImageStore
 import com.qbot.core.ai.BotMood
 import com.qbot.core.ai.MemeImage
 import com.qbot.core.ai.MemeLibrary
+import com.qbot.core.ai.MemeReader
 import com.qbot.core.ai.MoodPolicy
 import com.qbot.core.model.IncomingMessage
 import com.qbot.core.ai.PersonRelation
@@ -60,8 +62,15 @@ class RoomSocialStore(
      * 设定本身就是人格的一部分，必须跟着本条消息实际扮演的人格走。
      */
     private val isolateMemories: () -> Boolean = { false },
+    /**
+     * 表情包本地仓库。
+     *
+     * 收图时顺手落盘（QQ 链接会过期），发送时按 URL 找回本地字节。
+     * 为 null 时退化为「只存链接」，与接入前一致。
+     */
+    private val imageStore: LocalImageStore? = null,
     private val clock: () -> Long = System::currentTimeMillis,
-) : SocialContextProvider, RelationRecorder, MemeLibrary {
+) : SocialContextProvider, RelationRecorder, MemeLibrary, MemeReader {
     /** 读-改-写要串行，否则并发两条消息会把彼此的增量覆盖掉 */
     private val mutex = Mutex()
 
@@ -295,13 +304,33 @@ class RoomSocialStore(
         return runCatching { dao.find(clean) != null }.getOrDefault(false)
     }
 
+    /**
+     * 发送前的字节查找。
+     *
+     * 有本地副本就走字节直传，没有（老数据 / 落盘失败）返回 null，
+     * 由 BotRuntime 回退到「让平台按 URL 拉」。
+     */
+    override suspend fun read(url: String): ByteArray? {
+        val dao = memeDao ?: return null
+        val store = imageStore ?: return null
+        val clean = url.trim()
+        if (clean.isBlank()) return null
+        return runCatching {
+            val path = dao.find(clean)?.path ?: return@runCatching null
+            store.read(path)
+        }.getOrNull()
+    }
+
     /** 采用一次：只累加 hits，重复地址不会新增行。 */
     override suspend fun recordUse(url: String) {
         val dao = memeDao ?: return
         val clean = url.trim()
         if (clean.isBlank()) return
         runCatching {
-            dao.find(clean)?.let { dao.bumpHits(it.id, 1) }
+            val row = dao.find(clean) ?: return@runCatching
+            dao.bumpHits(row.id, 1)
+            // 用过就摸一下时间戳：淘汰按「最久未用」删，常用图才能留下来
+            row.path?.let { imageStore?.markUsed(it) }
         }
     }
 
@@ -321,6 +350,9 @@ class RoomSocialStore(
      *
      * 重复的图不堆行：同一地址再次出现只累加 hits——
      * 一张被反复发的图正是"这群人爱用"的信号，比十张一次性图有价值。
+     *
+     * 新图先下载字节并转 JPEG 落盘，**任一环节失败就不入库**：
+     * 只存一个几小时后必然过期的 URL，等于存了个用不上的死链。
      * @return true 表示是新入库的图
      */
     suspend fun harvestMeme(url: String): Boolean {
@@ -331,17 +363,27 @@ class RoomSocialStore(
             val existing = dao.find(clean)
             if (existing != null) {
                 dao.bumpHits(existing.id, 1)
-                false
-            } else {
-                dao.upsert(
-                    MemeEntity(
-                        url = clean,
-                        source = MemeImage.SOURCE_HARVEST,
-                        createdAt = clock(),
-                    ),
-                )
-                true
+                existing.path?.let { imageStore?.markUsed(it) }
+                return@withLock false
             }
+            val store = imageStore
+            val path =
+                if (store == null) {
+                    null
+                } else {
+                    val raw = store.download(clean) ?: return@withLock false
+                    val jpeg = store.transcodeToJpeg(raw) ?: return@withLock false
+                    store.save(jpeg) ?: return@withLock false
+                }
+            dao.upsert(
+                MemeEntity(
+                    url = clean,
+                    source = MemeImage.SOURCE_HARVEST,
+                    createdAt = clock(),
+                    path = path,
+                ),
+            )
+            true
         }
     }
 
@@ -356,18 +398,32 @@ class RoomSocialStore(
                 dao.bumpHits(existing.id, 1)
                 existing.id
             } else {
+                // 手动贴的图尽力落盘，失败也保留链接——用户贴的时候它多半还能用
+                val path =
+                    imageStore?.let { store ->
+                        store.download(clean)?.let { raw ->
+                            store.transcodeToJpeg(raw)?.let { jpeg -> store.save(jpeg) }
+                        }
+                    }
                 dao.upsert(
                     MemeEntity(
                         url = clean,
                         source = MemeImage.SOURCE_MANUAL,
                         createdAt = clock(),
+                        path = path,
                     ),
                 )
             }
         }
     }
 
-    suspend fun deleteMeme(id: Long) = memeDao?.delete(id)
+    suspend fun deleteMeme(id: Long) {
+        val dao = memeDao ?: return
+        val row = runCatching { dao.byId(id) }.getOrNull()
+        dao.delete(id)
+        // 行删了文件也别留着，否则目录会慢慢被孤儿文件撑满
+        row?.path?.let { imageStore?.delete(it) }
+    }
 
     suspend fun clearMemes() = memeDao?.clear()
 
@@ -381,10 +437,24 @@ class RoomSocialStore(
 }
 
 private fun MemeEntity.toModel() =
-    MemeImage(id = id, url = url, source = source, hits = hits, createdAt = createdAt)
+    MemeImage(
+        id = id,
+        url = url,
+        source = source,
+        hits = hits,
+        createdAt = createdAt,
+        path = path,
+    )
 
 private fun MemeImage.toEntity() =
-    MemeEntity(id = id, url = url, source = source, hits = hits, createdAt = createdAt)
+    MemeEntity(
+        id = id,
+        url = url,
+        source = source,
+        hits = hits,
+        createdAt = createdAt,
+        path = path,
+    )
 
 private fun AffinityEntity.toModel() =
     PersonRelation(

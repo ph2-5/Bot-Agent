@@ -16,6 +16,13 @@ data class MemeImage(
     /** 被采用次数，用于淘汰排序 */
     val hits: Int = 0,
     val createdAt: Long = 0,
+    /**
+     * 本地落盘后的相对文件名（如 `a1b2c3.jpg`），为空表示只有远程链接。
+     *
+     * QQ 图片链接带签名、几小时就失效，只存 URL 等于存了个定时炸弹：
+     * 收图时顺手存一份字节，发送时直接传字节，才不怕链接过期。
+     */
+    val path: String? = null,
 ) {
     companion object {
         const val SOURCE_HARVEST = "HARVEST"
@@ -121,4 +128,14 @@ object MemeIntent {
  */
 fun interface MemeHarvester {
     suspend fun harvest(url: String)
+}
+
+/**
+ * 按图库里的 URL 取回本地字节。
+ *
+ * botcore 不碰文件系统，读盘由 app 侧实现；返回 null 表示这张图没有本地副本，
+ * 调用方回退到「让平台按 URL 拉取」的老路径。
+ */
+fun interface MemeReader {
+    suspend fun read(url: String): ByteArray?
 }

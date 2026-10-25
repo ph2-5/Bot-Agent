@@ -138,6 +138,13 @@ data class MemeEntity(
     /** 被采用次数，用于淘汰排序 */
     val hits: Int = 0,
     val createdAt: Long = 0,
+    /**
+     * 本地 JPEG 的相对文件名（相对 `filesDir/memes`）。
+     *
+     * 老数据为 null：那时只存 URL，而 QQ 链接几小时就过期，
+     * 发送时只能回退「让平台按 URL 拉」，失败就跳过。
+     */
+    val path: String? = null,
 )
 
 @Dao
@@ -153,6 +160,9 @@ interface MemeDao {
 
     @Query("SELECT * FROM meme_images WHERE url = :url LIMIT 1")
     suspend fun find(url: String): MemeEntity?
+
+    @Query("SELECT * FROM meme_images WHERE id = :id LIMIT 1")
+    suspend fun byId(id: Long): MemeEntity?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(entity: MemeEntity): Long

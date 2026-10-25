@@ -30,6 +30,8 @@ class RemoteImageLoader(
     private val http: OkHttpClient,
     private val maxBytes: Long = 8L * 1024 * 1024,
     private val timeoutSeconds: Long = 10L,
+    /** 非空时先转 JPEG 再内联：视觉接口对 png/gif/webp 的兼容性参差不齐。 */
+    private val transcoder: ImageTranscoder? = null,
 ) : ImageInliner {
     override suspend fun inline(url: String): String? {
         if (!url.startsWith("http://") && !url.startsWith("https://")) return null
@@ -56,7 +58,19 @@ class RemoteImageLoader(
 
                     val bytes = buffer.readByteArray()
                     val mime = sniffMime(bytes) ?: return@use null
-                    "data:$mime;base64,${Base64.getEncoder().encodeToString(bytes)}"
+                    // 视觉模型吃不下 GIF 动图时更容易整条失败，先转 JPEG 更稳；
+                    // 转码失败就退回原始字节——原格式模型本来也可能认。
+                    val jpeg =
+                        transcoder?.toJpeg(
+                            bytes,
+                            ImageTranscoder.DEFAULT_MAX_EDGE,
+                            ImageTranscoder.DEFAULT_QUALITY,
+                        )
+                    if (jpeg != null) {
+                        "data:image/jpeg;base64,${Base64.getEncoder().encodeToString(jpeg)}"
+                    } else {
+                        "data:$mime;base64,${Base64.getEncoder().encodeToString(bytes)}"
+                    }
                 }
             }.getOrNull()
         }

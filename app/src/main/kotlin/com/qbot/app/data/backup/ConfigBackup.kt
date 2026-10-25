@@ -278,6 +278,14 @@ data class MemeBackup(
     val url: String,
     val source: String = "HARVEST",
     val hits: Int = 0,
+    /**
+     * 本地副本的相对文件名。
+     *
+     * 图片文件本身不进备份（几十 MB 塞进 JSON 不现实），换机后这个字段
+     * 指向的文件并不存在——读到 null 就自动回退 URL，不会因此报错。
+     * 同机备份/还原时它能让老图继续走字节直传。
+     */
+    val path: String? = null,
 )
 
 /**

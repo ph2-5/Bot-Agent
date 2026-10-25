@@ -135,6 +135,7 @@ class BotRuntimeAiTest {
         logSink: LogSink? = null,
         memeHarvester: com.qbot.core.ai.MemeHarvester? = null,
         memeLibrary: MemeLibrary? = null,
+        memeReader: com.qbot.core.ai.MemeReader? = null,
     ): BotRuntime {
         val auth =
             AccessTokenManager(
@@ -169,6 +170,7 @@ class BotRuntimeAiTest {
             aiConfigProvider = { config },
             memeHarvester = memeHarvester,
             memeLibrary = memeLibrary,
+            memeReader = memeReader,
         )
     }
 
@@ -419,6 +421,40 @@ class BotRuntimeAiTest {
             assertTrue(uploadedImages[0].contains("https://example.com/fixed.jpg"))
             // 真正发出去了才计一次采用
             assertEquals(listOf("https://example.com/fixed.jpg"), library.used.toList())
+        }
+
+    @Test
+    fun `有本地副本时改走字节直传`() =
+        runBlocking {
+            val logs = CopyOnWriteArrayList<LogEntry>()
+            val library = FixedMemeLibrary()
+            val runtime =
+                buildRuntime(
+                    scope = this,
+                    config =
+                        AiConfig(
+                            enabled = true,
+                            baseUrl = server.url("/").toString(),
+                            apiKey = "sk-test",
+                            model = "deepseek-chat",
+                        ),
+                    logSink = capturingSink(logs),
+                    memeLibrary = library,
+                    // 本地有副本：不该再让平台去拉那个会过期的 URL
+                    memeReader = { url ->
+                        if (url == "https://example.com/fixed.jpg") byteArrayOf(1, 2, 3) else null
+                    },
+                )
+
+            runtime.onMessage(message("发个表情包"))
+            awaitOutcome(logs, "按明确请求发送了一张表情包")
+            while (uploadedImages.isEmpty()) {
+                delay(50)
+            }
+
+            val body = uploadedImages[0]
+            assertTrue("应带 file_data，实际=$body", body.contains("\"file_data\":\"AQID\""))
+            assertTrue(!body.contains("\"url\""))
         }
 
     @Test
