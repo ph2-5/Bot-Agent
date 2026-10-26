@@ -98,6 +98,9 @@ fun ChimeReviewScreen() {
     var note by remember { mutableStateOf("") }
     var editingLesson by remember { mutableStateOf<ChimeLesson?>(null) }
     var editingText by remember { mutableStateOf("") }
+    /** 手动添加经验：AI 归纳只在标错之后才产生，常识性规矩得自己写 */
+    var addingLesson by remember { mutableStateOf(false) }
+    var newLessonText by remember { mutableStateOf("") }
 
     val summaries by controller.groupStore().observeSummaries().collectAsState(initial = emptyList())
     val decisions by controller.observeChimeDecisions(groupFilter, 100)
@@ -376,11 +379,22 @@ fun ChimeReviewScreen() {
 
         item(key = "lessons-header") {
             Column(modifier = Modifier.padding(top = 12.dp)) {
-                Text(
-                    "经验库（${lessons.size}/${chitchat.maxLessons}）",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "经验库（${lessons.size}/${chitchat.maxLessons}）",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        onClick = {
+                            newLessonText = ""
+                            addingLesson = true
+                        },
+                    ) {
+                        Text("添加")
+                    }
+                }
                 Text(
                     "按场景归档，同类会合并。每次判断参考最多 " +
                         "${chitchat.maxInjectedLessons} 条（本群优先，同一类不超过 " +
@@ -394,7 +408,8 @@ fun ChimeReviewScreen() {
         if (lessons.isEmpty()) {
             item(key = "lessons-empty") {
                 Text(
-                    "还没有经验。把某条判断标成「不该说 / 该说」，它就会总结一条。",
+                    "还没有经验。把某条判断标成「不该说 / 该说」，它会总结一条；" +
+                        "也可以点上面的「添加」自己写。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -507,6 +522,51 @@ fun ChimeReviewScreen() {
             },
             dismissButton = {
                 TextButton(onClick = { editingLesson = null }) { Text("取消") }
+            },
+        )
+    }
+
+    if (addingLesson) {
+        AlertDialog(
+            onDismissRequest = { addingLesson = false },
+            title = { Text("添加经验") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = newLessonText,
+                        onValueChange = {
+                            if (it.length <= ChimeLesson.MAX_TEXT_CHARS) newLessonText = it
+                        },
+                        minLines = 2,
+                        placeholder = { Text("例：这个群不喜欢被叫全名，喊「老张」就行") },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text(
+                        "写具体做法——它会照这条做判断，别写「要自然」「要幽默」这类空话。" +
+                            "添加后全局生效。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = newLessonText.isNotBlank(),
+                    onClick = {
+                        val content = newLessonText
+                        scope.launch {
+                            runCatching { controller.addChimeLesson(content) }
+                                .onSuccess { hint = "已添加经验" }
+                                .onFailure { hint = "添加失败：${it.message ?: "未知错误"}" }
+                            addingLesson = false
+                        }
+                    },
+                ) {
+                    Text("添加")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { addingLesson = false }) { Text("取消") }
             },
         )
     }

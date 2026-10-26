@@ -598,6 +598,34 @@ class BotController(
     fun observeChimeLessons(): Flow<List<ChimeLesson>> = chimeLessonStore.observeAll()
 
     /**
+     * 手动添加一条经验。
+     *
+     * 自动归纳只在「用户把某条判断标成该说/不该说」之后才产生，
+     * 但很多规矩是常识性的（「这个群不喜欢被叫全名」），等不到那条反馈。
+     * 手动加的经验和自动归纳的走同一条注入链路，只是来源记为 MANUAL。
+     */
+    suspend fun addChimeLesson(
+        text: String,
+        scopeGroupId: String? = null,
+        category: String = com.qbot.core.ai.LessonCategories.OTHER,
+    ): Long {
+        val trimmed = text.trim()
+        require(trimmed.isNotEmpty()) { "经验内容不能为空" }
+        val now = System.currentTimeMillis()
+        return chimeLessonStore.insert(
+            ChimeLesson(
+                text = trimmed,
+                source = ChimeLesson.SOURCE_MANUAL,
+                scopeGroupId = scopeGroupId,
+                enabled = true,
+                createdAt = now,
+                updatedAt = now,
+                category = category,
+            ),
+        )
+    }
+
+    /**
      * 最近说过但没发出去的话。
      *
      * 只有开了思考模式才会有记录；关掉时列表恒为空，不是故障。

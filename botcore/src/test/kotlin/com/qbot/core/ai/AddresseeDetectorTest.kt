@@ -165,6 +165,34 @@ class AddresseeDetectorTest {
     }
 
     @Test
+    fun `机器人刚说完对方接着追问时认为是对机器人说的`() {
+        // 双 bot 对谈的典型形态：上一句是它说的，"跟我学？"就是在问它。
+        // 过去只要 recent 里有 assistant，两人对话判定就整体失效，
+        // 结果复盘里几乎每条都写成"对全群说"。
+        val addressee =
+            AddresseeDetector.infer(
+                message("跟我学？"),
+                recent,
+                botNames = listOf("小白"),
+                selfId = "bot-1",
+            )
+        assertEquals(AddresseeKind.BOT, addressee.kind)
+    }
+
+    @Test
+    fun `机器人刚说完别人感慨一句时仍是对全群说`() {
+        // 收紧条件的边界：既不是问句也没有第二人称，不能硬算成接机器人的话
+        val addressee =
+            AddresseeDetector.infer(
+                message("今天好累啊"),
+                recent,
+                botNames = listOf("小白"),
+                selfId = "bot-1",
+            )
+        assertEquals(AddresseeKind.GROUP, addressee.kind)
+    }
+
+    @Test
     fun `回答机器人刚提的问题时认为是对机器人说的`() {
         val history =
             listOf(

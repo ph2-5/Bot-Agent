@@ -18,8 +18,8 @@ android {
         applicationId = "com.qbot.app"
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = 50
-        versionName = "2.15.4"
+        versionCode = 51
+        versionName = "2.15.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

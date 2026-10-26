@@ -48,6 +48,13 @@ data class Addressee(
  * 都对不上就认为是对全群说的，交给模型按语境判断。
  */
 object AddresseeDetector {
+    /**
+     * 「你刚说完、对方接上」的时间窗。
+     *
+     * 超过一分钟就不像在接你的话了——群里话题换得比这快得多。
+     */
+    private const val REPLY_WINDOW_MILLIS = 60_000L
+
     fun infer(
         message: IncomingMessage,
         recent: List<RoomMessage>,
@@ -97,6 +104,33 @@ object AddresseeDetector {
                 Addressee(AddresseeKind.BOT, null, "叫了你的名字")
             } else {
                 Addressee(AddresseeKind.MEMBER, called, "开头叫了对方的名字")
+            }
+        }
+
+        // 4.4) 你刚说完，对方接着追问 / 用「你」回应：在跟你说话。
+        //
+        // 下面的两人对话判定只要 recent 里有你自己的发言就直接失效，
+        // 而"我刚说完、对方接上"恰恰是最常见的形态——双 bot 对谈尤其如此。
+        // 结果是复盘里几乎每条都显示"对全群说"，模型也拿不到正确信号。
+        //
+        // 条件必须收紧：机器人说完一句，别人接着说"今天好累啊"是对全群感慨，
+        // 不能算接话。所以要求「问句」或「出现第二人称」才算指向你。
+        val last = recent.lastOrNull()
+        if (last != null &&
+            last.role == "assistant" &&
+            !message.senderId.isNullOrBlank() &&
+            message.senderId != selfId &&
+            message.timestampMillis >= last.timestampMillis &&
+            message.timestampMillis - last.timestampMillis <= REPLY_WINDOW_MILLIS
+        ) {
+            val trimmed = text.trimEnd()
+            val looksLikeReply =
+                trimmed.endsWith("?") ||
+                    trimmed.endsWith("？") ||
+                    text.contains("你") ||
+                    text.contains("您")
+            if (looksLikeReply) {
+                return Addressee(AddresseeKind.BOT, null, "你刚说完，对方在接你的话")
             }
         }
 
