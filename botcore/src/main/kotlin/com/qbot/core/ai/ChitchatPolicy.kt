@@ -40,8 +40,14 @@ data class ScoreWeights(
 data class ChitchatConfig(
     /** 总开关 */
     val enabled: Boolean = false,
-    /** 基础冷却时间（毫秒）；下限 1 秒，实际冷却按群活跃度自适应缩放 */
-    val baseCooldownMillis: Long = 45_000L,
+    /**
+     * 基础冷却时间（毫秒）；下限 1 秒，实际冷却按群活跃度自适应缩放。
+     *
+     * 默认 3 秒而不是 45 秒：AI 判断开启时，"该不该接"已经由模型决定，
+     * 冷却只该防"同一秒连发两条"。旧默认 45 秒是规则时代的产物——
+     * 那时没有模型判断，冷却同时兼任节奏与成本闸门。
+     */
+    val baseCooldownMillis: Long = 3_000L,
     /** 每群每小时最多接话次数；**0 表示不限制** */
     val maxPerHour: Int = 60,
     /** 每群每天最多接话次数；**0 表示不限制** */
@@ -110,8 +116,25 @@ sealed class ChitchatGate {
     /** 值得进一步判断的候选 */
     data class Candidate(val score: Int) : ChitchatGate()
 
+    /**
+     * 只是「还没轮到」——等一会儿重新判定，不是放弃。
+     *
+     * 冷却的本质是节奏而不是拒绝：群里刚说完一句，两秒后再接完全自然。
+     * 但超过 [MAX_DEFER_MILLIS] 的冷却（比如默认几十秒）等到了话题也过去了，
+     * 由调用方转成 Skip。
+     */
+    data class Defer(val reason: String, val delayMillis: Long) : ChitchatGate() {
+        /** 等待期间又来了新消息时，用新消息替换旧内容（覆盖式，不排队） */
+        fun capped(maxMillis: Long): Defer = copy(delayMillis = delayMillis.coerceAtMost(maxMillis))
+    }
+
     /** 放弃 */
     data class Skip(val reason: String) : ChitchatGate()
+
+    companion object {
+        /** 最长等多久：超过这个时长，等到也没有意义了 */
+        const val MAX_DEFER_MILLIS = 10_000L
+    }
 }
 
 /**
@@ -291,22 +314,28 @@ class ChitchatPolicy(
             // 被指名冒犯是次高优先级：这是"人设是否可信"的问题，
             // 不能交给概率和 AI 判断。仍保留最小间隔，避免对骂刷屏。
             if (insulted) {
-                if (now - state.lastSpokeAt < NAME_MIN_GAP_MILLIS) {
-                    return ChitchatGate.Skip("刚说过话，冒犯回应冷却中")
+                val waited = now - state.lastSpokeAt
+                if (waited < NAME_MIN_GAP_MILLIS) {
+                    // 回嘴晚两秒不影响效果——等，而不是丢
+                    return ChitchatGate.Defer("刚说过话，冒犯回应稍后", NAME_MIN_GAP_MILLIS - waited)
                 }
                 return ChitchatGate.Forced("被指名冒犯")
             }
 
             if (named) {
-                if (now - state.lastSpokeAt < NAME_MIN_GAP_MILLIS) {
-                    return ChitchatGate.Skip("刚说过话，名字问候冷却中")
+                val waited = now - state.lastSpokeAt
+                if (waited < NAME_MIN_GAP_MILLIS) {
+                    // 「叫了名字必答」是产品承诺，绝不能因为 5 秒间隔就装死
+                    return ChitchatGate.Defer("刚说过话，名字问候稍后", NAME_MIN_GAP_MILLIS - waited)
                 }
                 return ChitchatGate.Forced("有人叫了机器人的名字")
             }
 
             val cooldown = adaptiveCooldown(state, config, now)
-            if (now - state.lastSpokeAt < cooldown) {
-                return ChitchatGate.Skip("冷却中（${cooldown / 1000} 秒）")
+            val waited = now - state.lastSpokeAt
+            if (waited < cooldown) {
+                // 冷却 = 等一等，不是不说话；等太久（默认几十秒）则由调用方转成跳过
+                return ChitchatGate.Defer("冷却中（${cooldown / 1000} 秒）", cooldown - waited)
             }
 
             // AI 主导模式：规则层只负责挡"明显噪音"（单字、@别人、刷屏等
@@ -485,5 +514,6 @@ fun ChitchatGate.describe(): String =
     when (this) {
         is ChitchatGate.Forced -> "接话：$reason"
         is ChitchatGate.Candidate -> "候选（规则 $score 分）"
+        is ChitchatGate.Defer -> "等 ${delayMillis / 1000} 秒再接：$reason"
         is ChitchatGate.Skip -> "不接：$reason"
     }

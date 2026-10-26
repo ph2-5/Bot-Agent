@@ -125,21 +125,33 @@ fun ChitchatPage(onBack: () -> Unit) {
         SectionHeader("频率", "先挡住「说太多」，剩下才轮到内容判断")
         SettingsCard {
             var cooldown by remember(config.baseCooldownMillis) {
-                mutableFloatStateOf((config.baseCooldownMillis / 1000).toFloat().coerceIn(1f, 300f))
+                mutableFloatStateOf((config.baseCooldownMillis / 1000).toFloat().coerceIn(1f, 60f))
             }
             Text(
-                "冷却 ${cooldown.toInt()} 秒（群里聊得热闹时自动放慢，冷场时加快；最低 1 秒）",
+                "冷却 ${cooldown.toInt()} 秒" +
+                    "（热闹时 ×2 → ${(cooldown * 2).toInt()} 秒，冷场 ×0.6）",
                 style = MaterialTheme.typography.labelMedium,
             )
             Slider(
                 value = cooldown,
                 onValueChange = { cooldown = it },
-                valueRange = 1f..300f,
+                valueRange = 1f..60f,
+                steps = 58,
                 enabled = config.enabled,
                 onValueChangeFinished = {
-                    update(config.copy(baseCooldownMillis = cooldown.toInt().coerceIn(1, 300) * 1000L))
+                    update(config.copy(baseCooldownMillis = cooldown.toInt().coerceIn(1, 60) * 1000L))
                 },
             )
+            HintText(
+                "冷却不是不说话，是等一等再说：到点会重新判断一次，" +
+                    "超过 10 秒的冷却直接放弃（那时话题已经过去了）。",
+            )
+            if (config.aiJudge && cooldown <= 5f) {
+                HintText(
+                    "冷却 ≤5 秒且开着 AI 判断：每条候选消息都会调用一次判断模型，" +
+                        "活跃群里成本会明显上升——真正管总量的是下面的每小时上限。",
+                )
+            }
 
             var hourly by remember(config.maxPerHour) {
                 mutableFloatStateOf(config.maxPerHour.toFloat().coerceIn(0f, 200f))

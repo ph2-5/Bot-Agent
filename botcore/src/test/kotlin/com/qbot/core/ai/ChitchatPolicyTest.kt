@@ -55,7 +55,9 @@ class ChitchatPolicyTest {
             policy.markSpoke("g1")
             now += 3_000
             val gate = policy.gate("g1", "小白，小白！", names, config())
-            assertTrue("刚说过话时名字也不该连续触发，实际=$gate", gate is ChitchatGate.Skip)
+            // 冷却不是拒绝：等剩下的 2 秒再答，而不是装死
+            assertTrue("刚说过话时应等待而不是丢弃，实际=$gate", gate is ChitchatGate.Defer)
+            assertEquals(2_000L, (gate as ChitchatGate.Defer).delayMillis)
         }
 
     @Test
@@ -100,12 +102,15 @@ class ChitchatPolicyTest {
         }
 
     @Test
-    fun `冷却期内普通消息被跳过`() =
+    fun `冷却期内普通消息先等待而不是丢弃`() =
         runTest {
             policy.markSpoke("g1")
             now += 30_000
             val gate = policy.gate("g1", "今晚有人开黑吗", names, config(baseCooldownMillis = 90_000))
-            assertTrue("冷却中应跳过，实际=$gate", gate is ChitchatGate.Skip)
+            assertTrue("冷却中应给出等待时长，实际=$gate", gate is ChitchatGate.Defer)
+            // 基配 90 秒、冷场 ×0.6 → 54 秒；已过 30 秒，剩 24 秒。
+            // 调用方会判定「太久」并转成跳过，但这里先如实报出剩余时间
+            assertEquals(24_000L, (gate as ChitchatGate.Defer).delayMillis)
         }
 
     @Test
@@ -205,7 +210,7 @@ class ChitchatPolicyTest {
             now += 3_000
             val gate =
                 policy.gate("g1", "阿远你个傻逼", listOf("过去的阿远"), config(), insulted = true)
-            assertTrue("刚说过话时骂人回应也不该刷屏，实际=$gate", gate is ChitchatGate.Skip)
+            assertTrue("刚说过话时骂人回应应等待，实际=$gate", gate is ChitchatGate.Defer)
         }
 
     @Test

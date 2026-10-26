@@ -267,6 +267,25 @@ class BotRuntime(
     private val spokeAtMillis = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     /**
+     * 正在生成回复的群。
+     *
+     * 从判定通过到真正发出去要过 AI 判断和拟人延迟（1-8 秒），这段时间里
+     * 同群再进来一条消息，如果只看「上次发言时间」，它会以为"我还没说话"，
+     * 于是又回一句——同一秒两条消息各回一次，就是双回。
+     *
+     * 用 putIfAbsent 占位：后来的消息看到已占位就放弃这一轮。
+     */
+    private val generatingGroups = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * 正在等冷却的群。
+     *
+     * 冷却改成「等一会儿再判定」之后，刷屏的群会同时挂起一串等待协程；
+     * 同群只保留一条，等完重判一次就够。
+     */
+    private val deferringGroups = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
      * 本群机器人最后一条消息 id。
      *
      * 催场必须带 `msg_id` 走被动回复，否则算主动消息、会被额度与开关拦住
@@ -841,8 +860,14 @@ class BotRuntime(
         // 开关默认 OFF，此时 sceneLook 直接返回 null，下面与 2.12.0 完全一致。
         val sceneLook = sceneLook(message, text)
 
-        val gate =
+        // 抽成函数是为了"等冷却之后重判一次"——等待期间可能已经有人回了话，
+        // 或者对方已经划界，直接复用旧结论会答错。
+        suspend fun evaluateGate(): ChitchatGate =
             when {
+                // 同群正在生成上一条：不是"不该说"，是"轮不到这一条"。
+                // 等一小会儿再判，避免同一秒的两条消息各回一次。
+                generatingGroups.contains(groupId) ->
+                    ChitchatGate.Defer("正在回上一条", 1_200L)
                 sceneLook?.mine == true -> ChitchatGate.Forced("场景轮次：该我接")
                 addressed -> ChitchatGate.Skip("@ 了机器人，交给 @ 链路")
                 chitchatConfig == null -> ChitchatGate.Skip("群聊参与未开启")
@@ -862,6 +887,40 @@ class BotRuntime(
                     )
                 }
             }
+
+        var gate = evaluateGate()
+        if (gate is ChitchatGate.Defer) {
+            val pending = gate as ChitchatGate.Defer
+            gate =
+                when {
+                    // 冷却几十秒时等到也没意义：那时话题早换了，回过去反而突兀
+                    pending.delayMillis > ChitchatGate.MAX_DEFER_MILLIS ->
+                        ChitchatGate.Skip(
+                            "冷却 ${pending.delayMillis / 1000} 秒太久，等到话题也过去了",
+                        )
+                    !deferringGroups.add(groupId) ->
+                        ChitchatGate.Skip("已有消息在等冷却")
+                    else -> {
+                        try {
+                            log(
+                                LogLevel.VERBOSE,
+                                TAG,
+                                "等 ${pending.delayMillis}ms 再判定（${pending.reason}）",
+                            )
+                            // 多等 80ms：冷却按毫秒比，边界上容易差一两毫秒又判成冷却中
+                            delay(pending.delayMillis + 80)
+                            val again = evaluateGate()
+                            if (again is ChitchatGate.Defer) {
+                                ChitchatGate.Skip("等待后仍在冷却（${again.reason}）")
+                            } else {
+                                again
+                            }
+                        } finally {
+                            deferringGroups.remove(groupId)
+                        }
+                    }
+                }
+        }
 
         // 规则层已经认定「这是在叫它 / 在骂它」时，对话对象必须跟着一致。
         // 否则会出现自相矛盾：它明明照着"叫名字必答"回了话，
@@ -927,15 +986,35 @@ class BotRuntime(
             when (gate) {
                 is ChitchatGate.Forced -> ChimeDecisionRecord.GATE_FORCED
                 is ChitchatGate.Candidate -> ChimeDecisionRecord.GATE_CANDIDATE
+                // 上面的等待逻辑已经把 Defer 消化掉了；走到这里只可能是
+                // 等待失败后的兜底，按跳过记账即可。
+                is ChitchatGate.Defer -> ChimeDecisionRecord.GATE_SKIP
                 is ChitchatGate.Skip -> ChimeDecisionRecord.GATE_SKIP
             }
         val ruleScore = (gate as? ChitchatGate.Candidate)?.score
+
+        // 占位：从这一刻到发出去之间（AI 判断 + 拟人延迟）不再接同群的其他消息。
+        // 只有真的准备回才占；Skip 不占，否则会把正常聊天挡掉 1-8 秒。
+        var ownsInFlight = false
+        if (gate is ChitchatGate.Forced || gate is ChitchatGate.Candidate) {
+            if (generatingGroups.add(groupId)) {
+                ownsInFlight = true
+            } else {
+                gate = ChitchatGate.Skip("正在回上一条")
+            }
+        }
 
         try {
             val why =
                 when (val current = gate) {
                     is ChitchatGate.Skip -> {
                         log(LogLevel.VERBOSE, TAG, "群聊消息不接：${current.reason}")
+                        return
+                    }
+
+                    // 不该出现：等待逻辑已经消化掉了
+                    is ChitchatGate.Defer -> {
+                        log(LogLevel.VERBOSE, TAG, "群聊消息仍待定：${current.reason}")
                         return
                     }
 
@@ -1106,6 +1185,9 @@ class BotRuntime(
                 log(LogLevel.WARN, TAG, "群聊插话失败：${t.message}")
             }
         } finally {
+            // 先释放占位，再写复盘记录——否则复盘写库慢的时候，
+            // 同群的新消息会一直被这个标记挡住。
+            if (ownsInFlight) generatingGroups.remove(groupId)
             // 训练闭环的单一入口：成功 / 失败 / 提前返回都记一条
             chimeTrainer?.let { trainer ->
                 runCatching {

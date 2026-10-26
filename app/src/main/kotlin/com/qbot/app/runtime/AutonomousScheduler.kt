@@ -76,8 +76,14 @@ class AutonomousScheduler(
         private const val HARD_SPEAK_WINDOW_MILLIS = 30 * 60_000L
         private const val HARD_SPEAK_LIMIT = 2
 
-        /** chime 刚回过的时间窗：这段时间内自主完全不评估 */
-        private const val CHIME_GUARD_MILLIS = 5 * 60_000L
+        /**
+         * chime 刚回过的时间窗：这段时间内自主完全不评估。
+         *
+         * 原本是 5 分钟——但它的目的只是"别在 chime 刚说完后又自己接一句"，
+         * 一两分钟足够。5 分钟会让活跃群里的自主开口几乎永远不触发，
+         * 等于把整个功能关掉。
+         */
+        private const val CHIME_GUARD_MILLIS = 2 * 60_000L
 
         /** 便宜模型判定的每天上限：超过就只跑本地闸门 */
         private const val MAX_GATE_CALLS_PER_DAY = 120
