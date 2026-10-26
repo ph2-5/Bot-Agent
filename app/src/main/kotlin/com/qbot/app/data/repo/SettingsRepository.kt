@@ -20,6 +20,7 @@ import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.DriveConfig
 import com.qbot.core.ai.DriveSensitivity
+import com.qbot.core.ai.EmbeddingConfig
 import com.qbot.core.ai.MemoryConfig
 import com.qbot.core.ai.SceneMode
 import com.qbot.core.ai.ScoreWeights
@@ -155,6 +156,15 @@ class SettingsRepository(
         /** 高级参数是否展开（只影响界面，不影响行为） */
         val MEMORY_ADVANCED_VISIBLE = booleanPreferencesKey("memory_advanced_visible")
 
+        // ---- 向量记忆（embedding，与主 AI / 辅助 AI 各自独立） ----
+        val EMBEDDING_ENABLED = booleanPreferencesKey("embedding_enabled")
+        val EMBEDDING_PROVIDER = stringPreferencesKey("embedding_provider")
+        val EMBEDDING_BASE_URL = stringPreferencesKey("embedding_base_url")
+        val EMBEDDING_MODEL = stringPreferencesKey("embedding_model")
+        /** 由「测试连接」探测后写入；0 表示未探测 */
+        val EMBEDDING_DIM = intPreferencesKey("embedding_dim")
+        val EMBEDDING_TIMEOUT_SECONDS = intPreferencesKey("embedding_timeout_seconds")
+
         // ---- 群感知 ----
         val GREETING_ENABLED = booleanPreferencesKey("greeting_enabled")
         val GREETING_TEXT = stringPreferencesKey("greeting_text")
@@ -209,6 +219,7 @@ class SettingsRepository(
         private const val KEY_CLIENT_SECRET = "client_secret"
         private const val KEY_AI_API_KEY = "ai_api_key"
         private const val KEY_AUX_AI_API_KEY = "aux_ai_api_key"
+        private const val KEY_EMBEDDING_API_KEY = "embedding_api_key"
 
         /** 删除机器人时释放设置文件缓存（DataStore 同一文件只能有一个活动实例）。 */
         fun forget(botId: String?) {
@@ -327,6 +338,19 @@ class SettingsRepository(
     private val _sceneMode = MutableStateFlow(SceneMode.OFF)
     val sceneMode: StateFlow<SceneMode> = _sceneMode.asStateFlow()
 
+    /**
+     * 向量记忆配置。
+     *
+     * 与主 AI / 辅助 AI 完全独立：默认关闭、维度未探测（0），
+     * 此时检索走纯倒排，行为与 2.14.1 逐字节一致。
+     * API Key 与其它凭证一样只进加密存储。
+     */
+    private val _embeddingConfig =
+        MutableStateFlow(
+            EmbeddingConfig(apiKey = encryptedPrefs.getString(KEY_EMBEDDING_API_KEY, "").orEmpty()),
+        )
+    val embeddingConfig: StateFlow<EmbeddingConfig> = _embeddingConfig.asStateFlow()
+
     init {
         // DataStore 的变更合并进 StateFlow；加密偏好里的 apiKey 每次重新读，
         // 保证用户在设置页改完 Key 后保存即可生效。
@@ -335,6 +359,7 @@ class SettingsRepository(
                 _aiConfig.value = readAiConfig(prefs)
                 _auxAiConfig.value = readAuxAiConfig(prefs)
                 _memoryConfig.value = readMemoryConfig(prefs)
+                _embeddingConfig.value = readEmbeddingConfig(prefs)
                 _greetingConfig.value = readGreetingConfig(prefs)
                 _chitchatConfig.value = readChitchatConfig(prefs)
                 _autonomyConfig.value = readAutonomyConfig(prefs)
@@ -594,6 +619,45 @@ class SettingsRepository(
         _sceneMode.value = mode
         scope.launch {
             dataStore.edit { prefs -> prefs[Keys.SCENE_MODE] = mode.name }
+        }
+    }
+
+    // ---------- 向量记忆 ----------
+
+    private fun readEmbeddingConfig(prefs: Preferences): EmbeddingConfig {
+        val defaults = EmbeddingConfig()
+        return EmbeddingConfig(
+            enabled = prefs[Keys.EMBEDDING_ENABLED] ?: defaults.enabled,
+            provider = prefs[Keys.EMBEDDING_PROVIDER] ?: defaults.provider,
+            baseUrl = prefs[Keys.EMBEDDING_BASE_URL] ?: defaults.baseUrl,
+            apiKey = encryptedPrefs.getString(KEY_EMBEDDING_API_KEY, "").orEmpty(),
+            model = prefs[Keys.EMBEDDING_MODEL] ?: defaults.model,
+            dim = prefs[Keys.EMBEDDING_DIM] ?: defaults.dim,
+            timeoutSeconds =
+                (prefs[Keys.EMBEDDING_TIMEOUT_SECONDS] ?: defaults.timeoutSeconds.toInt()).toLong(),
+        )
+    }
+
+    /** 保存向量记忆配置。apiKey 单独走加密存储。 */
+    fun saveEmbeddingConfig(config: EmbeddingConfig) {
+        encryptedPrefs.edit()
+            .putString(KEY_EMBEDDING_API_KEY, config.apiKey.trim())
+            .apply()
+        _embeddingConfig.value =
+            config.copy(
+                apiKey = config.apiKey.trim(),
+                baseUrl = config.baseUrl.trim(),
+                model = config.model.trim(),
+            )
+        scope.launch {
+            dataStore.edit { prefs ->
+                prefs[Keys.EMBEDDING_ENABLED] = config.enabled
+                prefs[Keys.EMBEDDING_PROVIDER] = config.provider
+                prefs[Keys.EMBEDDING_BASE_URL] = config.baseUrl.trim()
+                prefs[Keys.EMBEDDING_MODEL] = config.model.trim()
+                prefs[Keys.EMBEDDING_DIM] = config.dim
+                prefs[Keys.EMBEDDING_TIMEOUT_SECONDS] = config.timeoutSeconds.toInt()
+            }
         }
     }
 

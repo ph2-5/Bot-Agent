@@ -218,6 +218,22 @@ interface RoomMessageDao {
         limit: Int,
     ): List<RoomMessageEntity>
 
+    /**
+     * 向量化入库：取某条消息及其之前 [limit] 条的滑动窗口。
+     *
+     * 单条「哈哈哈」的向量没有信息量，要带上「谁在什么语境下说的」。
+     * 倒序取再反转，保证取到的是「离它最近」的上下文。
+     */
+    @Query(
+        "SELECT * FROM room_messages WHERE scopeKey = :scopeKey AND id <= :rowId " +
+            "ORDER BY id DESC LIMIT :limit",
+    )
+    suspend fun windowBefore(
+        scopeKey: String,
+        rowId: Long,
+        limit: Int,
+    ): List<RoomMessageEntity>
+
     /** 备份导出：最近 [limit] 条（按 id 倒序，调用方自行反转） */
     @Query("SELECT * FROM room_messages ORDER BY id DESC LIMIT :limit")
     suspend fun exportRecent(limit: Int): List<RoomMessageEntity>

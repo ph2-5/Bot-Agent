@@ -16,16 +16,20 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.padding
 import com.qbot.app.BotApplication
 import com.qbot.core.ai.AutonomyMode
 import com.qbot.core.ai.DriveSensitivity
+import com.qbot.core.ai.EmbeddingConfig
 import com.qbot.core.ai.MemoryConfig
+import kotlinx.coroutines.launch
 
 @Composable
 fun MemoryPage(onBack: () -> Unit) {
@@ -347,6 +351,9 @@ fun MemoryPage(onBack: () -> Unit) {
             }
         }
 
+        SectionHeader("向量记忆", "可选：用 embedding 做语义召回；没配就退回关键词倒排，默认行为不变")
+        VectorMemoryCard(app)
+
         SectionHeader("存量", "查看与删除具体记忆在「AI → 记忆」")
         SettingsCard {
             Text(
@@ -361,6 +368,177 @@ fun MemoryPage(onBack: () -> Unit) {
         }
     }
 }
+
+/**
+ * 向量记忆（可选层）。
+ *
+ * 未开启且用户没有主动展开时整块折叠，只留一行说明——
+ * 绝大多数用户不需要配 embedding，不能让它看起来像必填项。
+ */
+@Composable
+private fun VectorMemoryCard(app: BotApplication) {
+    val config by app.controller.embeddingConfig.collectAsState()
+    val backfill by app.controller.vectorBackfill.state.collectAsState()
+    val scope = rememberCoroutineScope()
+
+    var editing by remember { mutableStateOf(false) }
+    var provider by remember(config.provider) { mutableStateOf(config.provider) }
+    var baseUrl by remember(config.baseUrl) {
+        mutableStateOf(config.baseUrl.ifBlank { EmbeddingConfig.PRESETS[config.provider]?.baseUrl.orEmpty() })
+    }
+    var apiKey by remember(config.apiKey) { mutableStateOf(config.apiKey) }
+    var model by remember(config.model) {
+        mutableStateOf(config.model.ifBlank { EmbeddingConfig.PRESETS[config.provider]?.model.orEmpty() })
+    }
+    var dim by remember(config.dim) { mutableStateOf(config.dim) }
+    var busy by remember { mutableStateOf(false) }
+    var tip by remember { mutableStateOf<String?>(null) }
+
+    // 只在真正开着向量记忆时才刷进度：折叠状态下不做任何数据库开销
+    LaunchedEffect(config.enabled) {
+        if (config.enabled) runCatching { app.controller.vectorBackfill.refresh() }
+    }
+
+    fun draft() =
+        config.copy(
+            provider = provider,
+            baseUrl = baseUrl.trim(),
+            apiKey = apiKey.trim(),
+            model = model.trim(),
+            dim = dim,
+        )
+
+    SettingsCard {
+        SwitchRow(
+            title = "启用向量记忆",
+            desc = "配好服务商与 Key 并「测试连接」探测维度后才能开启；" +
+                "关闭时检索完全走关键词倒排，不产生任何 embedding 调用",
+            checked = config.enabled,
+            onCheckedChange = { on ->
+                if (on && dim <= 0) {
+                    tip = "还没探测到维度：请先点「测试连接」，成功后才能开启"
+                    editing = true
+                } else {
+                    app.settings.saveEmbeddingConfig(draft().copy(enabled = on))
+                    tip = null
+                }
+            },
+        )
+
+        if (!config.enabled && !editing) {
+            HintText("未开启。需要语义召回（「上次聊的那个游戏」这类模糊指代）时再配置即可。")
+            TextButton(onClick = { editing = true }) { Text("配置向量服务") }
+        } else {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                EmbeddingConfig.PRESETS.forEach { (key, preset) ->
+                    FilterChip(
+                        selected = provider == key,
+                        onClick = {
+                            provider = key
+                            if (key != "custom") {
+                                baseUrl = preset.baseUrl
+                                model = preset.model
+                            }
+                            // 换服务商后旧维度必然不可比，必须重新探测
+                            dim = 0
+                            tip = null
+                        },
+                        label = { Text(preset.label) },
+                    )
+                }
+            }
+
+            OutlinedTextField(
+                value = baseUrl,
+                onValueChange = { baseUrl = it },
+                label = { Text("接口地址（例如 https://api.siliconflow.cn/v1）") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = apiKey,
+                onValueChange = { apiKey = it },
+                label = { Text("API Key") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = model,
+                onValueChange = { model = it },
+                label = { Text("模型（如 BAAI/bge-m3）") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                if (dim > 0) "维度 $dim（由测试连接探测）" else "维度：未探测，点「测试连接」自动探测",
+                style = MaterialTheme.typography.labelMedium,
+            )
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(
+                    onClick = { app.settings.saveEmbeddingConfig(draft()) },
+                    enabled = !busy,
+                ) { Text("保存配置") }
+                TextButton(
+                    onClick = {
+                        scope.launch {
+                            busy = true
+                            tip = null
+                            app.settings.saveEmbeddingConfig(draft())
+                            app.controller.probeEmbedding(draft()).fold(
+                                onSuccess = { detected ->
+                                    dim = detected
+                                    app.settings.saveEmbeddingConfig(draft().copy(dim = detected))
+                                    tip = "连接成功：维度 $detected，可以开启向量记忆了"
+                                },
+                                onFailure = {
+                                    dim = 0
+                                    tip = "连接失败：${it.message ?: it::class.simpleName}"
+                                },
+                            )
+                            busy = false
+                        }
+                    },
+                    enabled = !busy && baseUrl.isNotBlank() && apiKey.isNotBlank() && model.isNotBlank(),
+                ) { Text(if (busy) "测试中…" else "测试连接") }
+            }
+
+            tip?.let { HintText(it, modifier = Modifier.fillMaxWidth()) }
+
+            Text(
+                "已向量化 ${backfill.done} / ${backfill.total} 条 · 占用 ${formatBytes(backfill.bytes)}",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(
+                    onClick = {
+                        app.settings.saveEmbeddingConfig(draft())
+                        app.controller.vectorBackfill.start(scope)
+                    },
+                    enabled = !backfill.running && config.enabled,
+                ) { Text("开始向量化") }
+                TextButton(
+                    onClick = { app.controller.vectorBackfill.stop() },
+                    enabled = backfill.running,
+                ) { Text("停止") }
+            }
+            backfill.message?.let { HintText(it, modifier = Modifier.fillMaxWidth()) }
+            HintText(
+                "回填不自动跑：每批 20 条、间隔 1 秒，退出页面即停，下次从断点继续。" +
+                    "向量只是加分项——接口失败会静默退回倒排，连续失败 3 次暂停 10 分钟。",
+                modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+            )
+        }
+    }
+}
+
+private fun formatBytes(bytes: Long): String =
+    when {
+        bytes <= 0 -> "0MB"
+        bytes < 1024 * 1024 -> "${"%.0f".format(bytes / 1024.0)}KB"
+        else -> "${"%.1f".format(bytes / 1024.0 / 1024.0)}MB"
+    }
 
 /** 档位在人话里的名字；与 `AiScreen` 里的按群覆盖保持同一套措辞。 */
 private fun AutonomyMode.label(): String =

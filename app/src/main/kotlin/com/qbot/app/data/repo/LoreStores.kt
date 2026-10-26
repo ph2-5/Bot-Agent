@@ -9,6 +9,7 @@ import com.qbot.core.ai.LoreEntry
 import com.qbot.core.ai.LoreKind
 import com.qbot.core.ai.LoreSource
 import com.qbot.core.ai.LoreStore
+import com.qbot.core.ai.MemoryKind
 import com.qbot.core.ai.StyleRule
 import com.qbot.core.ai.StyleRuleCategory
 import com.qbot.core.ai.StyleRuleSource
@@ -26,6 +27,8 @@ import java.util.UUID
 class RoomLoreStore(
     private val dao: LoreDao,
     private val clock: () -> Long = System::currentTimeMillis,
+    /** 向量写入（可选）：人设设定只参与向量入库，不参与回复上下文检索 */
+    private val vectorIndexer: MemoryVectorIndexer? = null,
 ) : LoreStore {
     fun observeAll(): Flow<List<LoreEntry>> =
         dao.observeAll().map { rows -> rows.map { it.toModel() } }
@@ -45,32 +48,41 @@ class RoomLoreStore(
         val existing = dao.find(entry.personaId, entry.kind.name, name, entry.scopeGroupId)
         if (existing != null) {
             // 同一条设定重复抽取/手动改：覆盖正文与来源，保留 id 与创建时间
-            dao.upsert(
+            val row =
                 entry.copy(name = name, note = note).toEntity(now).copy(
                     id = existing.id,
                     createdAt = existing.createdAt,
                     updatedAt = now,
-                ),
-            )
+                )
+            dao.upsert(row)
+            vectorIndexer?.enqueueLore(row)
             return existing.id
         }
-        return dao.upsert(
+        val row =
             entry.copy(name = name, note = note).toEntity(now).copy(
                 id = 0,
                 createdAt = now,
                 updatedAt = now,
-            ),
-        )
+            )
+        val id = dao.upsert(row)
+        vectorIndexer?.enqueueLore(row.copy(id = id))
+        return id
     }
 
-    override suspend fun delete(id: Long) = dao.delete(id)
+    override suspend fun delete(id: Long) {
+        dao.delete(id)
+        vectorIndexer?.forget(MemoryKind.LORE, id)
+    }
 
     override suspend fun setEnabled(
         id: Long,
         enabled: Boolean,
     ) = dao.setEnabled(id, enabled, clock())
 
-    override suspend fun clearPersona(personaId: Long?) = dao.clearPersona(personaId)
+    override suspend fun clearPersona(personaId: Long?) {
+        dao.clearPersona(personaId)
+        vectorIndexer?.pruneOrphans()
+    }
 }
 
 /**

@@ -13,6 +13,7 @@ import com.qbot.core.ai.BotMood
 import com.qbot.core.ai.MemeImage
 import com.qbot.core.ai.MemeLibrary
 import com.qbot.core.ai.MemeReader
+import com.qbot.core.ai.MemoryKind
 import com.qbot.core.ai.MoodPolicy
 import com.qbot.core.model.IncomingMessage
 import com.qbot.core.ai.PersonRelation
@@ -69,6 +70,8 @@ class RoomSocialStore(
      * 为 null 时退化为「只存链接」，与接入前一致。
      */
     private val imageStore: LocalImageStore? = null,
+    /** 向量写入（可选）：梗库只参与向量入库，不参与回复上下文检索 */
+    private val vectorIndexer: MemoryVectorIndexer? = null,
     private val clock: () -> Long = System::currentTimeMillis,
 ) : SocialContextProvider, RelationRecorder, MemeLibrary, MemeReader {
     /** 读-改-写要串行，否则并发两条消息会把彼此的增量覆盖掉 */
@@ -260,29 +263,42 @@ class RoomSocialStore(
     suspend fun upsertSlang(term: SlangTerm): Long {
         val now = clock()
         val existing = slangDao.find(term.term, term.scopeGroupId)
-        return if (existing == null) {
-            slangDao.upsert(term.copy(createdAt = now, updatedAt = now).toEntity())
-        } else {
-            slangDao.upsert(
-                existing.copy(
-                    meaning = term.meaning.ifBlank { existing.meaning },
-                    usage = term.usage ?: existing.usage,
-                    hits = existing.hits + term.hits.coerceAtLeast(1),
-                    enabled = true,
-                    updatedAt = now,
-                ),
-            )
+        if (existing == null) {
+            val row = term.copy(createdAt = now, updatedAt = now).toEntity()
+            val id = slangDao.upsert(row)
+            vectorIndexer?.enqueueSlang(row.copy(id = id))
+            return id
         }
+        val row =
+            existing.copy(
+                meaning = term.meaning.ifBlank { existing.meaning },
+                usage = term.usage ?: existing.usage,
+                hits = existing.hits + term.hits.coerceAtLeast(1),
+                enabled = true,
+                updatedAt = now,
+            )
+        slangDao.upsert(row)
+        vectorIndexer?.enqueueSlang(row)
+        return row.id
     }
 
     suspend fun setSlangEnabled(id: Long, enabled: Boolean) =
         slangDao.setEnabled(id, enabled, clock())
 
-    suspend fun deleteSlang(id: Long) = slangDao.delete(id)
+    suspend fun deleteSlang(id: Long) {
+        slangDao.delete(id)
+        vectorIndexer?.forget(MemoryKind.SLANG, id)
+    }
 
-    suspend fun clearSlang() = slangDao.clear()
+    suspend fun clearSlang() {
+        slangDao.clear()
+        vectorIndexer?.pruneOrphans()
+    }
 
-    suspend fun trimSlang(keep: Int) = slangDao.trim(keep)
+    suspend fun trimSlang(keep: Int) {
+        slangDao.trim(keep)
+        vectorIndexer?.pruneOrphans()
+    }
 
     // ---- 表情包库 ----
 

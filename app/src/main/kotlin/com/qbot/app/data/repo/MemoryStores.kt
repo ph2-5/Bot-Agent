@@ -91,6 +91,8 @@ class RoomFactStore(
     private val dao: FactDao,
     /** 索引写入（可选）：为 null 时不建索引，行为与旧版一致 */
     private val indexer: RoomMemoryIndexer? = null,
+    /** 向量写入（可选）：只有用户配好 embedding 时才有值 */
+    private val vectorIndexer: MemoryVectorIndexer? = null,
 ) : MemoryStore {
     override suspend fun facts(senderId: String): List<UserFact> =
         dao.forSender(senderId).map { it.toFact() }
@@ -106,17 +108,20 @@ class RoomFactStore(
             )
         val id = dao.insert(entity)
         indexer?.indexFact(entity.copy(id = id))
+        vectorIndexer?.enqueueFact(entity.copy(id = id))
         return id
     }
 
     override suspend fun delete(factId: Long) {
         dao.deleteById(factId)
         indexer?.forgetFact(factId)
+        vectorIndexer?.forget(MemoryKind.FACT, factId)
     }
 
     override suspend fun deleteAll(senderId: String) {
         dao.deleteAllForSender(senderId)
         indexer?.clearScope(ConversationKeys.factScope(senderId), MemoryKind.FACT)
+        vectorIndexer?.pruneOrphans()
     }
 
     override suspend fun trimTo(
@@ -125,6 +130,7 @@ class RoomFactStore(
     ) {
         dao.trimTo(senderId, keep)
         indexer?.pruneFacts(senderId)
+        vectorIndexer?.pruneOrphans()
     }
 
     override suspend fun trimAll(keep: Int) {
@@ -133,6 +139,7 @@ class RoomFactStore(
             dao.trimTo(sender, keep)
             indexer?.pruneFacts(sender)
         }
+        vectorIndexer?.pruneOrphans()
     }
 
     private fun FactEntity.toFact(): UserFact =
@@ -157,6 +164,8 @@ class RoomSharedContextStore(
     private val dao: RoomMessageDao,
     /** 索引写入（可选）：为 null 时不建索引，行为与旧版一致 */
     private val indexer: RoomMemoryIndexer? = null,
+    /** 向量写入（可选）：只有用户配好 embedding 时才有值 */
+    private val vectorIndexer: MemoryVectorIndexer? = null,
 ) : RoomContextStore {
     override suspend fun recent(
         scopeKey: String,
@@ -188,6 +197,7 @@ class RoomSharedContextStore(
             )
         val id = dao.insert(entity)
         indexer?.indexRoomMessage(scopeKey, entity.copy(id = id))
+        vectorIndexer?.enqueueRoom(scopeKey, entity.copy(id = id))
     }
 
     override suspend fun trim(
@@ -197,6 +207,7 @@ class RoomSharedContextStore(
         dao.trim(scopeKey, keep)
         // 裁掉的老消息对应的索引条目一并清掉，否则检索会命中不存在的行
         indexer?.pruneRoom(scopeKey)
+        vectorIndexer?.pruneOrphans()
     }
 
     override suspend fun findByExternalId(

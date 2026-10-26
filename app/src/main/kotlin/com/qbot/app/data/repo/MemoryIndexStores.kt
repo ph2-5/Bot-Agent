@@ -211,6 +211,9 @@ class RoomMemorySearcher(
                         personaId = message.personaId,
                     )
                 }
+
+                // 人设设定与梗库目前只参与向量入库，不进回复上下文
+                MemoryKind.LORE, MemoryKind.SLANG -> null
             }
         }.take(limit)
     }

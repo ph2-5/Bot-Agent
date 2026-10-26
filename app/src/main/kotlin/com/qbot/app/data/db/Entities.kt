@@ -152,12 +152,13 @@ interface AiHistoryDao {
         LoreEntity::class,
         StyleRuleEntity::class,
         MemoryTermEntity::class,
+        MemoryVectorEntity::class,
         AutonomousDecisionEntity::class,
         GroupBehaviorEntity::class,
         SceneEntity::class,
         SceneDecisionEntity::class,
     ],
-    version = 20,
+    version = 21,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -201,6 +202,8 @@ abstract class AppDatabase : RoomDatabase() {
 
     abstract fun memoryTermDao(): MemoryTermDao
 
+    abstract fun memoryVectorDao(): MemoryVectorDao
+
     abstract fun autonomousDecisionDao(): AutonomousDecisionDao
 
     abstract fun groupBehaviorDao(): GroupBehaviorDao
@@ -243,6 +246,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_17_18,
                     MIGRATION_18_19,
                     MIGRATION_19_20,
+                    MIGRATION_20_21,
                 )
                 .build()
 
@@ -921,6 +925,40 @@ abstract class AppDatabase : RoomDatabase() {
                 override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
                     db.execSQL("ALTER TABLE `scenes` ADD COLUMN `contractJson` TEXT")
                     db.execSQL("ALTER TABLE `autonomous_decisions` ADD COLUMN `suppressedBy` TEXT")
+                }
+            }
+
+        /**
+         * v20 → v21：可选向量化记忆。
+         *
+         * 纯增量：只建 `memory_vectors`。老库升级后向量表为空，
+         * 检索立刻退回纯倒排——与 2.14.1 的行为一致。
+         */
+        val MIGRATION_20_21 =
+            object : androidx.room.migration.Migration(20, 21) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS `memory_vectors` (
+                            `kind` TEXT NOT NULL,
+                            `refId` INTEGER NOT NULL,
+                            `model` TEXT NOT NULL,
+                            `dim` INTEGER NOT NULL,
+                            `scopeKey` TEXT NOT NULL,
+                            `vec` BLOB NOT NULL,
+                            `createdAt` INTEGER NOT NULL,
+                            PRIMARY KEY(`kind`, `refId`, `model`)
+                        )
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_memory_vectors_scopeKey`" +
+                            " ON `memory_vectors` (`scopeKey`)",
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_memory_vectors_kind`" +
+                            " ON `memory_vectors` (`kind`)",
+                    )
                 }
             }
     }

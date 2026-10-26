@@ -43,7 +43,10 @@ import com.qbot.app.data.repo.RoomIdentityStore
 import com.qbot.app.data.repo.RoomInnerThoughtSink
 import com.qbot.app.data.media.LocalImageStore
 import com.qbot.app.data.repo.RoomLoreStore
+import com.qbot.app.data.repo.HybridMemorySearcher
 import com.qbot.app.data.repo.LlmMemoryReranker
+import com.qbot.app.data.repo.MemoryVectorBackfill
+import com.qbot.app.data.repo.MemoryVectorIndexer
 import com.qbot.app.data.repo.RoomMemoryIndexer
 import com.qbot.app.data.repo.RoomMemorySearcher
 import com.qbot.app.data.repo.RoomSceneStore
@@ -71,6 +74,9 @@ import com.qbot.core.ai.ChimeReflection
 import com.qbot.core.ai.ChimeStats
 import com.qbot.core.ai.FactKind
 import com.qbot.core.ai.FactSource
+import com.qbot.core.ai.EmbeddingClient
+import com.qbot.core.ai.EmbeddingConfig
+import com.qbot.core.ai.EmbeddingGuard
 import com.qbot.core.ai.EmptyContentException
 import com.qbot.core.ai.GenerationLimits
 import com.qbot.core.ai.LessonCategories
@@ -249,12 +255,60 @@ class BotController(
             logger = { logger.d("MemoryIndex", it) },
         )
 
-    /** 检索器：索引命中后回查原文，交给管线做最终注入。 */
-    private val memorySearcher =
+    /**
+     * 向量化（可选）：用户没配 embedding 时整条链路不工作，
+     * 检索结果与 2.14.1 的纯倒排逐字节一致。
+     */
+    private val embeddingClient = EmbeddingClient(http)
+
+    private val embeddingGuard = EmbeddingGuard()
+
+    private val memoryVectorIndexer =
+        MemoryVectorIndexer(
+            dao = database.memoryVectorDao(),
+            roomDao = database.roomMessageDao(),
+            client = embeddingClient,
+            guard = embeddingGuard,
+            configProvider = { settings.embeddingConfig.value },
+            scope = scope,
+            logger = { logger.d("MemoryVector", it) },
+        )
+
+    /** 倒排检索器（命中后回查原文），作为混合检索的基线。 */
+    private val invertedMemorySearcher =
         RoomMemorySearcher(
             termDao = database.memoryTermDao(),
             factDao = database.factDao(),
             roomDao = database.roomMessageDao(),
+        )
+
+    /**
+     * 检索器：倒排 + 向量 → RRF 融合。
+     *
+     * 未配置 / 开关关闭 / 熔断中 / 调用失败都原样返回倒排结果，
+     * 向量层永远只是「加分项」，坏了不影响回复。
+     */
+    private val memorySearcher =
+        HybridMemorySearcher(
+            inverted = invertedMemorySearcher,
+            vectorDao = database.memoryVectorDao(),
+            factDao = database.factDao(),
+            roomDao = database.roomMessageDao(),
+            client = embeddingClient,
+            guard = embeddingGuard,
+            configProvider = { settings.embeddingConfig.value },
+            logger = { logger.d("MemoryVector", it) },
+        )
+
+    /** 存量记忆向量化（手动触发，不自动跑）。 */
+    val vectorBackfill =
+        MemoryVectorBackfill(
+            dao = database.memoryVectorDao(),
+            roomDao = database.roomMessageDao(),
+            client = embeddingClient,
+            guard = embeddingGuard,
+            configProvider = { settings.embeddingConfig.value },
+            logger = { logger.d("MemoryVector", it) },
         )
 
     /** 精排器：只有「辅助模型精排」开关打开时才会被管线调用。 */
@@ -270,10 +324,11 @@ class BotController(
     }
 
     /** 事实存储，供维护端「删除某条记忆」与管线共用。 */
-    private val factStore = RoomFactStore(database.factDao(), memoryIndexer)
+    private val factStore = RoomFactStore(database.factDao(), memoryIndexer, memoryVectorIndexer)
 
     /** 共享背景存储，与管线共用。 */
-    private val roomContextStore = RoomSharedContextStore(database.roomMessageDao(), memoryIndexer)
+    private val roomContextStore =
+        RoomSharedContextStore(database.roomMessageDao(), memoryIndexer, memoryVectorIndexer)
 
     /**
      * 群档案存储（机器人进过哪些群、群里见过谁、群名片、主动消息权限）。
@@ -288,7 +343,7 @@ class BotController(
         )
 
     /** 关系、心情、梗库、人设设定：既是提示词的数据源，也是互动事件的落库点。 */
-    private val loreStore = RoomLoreStore(database.loreDao())
+    private val loreStore = RoomLoreStore(database.loreDao(), vectorIndexer = memoryVectorIndexer)
 
     /**
      * 记忆管线：身份 → 事实 → 共享群聊背景 → 群画像。
@@ -386,6 +441,8 @@ class BotController(
             isolateMemories = { settings.memoryConfig.value.personaScoped },
             // 收图落盘 / 发送读字节：只存 URL 的图库活不过一天
             imageStore = localImageStore,
+            // 梗库只参与向量入库（供未来「按语义找梗」），不进回复上下文
+            vectorIndexer = memoryVectorIndexer,
         )
 
     /** 反思串行化：一次只处理一条反馈，避免并发写入把经验库弄乱 */
@@ -985,6 +1042,21 @@ class BotController(
     /** 记忆系统配置快照，供 UI 展示与编辑。 */
     val memoryConfig = settings.memoryConfig
 
+    /** 向量记忆配置（可选层），供「向量记忆」区块展示与编辑。 */
+    val embeddingConfig = settings.embeddingConfig
+
+    /** 保存向量记忆配置（API Key 走加密凭证存储）。 */
+    suspend fun saveEmbeddingConfig(config: EmbeddingConfig) = settings.saveEmbeddingConfig(config)
+
+    /**
+     * 测试连接：真调一次 embeddings，用返回向量长度探测维度。
+     *
+     * 探测失败不能用「猜」的维度开启——维度错了，检索时点积会全部跳过，
+     * 表面上「开了」实际一条都召回不到。
+     */
+    suspend fun probeEmbedding(config: EmbeddingConfig): Result<Int> =
+        runCatching { embeddingClient.probe(config) }
+
     /** 加群问候语配置快照，供 UI 展示与编辑。 */
     val greetingConfig = settings.greetingConfig
 
@@ -1137,6 +1209,8 @@ class BotController(
         }
         // 顺带清掉上次退出时 trim 遗留下来的孤儿索引
         scopes.forEach { runCatching { memoryIndexer.pruneRoom(it) } }
+        // 向量表同理：源记录被裁掉后，对应的向量不能再被召回
+        runCatching { memoryVectorIndexer.pruneOrphans() }
     }
 
     /** 保证成长轮询在跑；重复调用是幂等的。 */
@@ -2237,6 +2311,9 @@ class BotController(
 
         // 导入的行是新 id，落在索引游标之后：补一次回填，否则新导入的记忆搜不到
         if (factCount > 0 || messageCount > 0) {
+            // 向量是派生物：导入后 id 全变，旧向量会指到另一条记录上，必须整表清掉，
+            // 由用户在设置页手动重新向量化。
+            runCatching { database.memoryVectorDao().clear() }
             runCatching { backfillMemoryIndex() }
         }
 
