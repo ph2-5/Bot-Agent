@@ -23,6 +23,7 @@ class ChitchatPolicyTest {
         minScore: Int = 15,
         aiJudge: Boolean = false,
         scoreWeights: ScoreWeights = ScoreWeights(),
+        replyToBots: Boolean = true,
     ) = ChitchatConfig(
         enabled = enabled,
         baseCooldownMillis = baseCooldownMillis,
@@ -31,6 +32,7 @@ class ChitchatPolicyTest {
         aiJudge = aiJudge,
         minScore = minScore,
         scoreWeights = scoreWeights,
+        replyToBots = replyToBots,
     )
 
     private val names = listOf("小白")
@@ -40,6 +42,49 @@ class ChitchatPolicyTest {
         runTest {
             val gate = policy.gate("g1", "有人吗", names, config(enabled = false))
             assertTrue(gate is ChitchatGate.Skip)
+        }
+
+    @Test
+    fun `关掉接机器人时普通机器人消息被跳过`() =
+        runTest {
+            val gate =
+                policy.gate(
+                    "g1",
+                    "这段子不错",
+                    names,
+                    config(replyToBots = false),
+                    senderIsBot = true,
+                )
+            assertTrue("对方是机器人且开关关着，应跳过，实际=$gate", gate is ChitchatGate.Skip)
+        }
+
+    @Test
+    fun `关掉接机器人时被叫名字仍然要接`() =
+        runTest {
+            // 开关只挡"泛泛的机器人发言"，不挡明确冲我说话的
+            val gate =
+                policy.gate(
+                    "g1",
+                    "小白你捧得不错",
+                    names,
+                    config(replyToBots = false),
+                    senderIsBot = true,
+                )
+            assertTrue("叫了名字应强制接，实际=$gate", gate is ChitchatGate.Forced)
+        }
+
+    @Test
+    fun `开着接机器人时机器人消息正常参与`() =
+        runTest {
+            val gate =
+                policy.gate(
+                    "g1",
+                    "今晚有人开黑吗",
+                    names,
+                    config(replyToBots = true),
+                    senderIsBot = true,
+                )
+            assertTrue("默认应正常判定，实际=$gate", gate is ChitchatGate.Candidate)
         }
 
     @Test

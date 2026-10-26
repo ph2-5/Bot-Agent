@@ -197,6 +197,16 @@ fun ChitchatPage(onBack: () -> Unit) {
                 enabled = config.enabled,
             )
 
+            SwitchRow(
+                title = "接其他机器人的话",
+                desc = "开：多 bot 可以互相对谈（双人相声靠它）。" +
+                    "关：只回应真人——被叫名字或被骂时仍会接，" +
+                    "适合几个机器人在同一个群、互相捧哏刷屏时关掉。",
+                checked = config.replyToBots,
+                onCheckedChange = { update(config.copy(replyToBots = it)) },
+                enabled = config.enabled,
+            )
+
             var probability by remember(config.probability) {
                 mutableFloatStateOf((config.probability * 100).toFloat().coerceIn(5f, 100f))
             }

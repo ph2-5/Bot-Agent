@@ -884,6 +884,7 @@ class BotRuntime(
                         talkingToOthers = talkingToOthers,
                         personaBias = personaBias,
                         recent = recent,
+                        senderIsBot = message.senderIsBot,
                     )
                 }
             }

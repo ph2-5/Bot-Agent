@@ -145,6 +145,8 @@ data class ChitchatBackup(
     // ---- 1.9.3 新增：全部带默认值，旧备份缺失这些字段时按出厂值导入 ----
     @SerialName("max_per_day") val maxPerDay: Int = 400,
     @SerialName("answer_on_name") val answerOnName: Boolean = true,
+    /** 2.15.6 新增：是否接其他机器人（旧备份按「接」导入，保持原行为） */
+    @SerialName("reply_to_bots") val replyToBots: Boolean = true,
     @SerialName("min_score") val minScore: Int = 15,
     @SerialName("w_length") val lengthScore: Int = 10,
     @SerialName("w_question") val questionScore: Int = 25,

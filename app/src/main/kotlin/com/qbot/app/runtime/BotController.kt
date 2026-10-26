@@ -1748,6 +1748,7 @@ class BotController(
                         probabilityPercent = (chitchat.probability * 100).toInt().coerceIn(1, 100),
                         maxPerDay = chitchat.maxPerDay,
                         answerOnName = chitchat.answerOnName,
+                        replyToBots = chitchat.replyToBots,
                         minScore = chitchat.minScore,
                         lengthScore = chitchat.scoreWeights.lengthScore,
                         questionScore = chitchat.scoreWeights.questionScore,
@@ -2045,6 +2046,7 @@ class BotController(
                     aiJudge = it.aiJudge,
                     probability = it.probabilityPercent.coerceIn(1, 100) / 100.0,
                     answerOnName = it.answerOnName,
+                    replyToBots = it.replyToBots,
                     minScore = it.minScore.coerceIn(0, 40),
                     scoreWeights =
                         ScoreWeights(

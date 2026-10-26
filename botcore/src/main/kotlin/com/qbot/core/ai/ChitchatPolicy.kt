@@ -63,6 +63,17 @@ data class ChitchatConfig(
     val probability: Double = 0.35,
     /** 有人叫机器人的名字时必须接话 */
     val answerOnName: Boolean = true,
+    /**
+     * 是否回应**其他机器人**的发言。
+     *
+     * 多 bot 同群时这是一把双刃剑：双人相声靠它才能接得上，
+     * 但四个 bot 互接就会变成互相捧哏刷屏（各自每小时 60 次配额都能打满）。
+     * 默认开启，因为默认只有单 bot、不会有第二条机器人消息。
+     *
+     * 关闭后并非一刀切：被叫名字、被指名冒犯时仍然会接——
+     * 那两种是"有人明确冲我说话"，不该因为对方是机器人就装死。
+     */
+    val replyToBots: Boolean = true,
     /** 规则打分阈值：低于它就放弃，不进入 AI 判断 */
     val minScore: Int = 15,
     /** 打分明细权重：各情形加/扣多少分，全部可调 */
@@ -285,6 +296,7 @@ class ChitchatPolicy(
         talkingToOthers: Boolean = false,
         personaBias: PersonaBias = PersonaBias.NEUTRAL,
         recent: List<RoomMessage> = emptyList(),
+        senderIsBot: Boolean = false,
     ): ChitchatGate {
         if (!config.enabled) return ChitchatGate.Skip("参与开关关闭")
         if (text.isBlank()) return ChitchatGate.Skip("空消息")
@@ -320,6 +332,13 @@ class ChitchatPolicy(
             // 所以划界的优先级高于冒犯回应。
             if (BotNameMatcher.isRefusal(text)) {
                 return ChitchatGate.Skip("对方明确不需要你插话")
+            }
+
+            // 对方也是机器人：开关关掉时只保留「明确冲我说话」的两条路径。
+            // 叫名字 / 被骂说明它就是在对你说，装死反而更怪；
+            // 其余情况四个 bot 会互相捧哏刷屏，各自每小时 60 次都能打满。
+            if (senderIsBot && !config.replyToBots && !named && !insulted) {
+                return ChitchatGate.Skip("对方是机器人（可在插话设置里允许）")
             }
 
             // 被指名冒犯是次高优先级：这是"人设是否可信"的问题，

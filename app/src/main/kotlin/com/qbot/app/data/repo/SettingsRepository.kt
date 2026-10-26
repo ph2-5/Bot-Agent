@@ -177,6 +177,7 @@ class SettingsRepository(
         val CHITCHAT_MAX_PER_DAY = intPreferencesKey("chitchat_max_per_day")
         val CHITCHAT_PROBABILITY_PERCENT = intPreferencesKey("chitchat_probability_percent")
         val CHITCHAT_ANSWER_ON_NAME = booleanPreferencesKey("chitchat_answer_on_name")
+        val CHITCHAT_REPLY_TO_BOTS = booleanPreferencesKey("chitchat_reply_to_bots")
         val CHITCHAT_MIN_SCORE = intPreferencesKey("chitchat_min_score")
         // 打分明细权重（各情形加/扣分）
         val CHITCHAT_W_LENGTH = intPreferencesKey("chitchat_w_length")
@@ -503,6 +504,8 @@ class SettingsRepository(
                 (prefs[Keys.CHITCHAT_PROBABILITY_PERCENT] ?: (defaults.probability * 100).toInt())
                     .coerceIn(1, 100) / 100.0,
             answerOnName = prefs[Keys.CHITCHAT_ANSWER_ON_NAME] ?: defaults.answerOnName,
+            // 缺省 true：老用户升级后行为不变（单 bot 本来也遇不到这条）
+            replyToBots = prefs[Keys.CHITCHAT_REPLY_TO_BOTS] ?: defaults.replyToBots,
             minScore =
                 (prefs[Keys.CHITCHAT_MIN_SCORE] ?: defaults.minScore).coerceIn(0, 40),
             scoreWeights =
@@ -552,6 +555,7 @@ class SettingsRepository(
                 prefs[Keys.CHITCHAT_PROBABILITY_PERCENT] =
                     (config.probability * 100).toInt().coerceIn(1, 100)
                 prefs[Keys.CHITCHAT_ANSWER_ON_NAME] = config.answerOnName
+                prefs[Keys.CHITCHAT_REPLY_TO_BOTS] = config.replyToBots
                 prefs[Keys.CHITCHAT_MIN_SCORE] = config.minScore.coerceIn(0, 40)
                 val w = config.scoreWeights
                 prefs[Keys.CHITCHAT_W_LENGTH] = w.lengthScore.coerceIn(0, 20)
