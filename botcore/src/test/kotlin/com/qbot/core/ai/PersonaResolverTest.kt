@@ -29,6 +29,7 @@ class PersonaResolverTest {
         name: String,
         prompt: String,
         seedId: String? = "SHARP_TONGUE",
+        stage: PersonaStage = PersonaStage.GROWING,
     ): Long {
         val id =
             save(
@@ -36,7 +37,7 @@ class PersonaResolverTest {
                     name = name,
                     prompt = prompt,
                     kind = PersonaKind.PROFILE,
-                    stage = PersonaStage.GROWING,
+                    stage = stage,
                     seedId = seedId,
                     active = true,
                 ),
@@ -89,17 +90,57 @@ class PersonaResolverTest {
         }
 
     @Test
-    fun `激活档案正文为空时返回种子骨架`() =
+    fun `EMBRYO 正文为空时返回种子骨架`() =
         runTest {
             val store = InMemoryPersonaStore()
-            store.addActive("还没破壳", "", seedId = "QUIET_OBSERVER")
+            store.addActive("还没破壳", "", seedId = "QUIET_OBSERVER", stage = PersonaStage.EMBRYO)
 
             val resolved = PersonaResolver(store).resolve(message())
 
             assertEquals(PersonaSource.PROFILE, resolved.source)
-            assertEquals(PersonaStage.GROWING, resolved.stage)
+            assertEquals(PersonaStage.EMBRYO, resolved.stage)
             assertTrue("骨架必须含身份段标记", resolved.prompt.contains("[身份]"))
             assertTrue("应使用档案自己的种子", resolved.prompt.contains("话最少"))
+            assertEquals("正常兜底不该标记异常", null, resolved.fallbackReason)
+        }
+
+    @Test
+    fun `MANUAL 正文为空时用中性提示词，绝不掺种子`() =
+        runTest {
+            val store = InMemoryPersonaStore()
+            store.addActive(
+                "手写但忘了写正文",
+                "",
+                seedId = "SHARP_TONGUE",
+                stage = PersonaStage.MANUAL,
+            )
+
+            val resolved = PersonaResolver(store).resolve(message())
+
+            assertEquals(PersonaSource.PROFILE, resolved.source)
+            assertEquals(PersonaStage.MANUAL, resolved.stage)
+            assertEquals("MANUAL_EMPTY", resolved.fallbackReason)
+            assertTrue(
+                "应等于中性提示词",
+                resolved.prompt.contains(PersonaGrowth.NEUTRAL_FALLBACK),
+            )
+            // 回归防线：手写档案绝不能被种子骨架污染
+            assertFalse("不得出现骨架段标记", resolved.prompt.contains("[身份]"))
+            assertFalse("不得出现种子特征", resolved.prompt.contains("毒舌"))
+            assertFalse("不得出现种子特征", resolved.prompt.contains("热心"))
+        }
+
+    @Test
+    fun `GROWING 正文为空按异常态处理，也不用种子`() =
+        runTest {
+            val store = InMemoryPersonaStore()
+            store.addActive("长了一半丢了正文", "", stage = PersonaStage.GROWING)
+
+            val resolved = PersonaResolver(store).resolve(message())
+
+            assertEquals("EMPTY", resolved.fallbackReason)
+            assertTrue(resolved.prompt.contains(PersonaGrowth.NEUTRAL_FALLBACK))
+            assertFalse("不得回退成种子骨架", resolved.prompt.contains("[身份]"))
         }
 
     @Test

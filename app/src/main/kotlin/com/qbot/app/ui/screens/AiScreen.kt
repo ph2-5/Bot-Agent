@@ -628,8 +628,12 @@ private fun ActivePersonaCard(
     // 三种形态：分段结构（自动成长）/ 自由文本（用户手写）/ 空（EMBRYO，显示骨架）
     val sections = PersonaSections.parse(persona.prompt)
     val freeform = persona.prompt.isNotBlank() && sections == null
+    // 手写档案（MANUAL）不参与自动成长，也就不存在"种子"这回事。
+    // 过去这里无条件显示「种子「XXX」」，用户会以为「我手写了怎么还有种子」——
+    // 那是展示 bug，不是行为。只有 EMBRYO/GROWING/MATURE 才挂种子标签。
+    val isManual = persona.stage == PersonaStage.MANUAL
     val skeletonPreview =
-        if (persona.prompt.isBlank()) {
+        if (persona.prompt.isBlank() && !isManual) {
             PersonaSections.parse(PersonaGrowth.embryoSkeleton(persona.seedId))
         } else {
             null
@@ -650,7 +654,9 @@ private fun ActivePersonaCard(
                     Text(
                         buildString {
                             append(stageLabel(persona.stage))
-                            append(" · 种子「").append(seed.label).append("」")
+                            if (!isManual) {
+                                append(" · 种子「").append(seed.label).append("」")
+                            }
                             if (persona.growthCount > 0) {
                                 append(" · 已成长 ").append(persona.growthCount).append(" 次")
                             }
@@ -658,6 +664,13 @@ private fun ActivePersonaCard(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary,
                     )
+                    if (isManual && persona.prompt.isBlank()) {
+                        Text(
+                            "正文为空：当前使用中性占位提示词（不会套用种子性格）",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
                 }
                 TextButton(onClick = { onFreeze(!persona.frozen) }) {
                     Text(if (persona.frozen) "已冻结" else "冻结")

@@ -365,6 +365,16 @@ class PersonaGrowth(private val client: LlmClient) {
                 "不主动提自己是 AI 以外的身份；不用 Markdown 标题和代码块，因为 QQ 不渲染。"
 
         /**
+         * MANUAL 人格正文为空时的最小中性提示词。
+         *
+         * 刻意**不含任何种子特征**：手写就是手写，系统不该偷偷换成
+         * 「热心老哥 / 毒舌损友」那套性格。只有 EMBRYO（还没有正文、
+         * 等着自动破壳）才走 [embryoSkeleton]。
+         */
+        const val NEUTRAL_FALLBACK: String =
+            "你是一个运行在 QQ 群里的助手。说话简洁、自然，不使用 Markdown。"
+
+        /**
          * 胚胎骨架：EMBRYO 阶段运行时兜底的人格底座。
          *
          * **永不为空**。空 system 会让 [PromptAssembler] 整条不注入，

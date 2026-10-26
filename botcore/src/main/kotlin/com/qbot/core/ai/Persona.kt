@@ -160,6 +160,13 @@ data class ResolvedPersona(
     val personaId: Long?,
     val source: PersonaSource,
     val stage: PersonaStage = PersonaStage.MANUAL,
+    /**
+     * 非空表示「正文缺失、用了兜底」，供 UI 与日志提示。
+     *
+     * - `MANUAL_EMPTY`：手写人格正文为空（用中性提示词，**不掺种子**）
+     * - `EMPTY`：其他阶段正文为空（异常态）
+     */
+    val fallbackReason: String? = null,
 )
 
 /**
@@ -190,20 +197,37 @@ class PersonaResolver(
             return ResolvedPersona(it.prompt, it.id, PersonaSource.OVERRIDE, it.stage)
         }
 
-        // 2) 当前激活档案；正文为空（EMBRYO）时用种子骨架顶上。
+        // 2) 当前激活档案；正文空时按阶段区分兜底方式。
         // 档案名不参与养成，但必须进提示词：不然用户新建一个空档案、
         // 改了名字再切换，模型收到的仍是与名字无关的种子骨架，
         // 看起来就像"切换没生效"。群昵称仍然优先。
         val active = all.firstOrNull { it.active && it.kind == PersonaKind.PROFILE }
         if (active != null) {
-            val body = active.prompt.ifBlank { PersonaGrowth.embryoSkeleton(active.seedId) }
+            // 正文非空永远用正文。只有 EMBRYO（还没有正文、等着自动破壳）
+            // 才用种子骨架；MANUAL 是用户手写的档案——正文空时要给中性提示词，
+            // 否则用户会看到"我手写了，怎么还是热心老哥/毒舌损友那套"。
+            val (body, fallbackReason) =
+                when {
+                    active.prompt.isNotBlank() -> active.prompt to null
+                    active.stage == PersonaStage.EMBRYO ->
+                        PersonaGrowth.embryoSkeleton(active.seedId) to null
+                    active.stage == PersonaStage.MANUAL ->
+                        PersonaGrowth.NEUTRAL_FALLBACK to "MANUAL_EMPTY"
+                    else -> PersonaGrowth.NEUTRAL_FALLBACK to "EMPTY"
+                }
             val named =
                 if (active.name.isBlank()) {
                     body
                 } else {
                     "你的人设名是「${active.name}」（群里怎么称呼你以群昵称为准，不必主动自我介绍）。\n\n$body"
                 }
-            return ResolvedPersona(named, active.id, PersonaSource.PROFILE, active.stage)
+            return ResolvedPersona(
+                prompt = named,
+                personaId = active.id,
+                source = PersonaSource.PROFILE,
+                stage = active.stage,
+                fallbackReason = fallbackReason,
+            )
         }
 
         // 3) 兼容兜底
