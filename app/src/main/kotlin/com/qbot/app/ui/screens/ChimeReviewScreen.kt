@@ -53,6 +53,10 @@ import com.qbot.core.ai.ChimeLesson
 import com.qbot.core.ai.ChimeStats
 import com.qbot.core.ai.InnerThought
 import com.qbot.core.ai.LessonCategories
+import com.qbot.core.ai.Scene
+import com.qbot.core.ai.SceneDecisionRecord
+import com.qbot.core.ai.SceneMode
+import com.qbot.core.ai.SceneStatus
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -97,8 +101,11 @@ fun ChimeReviewScreen() {
     val chitchat by controller.chitchatConfig.collectAsState()
     val thoughts by controller.observeInnerThoughts(30).collectAsState(initial = emptyList())
     val autonomous by controller.observeAutonomousDecisions(30).collectAsState(initial = emptyList())
+    val sceneMode by controller.sceneMode.collectAsState()
+    val sceneDecisions by controller.observeSceneDecisions(20).collectAsState(initial = emptyList())
     var showThoughts by rememberSaveable { mutableStateOf(false) }
     var showAutonomy by rememberSaveable { mutableStateOf(false) }
+    var showScenes by rememberSaveable { mutableStateOf(false) }
 
     // 反馈落库后 Flow 会重发，统计随之刷新
     LaunchedEffect(decisions, lessons) {
@@ -112,6 +119,13 @@ fun ChimeReviewScreen() {
                     ?: "群 ${it.groupId.takeLast(6)}")
             }
         }
+
+    // 场景调试：优先看当前筛选的群；没选群时取第一个已知群。
+    // 按群记住 Flow，避免每次重组都重新订阅一次数据库。
+    val sceneGroupId = groupFilter ?: summaries.firstOrNull()?.groupId
+    val scenesFlow = remember(sceneGroupId) { controller.observeScenes(sceneGroupId ?: "", 5) }
+    val scenes by scenesFlow.collectAsState(initial = emptyList())
+    val activeScene = scenes.firstOrNull { it.status != SceneStatus.ENDED }
 
     val visible =
         decisions.filter {
@@ -230,6 +244,79 @@ fun ChimeReviewScreen() {
                 }
             }
         }
+
+        // ---------- 场景语境 ----------
+        item(key = "scene-header") {
+            SceneHeader(
+                count = sceneDecisions.size,
+                mode = sceneMode,
+                expanded = showScenes,
+                onToggle = { showScenes = !showScenes },
+            )
+        }
+
+        item(key = "scene-mode") {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                SceneModeChips(
+                    mode = sceneMode,
+                    onSelect = { mode -> scope.launch { controller.saveSceneMode(mode) } },
+                )
+                Text(
+                    when (sceneMode) {
+                        SceneMode.OFF ->
+                            "关闭：工具不发给模型，判定链不查场景——行为与 2.12.0 完全一致。"
+                        SceneMode.OBSERVE ->
+                            "只读：模型照常调用开场 / 等待 / 催场 / 收尾，但只写记录、不产生任何行为。" +
+                                "先跑几天看它开场的时机是否合理，再决定要不要打开。"
+                        SceneMode.ACTIVE ->
+                            "执行：真实开启双人对谈。单场景最长 10 分钟，单群每小时最多 " +
+                                "${com.qbot.core.ai.SceneLimits.MAX_SPEAKS_PER_HOUR} 条，" +
+                                "对方连续 ${com.qbot.core.ai.SceneLimits.MAX_PROMPTS} 次不接就自动收尾。"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
+        if (showScenes) {
+            item(key = "scene-state") {
+                if (sceneGroupId == null) {
+                    Text(
+                        "还没有群档案。等群里说过话之后再回来，这里会显示当前场景。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    SceneStateCard(
+                        scene = activeScene,
+                        groupName = groupNames[sceneGroupId] ?: "群",
+                        mode = sceneMode,
+                    )
+                }
+            }
+
+            if (sceneDecisions.isEmpty()) {
+                item(key = "scene-empty") {
+                    Text(
+                        "还没有场景记录。切到「只读」后，模型每次想开场 / 等待 / 催场 / 收尾都会记一条。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                itemsIndexed(
+                    sceneDecisions,
+                    key = { index, item -> "scene-${item.id}-$index" },
+                ) { _, record ->
+                    SceneDecisionCard(
+                        record = record,
+                        groupName = groupNames[record.groupId] ?: "群",
+                    )
+                }
+            }
+        }
+
 
         hint?.let { text ->
             item(key = "hint") {
@@ -606,6 +693,182 @@ private fun AutonomousDecisionCard(record: AutonomousRecord, groupName: String) 
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+        }
+    }
+}
+
+/** 场景折叠头：当前开关与记录条数。 */
+@Composable
+private fun SceneHeader(
+    count: Int,
+    mode: SceneMode,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onToggle),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "场景对谈",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "${mode.label()} · ${count} 条记录",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.weight(1f))
+            Text(
+                if (expanded) "收起" else "展开",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+        Text(
+            "跨消息的「正在演一段」状态：AI 用工具表达开场 / 等待 / 催场 / 收尾，" +
+                "代码负责所有上限。默认关闭。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** 三档开关：关闭 / 只读 / 执行。 */
+@Composable
+private fun SceneModeChips(
+    mode: SceneMode,
+    onSelect: (SceneMode) -> Unit,
+) {
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        SceneMode.entries.forEach { item ->
+            FilterChip(
+                selected = mode == item,
+                onClick = { onSelect(item) },
+                label = { Text(item.label()) },
+            )
+        }
+    }
+}
+
+private fun SceneMode.label(): String =
+    when (this) {
+        SceneMode.OFF -> "关闭"
+        SceneMode.OBSERVE -> "只读观察"
+        SceneMode.ACTIVE -> "实际执行"
+    }
+
+/** 当前群有没有正在进行的一段，以及走到哪一轮、在等谁。 */
+@Composable
+private fun SceneStateCard(
+    scene: Scene?,
+    groupName: String,
+    mode: SceneMode,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                "$groupName · ${mode.label()}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.SemiBold,
+            )
+            if (scene == null) {
+                Text(
+                    if (mode == SceneMode.ACTIVE) {
+                        "当前群没有进行中的场景。"
+                    } else {
+                        "当前群没有进行中的场景（只读模式本就不会真的开场）。"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                val expected =
+                    scene.participants.firstOrNull { it.senderId == scene.expectedSpeakerId }
+                        ?: scene.participants.lastOrNull()
+                val remain =
+                    scene.waitUntil?.let { ((it - System.currentTimeMillis()) / 1000L).coerceAtLeast(0) }
+                Text(
+                    "状态 ${scene.status.label()} · 第 ${scene.turnIndex} 轮 · " +
+                        "等「${expected?.displayName ?: "对方"}」" +
+                        (remain?.let { " · 剩余 $it 秒" } ?: ""),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                scene.goal.takeIf { it.isNotBlank() }?.let { goal ->
+                    Text("目标：$goal", style = MaterialTheme.typography.labelSmall)
+                }
+                Text(
+                    "参与者：" + scene.participants.joinToString("、") { it.displayName.ifBlank { "?" } },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+private fun SceneStatus.label(): String =
+    when (this) {
+        SceneStatus.ACTIVE -> "进行中"
+        SceneStatus.WAITING -> "等对方"
+        SceneStatus.ENDED -> "已结束"
+    }
+
+/** 一条场景决策：AI 想做什么、带什么参数、有没有真的执行、给的理由。 */
+@Composable
+private fun SceneDecisionCard(
+    record: SceneDecisionRecord,
+    groupName: String,
+) {
+    val timeFormat = remember { SimpleDateFormat("MM-dd HH:mm", Locale.CHINA) }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    when (record.action) {
+                        "START" -> "开场"
+                        "WAIT" -> "等待"
+                        "PROMPT" -> "催场"
+                        "END" -> "收尾"
+                        "SPEAK" -> "接话"
+                        else -> record.action
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color =
+                        if (record.executed) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "$groupName · ${if (record.executed) "实际执行" else "只读记录"} · " +
+                        timeFormat.format(Date(record.createdAt)),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            record.argsJson?.takeIf { it.isNotBlank() }?.let { args ->
+                Text(args, style = MaterialTheme.typography.labelSmall)
+            }
+            record.reason?.takeIf { it.isNotBlank() }?.let { reason ->
+                Text(reason, style = MaterialTheme.typography.bodySmall)
             }
         }
     }

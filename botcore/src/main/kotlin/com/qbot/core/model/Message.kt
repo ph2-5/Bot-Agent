@@ -3,6 +3,7 @@ package com.qbot.core.model
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
@@ -63,6 +64,13 @@ data class IncomingMessage(
      * 昵称查询接口，展示名由上层身份名录（自称名/人工备注）补齐。
      */
     val senderName: String? = null,
+    /**
+     * 发送者是不是机器人。
+     *
+     * 两个 bot 演对谈时必须分清谁是谁：否则把对方的话当成"我说的"，
+     * 场景轮次就会错乱。平台在 author.bot 里给标记，缺省按 false。
+     */
+    val senderIsBot: Boolean = false,
     val timestampMillis: Long,
     /**
      * 被引用（回复）的消息 id。
@@ -224,6 +232,11 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
 
     val content = obj.stringOrNull("content")?.trim().orEmpty()
 
+    val senderIsBot =
+        (obj["author"] as? JsonObject)?.get("bot")?.jsonPrimitive?.booleanOrNull
+            ?: (obj["member"] as? JsonObject)?.get("bot")?.jsonPrimitive?.booleanOrNull
+            ?: false
+
     // 引用/回复关系：不同事件版本字段名不一致，逐层兜底。
     val quotedId =
         obj.stringOrNull("reference_message_id")
@@ -250,6 +263,7 @@ fun parseIncomingMessage(eventType: String, d: JsonElement?): IncomingMessage? {
         targetId = targetId,
         senderId = senderId,
         senderName = senderName,
+        senderIsBot = senderIsBot,
         timestampMillis = if (timestamp > 1_000_000_000_000L) timestamp else timestamp * 1000,
         quotedMessageId = quotedId,
         imageUrl = imageUrl,

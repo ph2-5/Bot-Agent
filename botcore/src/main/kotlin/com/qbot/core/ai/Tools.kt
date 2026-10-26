@@ -39,11 +39,36 @@ data class ToolResult(
     val memeUrl: String? = null,
 )
 
+/**
+ * 本轮工具上下文的摘要。
+ *
+ * 有些工具必须知道「这句话是谁在哪个群、在什么场景里说的」（催场要引用消息、
+ * 结束要知道结束哪一段）。这些信息只有运行时知道，但工具执行发生在
+ * [ToolRegistry] 里——用一个只读快照传进去，避免给 [BotTool] 加一堆参数。
+ *
+ * 普通工具（表情包 / 联网搜索）忽略它即可。
+ */
+data class ToolTurn(
+    val groupId: String? = null,
+    val senderId: String? = null,
+    val senderName: String? = null,
+    /** 本轮入站消息 id，被动回复要带它 */
+    val messageId: String? = null,
+    val isGroup: Boolean = false,
+    val nowMillis: Long = 0L,
+    /** 当前进行中的场景；不在场景里为 null */
+    val scene: Scene? = null,
+    /** 场景功能是否开启（OFF 时连 start_scene 都不该发给模型） */
+    val sceneEnabled: Boolean = false,
+    /** 是否把场景内的动作工具发给模型（有场景或刚结束 3 分钟内） */
+    val sceneToolsVisible: Boolean = false,
+)
+
 /** 一个可执行工具。实现方负责参数解析、校验与副作用。 */
 interface BotTool {
     val spec: ToolSpec
 
-    suspend fun execute(arguments: JsonObject): ToolResult
+    suspend fun execute(arguments: JsonObject, turn: ToolTurn = ToolTurn()): ToolResult
 }
 
 /** 工具注册表：模型看到 schema，执行时按名字查找。 */
@@ -64,7 +89,10 @@ class ToolRegistry(tools: List<BotTool> = emptyList()) {
 
     val isEmpty: Boolean get() = ordered.isEmpty()
 
-    suspend fun execute(call: ToolCall): ToolResult {
+    suspend fun execute(
+        call: ToolCall,
+        turn: ToolTurn = ToolTurn(),
+    ): ToolResult {
         val tool =
             byName[call.name]
                 ?: return ToolResult("未知工具「${call.name}」，本次未执行。")
@@ -75,7 +103,7 @@ class ToolRegistry(tools: List<BotTool> = emptyList()) {
         val arguments =
             parsed as? JsonObject
                 ?: return ToolResult("工具「${call.name}」参数必须是 JSON 对象。")
-        return runCatching { tool.execute(arguments) }.getOrElse {
+        return runCatching { tool.execute(arguments, turn) }.getOrElse {
             ToolResult("工具「${call.name}」执行失败：${it.message}")
         }
     }
@@ -128,7 +156,7 @@ class SendMemeTool(private val library: MemeLibrary) : BotTool {
                 ) as JsonObject,
         )
 
-    override suspend fun execute(arguments: JsonObject): ToolResult {
+    override suspend fun execute(arguments: JsonObject, turn: ToolTurn): ToolResult {
         val url = arguments["url"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
         if (url.isBlank()) return ToolResult("缺少表情图片地址，未发送。")
         if (!library.contains(url)) return ToolResult("这张图不在候选库里，未发送。")

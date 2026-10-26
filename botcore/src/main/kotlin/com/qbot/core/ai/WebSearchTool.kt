@@ -35,7 +35,7 @@ class WebSearchTool(
                 ) as JsonObject,
         )
 
-    override suspend fun execute(arguments: JsonObject): ToolResult {
+    override suspend fun execute(arguments: JsonObject, turn: ToolTurn): ToolResult {
         val cfg = config()
         if (!cfg.webSearch) {
             return ToolResult("联网搜索已关闭。请直接按已有知识回答，并说明可能不是最新信息。")

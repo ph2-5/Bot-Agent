@@ -21,6 +21,7 @@ import com.qbot.core.ai.ChitchatConfig
 import com.qbot.core.ai.DriveConfig
 import com.qbot.core.ai.DriveSensitivity
 import com.qbot.core.ai.MemoryConfig
+import com.qbot.core.ai.SceneMode
 import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.ThinkingMode
 import kotlinx.coroutines.CoroutineScope
@@ -194,6 +195,10 @@ class SettingsRepository(
         /** 高级项：ACTIVE 档的开口阈值 */
         val AUTONOMY_THRESHOLD = floatPreferencesKey("autonomy_threshold")
 
+        // ---------- 场景语境 ----------
+        /** OFF / OBSERVE / ACTIVE；缺省即 OFF（升级后行为与 2.12.0 完全一致） */
+        val SCENE_MODE = stringPreferencesKey("scene_mode")
+
         // ---- 人格（2.3.0） ----
         val PERSONA_LEGACY_IMPORTED = booleanPreferencesKey("persona_legacy_imported")
     }
@@ -313,6 +318,15 @@ class SettingsRepository(
     private val _autonomyConfig = MutableStateFlow(DriveConfig())
     val autonomyConfig: StateFlow<DriveConfig> = _autonomyConfig.asStateFlow()
 
+    /**
+     * 场景语境开关。
+     *
+     * 默认 OFF：工具不发给模型、判定链不查场景，行为与 2.12.0 逐字节一致。
+     * OBSERVE 只落 scene_decisions 表不产生行为，用来先观察 AI 会不会乱开场。
+     */
+    private val _sceneMode = MutableStateFlow(SceneMode.OFF)
+    val sceneMode: StateFlow<SceneMode> = _sceneMode.asStateFlow()
+
     init {
         // DataStore 的变更合并进 StateFlow；加密偏好里的 apiKey 每次重新读，
         // 保证用户在设置页改完 Key 后保存即可生效。
@@ -324,6 +338,7 @@ class SettingsRepository(
                 _greetingConfig.value = readGreetingConfig(prefs)
                 _chitchatConfig.value = readChitchatConfig(prefs)
                 _autonomyConfig.value = readAutonomyConfig(prefs)
+                _sceneMode.value = SceneMode.parse(prefs[Keys.SCENE_MODE])
             }
         }
     }
@@ -571,6 +586,14 @@ class SettingsRepository(
                 prefs[Keys.AUTONOMY_MAX_PER_HOUR] = config.maxSpeaksPerHour.coerceIn(0, 12)
                 prefs[Keys.AUTONOMY_THRESHOLD] = config.threshold.toFloat()
             }
+        }
+    }
+
+    /** 保存场景开关（改完立即生效，无需重启）。 */
+    fun saveSceneMode(mode: SceneMode) {
+        _sceneMode.value = mode
+        scope.launch {
+            dataStore.edit { prefs -> prefs[Keys.SCENE_MODE] = mode.name }
         }
     }
 

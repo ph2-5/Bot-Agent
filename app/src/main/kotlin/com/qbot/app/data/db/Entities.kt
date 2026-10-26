@@ -154,8 +154,10 @@ interface AiHistoryDao {
         MemoryTermEntity::class,
         AutonomousDecisionEntity::class,
         GroupBehaviorEntity::class,
+        SceneEntity::class,
+        SceneDecisionEntity::class,
     ],
-    version = 18,
+    version = 19,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -203,6 +205,10 @@ abstract class AppDatabase : RoomDatabase() {
 
     abstract fun groupBehaviorDao(): GroupBehaviorDao
 
+    abstract fun sceneDao(): SceneDao
+
+    abstract fun sceneDecisionDao(): SceneDecisionDao
+
     companion object {
         /**
          * 打开一个机器人的数据库。
@@ -235,6 +241,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_15_16,
                     MIGRATION_16_17,
                     MIGRATION_17_18,
+                    MIGRATION_18_19,
                 )
                 .build()
 
@@ -849,6 +856,55 @@ abstract class AppDatabase : RoomDatabase() {
                             `autonomyMode` TEXT NOT NULL,
                             `updatedAt` INTEGER NOT NULL)
                         """.trimIndent(),
+                    )
+                }
+            }
+
+        /**
+         * v18 → v19：场景语境。
+         *
+         * 纯增量：只建 `scenes` / `scene_decisions` 两张表，
+         * 老库的人设、记忆、决策记录全部原样保留。
+         */
+        val MIGRATION_18_19 =
+            object : androidx.room.migration.Migration(18, 19) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS `scenes` (
+                            `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            `kind` TEXT NOT NULL,
+                            `groupId` TEXT NOT NULL,
+                            `participantsJson` TEXT NOT NULL,
+                            `goal` TEXT NOT NULL,
+                            `status` TEXT NOT NULL,
+                            `turnIndex` INTEGER NOT NULL DEFAULT 0,
+                            `expectedSpeakerId` TEXT,
+                            `waitUntil` INTEGER,
+                            `lastActivityAt` INTEGER NOT NULL,
+                            `createdAt` INTEGER NOT NULL)
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_scenes_group_status` " +
+                            "ON `scenes` (`groupId`, `status`)",
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS `scene_decisions` (
+                            `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            `sceneId` INTEGER,
+                            `groupId` TEXT NOT NULL,
+                            `action` TEXT NOT NULL,
+                            `argsJson` TEXT,
+                            `executed` INTEGER NOT NULL,
+                            `reason` TEXT,
+                            `createdAt` INTEGER NOT NULL)
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_scene_decisions_group` " +
+                            "ON `scene_decisions` (`groupId`)",
                     )
                 }
             }

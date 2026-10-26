@@ -53,6 +53,7 @@ class PromptAssembler {
      * @param question 本轮问题（已剥离 /ai 前缀与 @ 前缀）
      * @param tokenBudget 「人设 + 事实 + 背景 + 历史 + 问题」的总量上限
      * @param senderPrefix 是否在系统块里点名「现在和你说话的人」（不再把名字塞进消息正文）
+     * @param sceneBlock 场景块：说明「现在在做什么」，为 null 时不注入
      */
     fun assemble(
         personaPrompt: String,
@@ -61,6 +62,7 @@ class PromptAssembler {
         question: String,
         tokenBudget: Int,
         senderPrefix: Boolean = true,
+        sceneBlock: String? = null,
     ): List<ChatMessage> {
         val result = mutableListOf<ChatMessage>()
 
@@ -73,6 +75,12 @@ class PromptAssembler {
         // 放在这里既能压住人设里的修辞，也不破坏后续前缀缓存。
         StyleRender.block(memory?.styleRules.orEmpty())?.let { text ->
             result += ChatMessage(role = "system", content = text)
+        }
+
+        // 1.6) 场景：紧接着人设，说明"现在在做什么"。
+        // 放在记忆之前，因为它决定这一轮该扮演什么角色，比背景信息更靠前。
+        if (!sceneBlock.isNullOrBlank()) {
+            result += ChatMessage(role = "system", content = sceneBlock)
         }
 
         val budget = tokenBudget.coerceAtLeast(TokenEstimator.estimate(question) + 16)

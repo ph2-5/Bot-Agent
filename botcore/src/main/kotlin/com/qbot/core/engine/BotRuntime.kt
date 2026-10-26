@@ -33,10 +33,19 @@ import com.qbot.core.ai.PersonaBias
 import com.qbot.core.ai.PraiseDetector
 import com.qbot.core.ai.RelationEvent
 import com.qbot.core.ai.RelationRecorder
+import com.qbot.core.ai.Scene
+import com.qbot.core.ai.SceneAction
+import com.qbot.core.ai.SceneDecisionRecord
+import com.qbot.core.ai.SceneLimits
+import com.qbot.core.ai.SceneMode
+import com.qbot.core.ai.ScenePrompt
+import com.qbot.core.ai.SceneStatus
+import com.qbot.core.ai.SceneStore
 import com.qbot.core.ai.SlangLearner
 import com.qbot.core.ai.SocialContextProvider
 import com.qbot.core.ai.StyleRule
 import com.qbot.core.ai.StyleRuleSource
+import com.qbot.core.ai.ToolTurn
 import com.qbot.core.ai.TranscriptRender
 import com.qbot.core.ai.RoomMessage
 import com.qbot.core.ai.describe
@@ -186,6 +195,22 @@ class BotRuntime(
      * 行为与接入前一致（测试 / 轻量模式）。
      */
     private val styleRuleProvider: (suspend () -> List<StyleRule>)? = null,
+    /**
+     * 场景存储。
+     *
+     * 为 null 或场景开关为 [SceneMode.OFF] 时，判定链完全不查场景，
+     * 行为与 2.12.0 逐字节一致（默认关闭，这是 2.13.0 的硬要求）。
+     */
+    private val sceneStore: SceneStore? = null,
+    /** 场景开关提供者；默认 OFF。 */
+    private val sceneModeProvider: (() -> SceneMode)? = null,
+    /**
+     * 场景工具箱。
+     *
+     * 只用来在对方接话后重置"相邻两轮不能连续等待"的计数；
+     * 工具本身注册在 [com.qbot.core.ai.ToolRegistry] 里，由 app 侧装配。
+     */
+    private val sceneToolbox: com.qbot.core.ai.SceneToolbox? = null,
     /** 插话决策引擎；默认实例即可，测试可注入固定时钟 */
     private val chitchatPolicy: ChitchatPolicy = ChitchatPolicy(),
     /** 冒犯检测：被指名辱骂时要按人设反应，不能装没看见 */
@@ -206,6 +231,9 @@ class BotRuntime(
 
         /** 内心戏留存上限：足够看出态度，又不至于让一条记录吃掉几 KB */
         private const val MAX_THOUGHT_CHARS = 600
+
+        /** 自动催场后重新开始计时的等待窗口 */
+        private const val PROMPT_WAIT_MILLIS = 20_000L
     }
 
     /** 机器人自身 openid，用于剥离消息里的 @ 前缀。 */
@@ -236,6 +264,20 @@ class BotRuntime(
      * 是自主式最容易被群友骂的地方。
      */
     private val spokeAtMillis = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * 本群机器人最后一条消息 id。
+     *
+     * 催场必须带 `msg_id` 走被动回复，否则算主动消息、会被额度与开关拦住
+     * （任务书坑清单第 2 条）。
+     */
+    private val lastSentId = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** 有人插话时的名字，下一次聊到我时注入场景块，用完即清。 */
+    private val pendingInterruption = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** 已自动催场几次（按场景）；对方接上就清零。 */
+    private val scenePrompts = java.util.concurrent.ConcurrentHashMap<Long, Int>()
 
     /** 启动运行时。会同时拉起网关连接。 */
     fun start() {
@@ -435,6 +477,280 @@ class BotRuntime(
         log(LogLevel.DEBUG, TAG, "无匹配规则，忽略")
     }
 
+    /** 当前场景开关。未配置时视为 OFF。 */
+    private fun sceneMode(): SceneMode = sceneModeProvider?.invoke() ?: SceneMode.OFF
+
+    /**
+     * 本轮要不要把 `wait / prompt / end` 三个动作工具发给模型。
+     *
+     * - OBSERVE：全发。第一期就是要看模型会怎么用（包括误用），
+     *   工具只落表、不产生行为；
+     * - ACTIVE：有进行中的场景，或刚结束不到 3 分钟（还在说收尾的话）。
+     */
+    private suspend fun sceneToolsVisible(
+        groupId: String,
+        scene: Scene?,
+    ): Boolean {
+        return when {
+            sceneMode() == SceneMode.OFF -> false
+            sceneMode() == SceneMode.OBSERVE -> true
+            scene != null -> true
+            else -> {
+                val endedAt = runCatching { sceneStore?.lastEndedAt(groupId) }.getOrNull()
+                endedAt != null &&
+                    System.currentTimeMillis() - endedAt < SceneLimits.RECENT_SCENE_WINDOW_MILLIS
+            }
+        }
+    }
+
+    /** 一次场景查询的结论。 */
+    private data class SceneLook(
+        val scene: Scene,
+        /** 本条消息是不是场景里"该我接"的那一句 */
+        val mine: Boolean,
+        /** 等对方期间收到别人的话：本条不生成回复 */
+        val ignore: Boolean,
+    )
+
+    /**
+     * 查本群进行中的场景，判断本条消息属于哪种情况。
+     *
+     * 四条分支与任务书第四节一一对应：
+     * - 无场景 / 开关 OFF → 返回 null，判定链完全走原样（2.12.0 行为）；
+     * - 等对方期间别人说话 → [SceneLook.ignore]，不生成；
+     * - 对方接话 → [SceneLook.mine]，跳过 chime 直接生成；
+     * - 其他参与者/第三方 → mine=false，走原判定链并记一条插话信号。
+     */
+    private suspend fun sceneLook(
+        message: IncomingMessage,
+        text: String,
+    ): SceneLook? {
+        val store = sceneStore ?: return null
+        if (sceneMode() == SceneMode.OFF) return null
+        val groupId = message.targetId?.takeIf { it.isNotBlank() } ?: return null
+        val selfId = botId
+        if (selfId.isBlank()) return null
+        if (message.senderId == selfId) return null
+
+        var scene = runCatching { store.active(groupId) }.getOrNull()
+        if (scene == null || scene.status == SceneStatus.ENDED) {
+            pendingInterruption.remove(groupId)
+            return null
+        }
+        val now = System.currentTimeMillis()
+        if (scene.isExpired(now)) {
+            endScene(scene, now, "超过单场景最长时长")
+            return null
+        }
+
+        val label = runCatching { memoryPipeline?.resolveLabel(message, text) }.getOrNull()
+        // 认领占位对方：优先看名字（AI 从对话里读到的名字），
+        // 名字对不上但对方也是机器人时也认——双 bot 对谈里这就是对方。
+        val placeholder = scene.participants.firstOrNull { it.senderId.isBlank() }
+        val senderId = message.senderId
+        if (placeholder != null && senderId != null && senderId.isNotBlank()) {
+            val byName = namesMatch(placeholder.displayName, message.senderName, label)
+            if (byName || (message.senderIsBot && placeholder.isBot)) {
+                scene =
+                    scene.claimPartner(
+                        senderId = senderId,
+                        displayName = label ?: message.senderName,
+                        isBot = message.senderIsBot,
+                    )
+                runCatching { store.save(scene) }
+            }
+        }
+
+        val me = scene.participants.firstOrNull { it.senderId == selfId }
+        if (me == null) {
+            // 场景不是自己开的（理论上不会发生）：只记插话，不接管
+            pendingInterruption[groupId] = label ?: "有人"
+            return null
+        }
+
+        val partnerId = scene.partnerOf(selfId)?.senderId.orEmpty()
+        val fromPartner = partnerId.isNotBlank() && partnerId == message.senderId
+        val waiting = scene.status == SceneStatus.WAITING && (scene.waitUntil ?: 0L) > now
+        if (waiting && !fromPartner) {
+            // 等对方接话期间收到别人的话：不抢话，只更新活动时间并记下插话者
+            pendingInterruption[groupId] = label ?: "有人"
+            runCatching { store.save(scene.copy(lastActivityAt = now)) }
+            return SceneLook(scene, mine = false, ignore = true)
+        }
+
+        if (!fromPartner) {
+            // 轮次没到我，或第三方插话：交给原判定链（可能接话，也可能不接）
+            pendingInterruption[groupId] = label ?: "有人"
+            return SceneLook(scene, mine = false, ignore = false)
+        }
+
+        // 该我接了：先守单群每小时的场景发言上限
+        val speaks =
+            runCatching { store.speaksSince(groupId, now - 3_600_000L) }.getOrDefault(0)
+        if (speaks >= SceneLimits.MAX_SPEAKS_PER_HOUR) {
+            endScene(scene, now, "本群每小时场景发言已达上限")
+            return null
+        }
+        return SceneLook(scene, mine = true, ignore = false)
+    }
+
+    /** 两个展示名是否指同一个人（短名不做包含匹配，避免"阿"命中所有人）。 */
+    private fun namesMatch(
+        target: String,
+        vararg candidates: String?,
+    ): Boolean {
+        val t = target.trim()
+        if (t.isBlank()) return false
+        return candidates.any { raw ->
+            val c = raw?.trim().orEmpty()
+            when {
+                c.isBlank() -> false
+                c == t -> true
+                t.length >= 2 && c.length >= 2 -> c.contains(t) || t.contains(c)
+                else -> false
+            }
+        }
+    }
+
+    /** 结束一段场景，并留下可复盘的记录。 */
+    private suspend fun endScene(
+        scene: Scene,
+        now: Long,
+        reason: String,
+    ) {
+        val store = sceneStore ?: return
+        runCatching { store.end(scene.id, now) }
+        runCatching {
+            store.record(
+                SceneDecisionRecord(
+                    sceneId = scene.id.takeIf { it > 0L },
+                    groupId = scene.groupId,
+                    action = SceneAction.END,
+                    executed = true,
+                    reason = reason,
+                    createdAt = now,
+                ),
+            )
+        }
+        scenePrompts.remove(scene.id)
+        pendingInterruption.remove(scene.groupId)
+        sceneToolbox?.forget(scene.id)
+    }
+
+    /** 我接了一句之后推进轮次：话头交回对方，等待状态清空。 */
+    private suspend fun advanceScene(
+        scene: Scene,
+        now: Long,
+    ) {
+        val store = sceneStore ?: return
+        val partnerId = scene.partnerOf(botId)?.senderId.orEmpty()
+        scenePrompts.remove(scene.id)
+        pendingInterruption.remove(scene.groupId)
+        sceneToolbox?.onPartnerSpoke(scene.id)
+        val next =
+            scene.copy(
+                status = SceneStatus.ACTIVE,
+                turnIndex = scene.turnIndex + 1,
+                expectedSpeakerId = partnerId,
+                waitUntil = null,
+                lastActivityAt = now,
+            )
+        runCatching { store.save(next) }
+        runCatching {
+            store.record(
+                SceneDecisionRecord(
+                    sceneId = scene.id,
+                    groupId = scene.groupId,
+                    action = SceneAction.SPEAK,
+                    executed = true,
+                    reason = "场景内第 ${next.turnIndex} 轮",
+                    createdAt = now,
+                ),
+            )
+        }
+    }
+
+    /**
+     * 场景巡检：超时收尾 + 等待过期催场。
+     *
+     * 由外部定时器调用（app 侧 15 秒一次）。不能靠 `delay` 挂起等待——
+     * 那会把消息协程拖住（任务书坑清单第 1 条）。
+     */
+    suspend fun sceneTick() {
+        val store = sceneStore ?: return
+        if (sceneMode() != SceneMode.ACTIVE) return
+        val now = System.currentTimeMillis()
+        val scenes = runCatching { store.activeScenes() }.getOrDefault(emptyList())
+        scenes.forEach { scene ->
+            if (scene.isExpired(now)) {
+                endScene(scene, now, "超过单场景最长时长")
+                return@forEach
+            }
+            if (!scene.waitExpired(now)) return@forEach
+
+            val count = (scenePrompts[scene.id] ?: 0) + 1
+            if (count > SceneLimits.MAX_PROMPTS) {
+                endScene(scene, now, "连续 ${SceneLimits.MAX_PROMPTS} 次催场无回应")
+                return@forEach
+            }
+            if (!sendScenePrompt(scene, promptLine(scene))) {
+                endScene(scene, now, "催场发送失败（被动回复窗口已过）")
+                return@forEach
+            }
+            scenePrompts[scene.id] = count
+            runCatching {
+                store.save(
+                    scene.copy(
+                        status = SceneStatus.WAITING,
+                        waitUntil = now + PROMPT_WAIT_MILLIS,
+                        lastActivityAt = now,
+                    ),
+                )
+            }
+            runCatching {
+                store.record(
+                    SceneDecisionRecord(
+                        sceneId = scene.id,
+                        groupId = scene.groupId,
+                        action = SceneAction.PROMPT,
+                        executed = true,
+                        reason = "等待超时，自动催场",
+                        createdAt = now,
+                    ),
+                )
+            }
+        }
+    }
+
+    /** 催场话术：由我（机器人）说，不引用别人的话。 */
+    private fun promptLine(scene: Scene): String {
+        val partner = scene.participants.firstOrNull { it.senderId == scene.expectedSpeakerId }
+        val name = partner?.displayName?.takeIf { it.isNotBlank() }
+        return if (name != null) "该你了，$name——接着说。" else "该你了，接着往下说。"
+    }
+
+    /** 催场必须引用自己上一条消息；拿不到 msg_id 就失败，由调用方收尾。 */
+    private suspend fun sendScenePrompt(
+        scene: Scene,
+        line: String,
+    ): Boolean {
+        val replyTo = lastSentId[scene.groupId] ?: return false
+        return runCatching {
+            val result =
+                api.sendGroupMessage(
+                    groupOpenId = scene.groupId,
+                    content = line,
+                    replyMessageId = replyTo,
+                )
+            if (result.isSuccess) {
+                result.id?.let { lastSentId[scene.groupId] = it }
+                true
+            } else {
+                false
+            }
+        }.getOrDefault(false)
+    }
+
     /**
      * 群内普通消息的"旁听"处理。
      *
@@ -517,8 +833,13 @@ class BotRuntime(
         // 「两人互道晚安」和「有人吗」该不该接完全不同。
         val addressee = AddresseeDetector.infer(message, recent, names, selfId)
 
+        // 场景优先于单条打分：只要有进行中的对谈且轮到我，就不再问"值不值得接"。
+        // 开关默认 OFF，此时 sceneLook 直接返回 null，下面与 2.12.0 完全一致。
+        val sceneLook = sceneLook(message, text)
+
         val gate =
             when {
+                sceneLook?.mine == true -> ChitchatGate.Forced("场景轮次：该我接")
                 addressed -> ChitchatGate.Skip("@ 了机器人，交给 @ 链路")
                 chitchatConfig == null -> ChitchatGate.Skip("群聊参与未开启")
                 profile?.active == false -> ChitchatGate.Skip("群档案不可用")
@@ -542,10 +863,20 @@ class BotRuntime(
         // 否则会出现自相矛盾：它明明照着"叫名字必答"回了话，
         // 复盘却记成"对全群说"——因为两处用的是不同判定（审计发现）。
         val finalAddressee =
-            if (gate is ChitchatGate.Forced && addressee.kind == AddresseeKind.GROUP) {
-                Addressee(AddresseeKind.BOT, null, gate.reason)
-            } else {
-                addressee
+            when {
+                sceneLook != null -> {
+                    val partner = sceneLook.scene.partnerOf(selfId)
+                    Addressee(
+                        AddresseeKind.MEMBER,
+                        partner?.displayName,
+                        "场景进行中",
+                    )
+                }
+
+                gate is ChitchatGate.Forced && addressee.kind == AddresseeKind.GROUP ->
+                    Addressee(AddresseeKind.BOT, null, gate.reason)
+
+                else -> addressee
             }
 
         pipeline.recordChitchat(
@@ -556,11 +887,26 @@ class BotRuntime(
         )
         learnBotName(message, selfId)
 
+        // 场景正在等对方：本条只入群记忆，不抢话。
+        // （等对方接话的窗口里，别人插的话不该由我接，否则就成了打断场景）
+        if (sceneLook?.ignore == true) {
+            pipeline.markChitchatDecision(message, "场景等待中，本条不接")
+            log(LogLevel.VERBOSE, TAG, "场景等待中，忽略本条")
+            return
+        }
+
         // @ 自己的消息交给 @ 链路应答，这里只记不说
         if (addressed) return
 
         // 2) 三级漏斗的后两级
-        val config = chitchatConfig ?: return
+        // 场景轮到我了：直接生成，不因为"群聊参与未开启"被挡回去——
+        // 场景是用户显式开启的状态机，优先级高于概率漏斗。
+        val config =
+            if (sceneLook?.mine == true) {
+                chitchatConfigProvider?.invoke() ?: return
+            } else {
+                chitchatConfig ?: return
+            }
 
         // 训练闭环：整个判断过程只在这里落一条记录，无论从哪个分支返回。
         // 用 finally 而不是在每个 return 前写库——既不会漏记，也是未来把
@@ -696,12 +1042,45 @@ class BotRuntime(
                         null
                     }
                 val memory = buildMemory(message, text, insult)
-                val answer = responder.replyDetailed(message, aiConfig, memory)
+                // 场景只改"要不要说"，不改"以什么身份说"：记忆/关系照常注入
+                // （任务书坑清单第 8 条）。
+                val currentScene = sceneLook?.scene
+                val turn =
+                    ToolTurn(
+                        groupId = groupId,
+                        senderId = message.senderId,
+                        senderName = message.senderName,
+                        messageId = message.messageId,
+                        isGroup = true,
+                        nowMillis = System.currentTimeMillis(),
+                        scene = currentScene,
+                        sceneEnabled = sceneMode() != SceneMode.OFF,
+                        sceneToolsVisible = sceneToolsVisible(groupId, currentScene),
+                    )
+                val sceneBlock =
+                    currentScene?.let {
+                        ScenePrompt.block(
+                            it,
+                            selfId,
+                            interruptedBy = pendingInterruption.remove(groupId),
+                        )
+                    }
+                val answer =
+                    responder.replyDetailed(
+                        message,
+                        aiConfig,
+                        memory,
+                        sceneBlock = sceneBlock,
+                        toolTurn = turn,
+                    )
                 if (answer.content.isBlank() && answer.memeUrl.isNullOrBlank()) {
                     finalReason = "不接：回复为空"
                     return@runCatching
                 }
                 sendReply(message, answer.content, answer.memeUrl)
+                if (sceneLook?.mine == true) {
+                    advanceScene(currentScene!!, System.currentTimeMillis())
+                }
                 // 经验真正被采纳：这一轮是看了这些经验才决定接的
                 if (injectedLessons.isNotEmpty()) {
                     runCatching { chimeTrainer?.bumpHits(injectedLessons.map { it.id }) }
@@ -967,8 +1346,41 @@ class BotRuntime(
                 }
             // 组装这条消息的记忆上下文：展示名 / 关于此人的事实 / 所在范围的近期对话
             val memory = buildMemory(message, text, insult)
-            val answer = aiResponder!!.replyDetailed(message, config, memory)
+            // @ 链路也要带场景：对方 bot 可能 @ 你接话，这时它仍然在场景里。
+            val scene = sceneLook(message, text)
+            val groupId = message.targetId.orEmpty()
+            val turn =
+                ToolTurn(
+                    groupId = message.targetId,
+                    senderId = message.senderId,
+                    senderName = message.senderName,
+                    messageId = message.messageId,
+                    isGroup = true,
+                    nowMillis = System.currentTimeMillis(),
+                    scene = scene?.scene,
+                    sceneEnabled = sceneMode() != SceneMode.OFF,
+                    sceneToolsVisible = sceneToolsVisible(groupId, scene?.scene),
+                )
+            val sceneBlock =
+                scene?.scene?.let {
+                    ScenePrompt.block(
+                        it,
+                        botId,
+                        interruptedBy = pendingInterruption.remove(groupId),
+                    )
+                }
+            val answer =
+                aiResponder!!.replyDetailed(
+                    message,
+                    config,
+                    memory,
+                    sceneBlock = sceneBlock,
+                    toolTurn = turn,
+                )
             sendReply(message, answer.content, answer.memeUrl)
+            if (scene?.mine == true) {
+                advanceScene(scene.scene, System.currentTimeMillis())
+            }
             recordThought(message, answer)
             if (isDirectChat(message)) {
                 memoryPipeline?.recordExchange(message, text, answer.content)
@@ -1137,17 +1549,29 @@ class BotRuntime(
         val meme = memeUrl ?: parsedMeme
 
         // 纯表情包（正文被标记占满）时不发文字，只发图
+        var sentId: String? = null
         if (body.isNotBlank()) {
-            when (message.kind) {
-                MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE ->
-                    api.sendGroupMessage(target, body, replyMessageId = message.messageId)
-                MessageKind.C2C -> api.sendUserMessage(target, body, replyMessageId = message.messageId)
-                MessageKind.GUILD ->
-                    // 频道消息沿用频道 openid 发送，此处退化为按 group 通道处理
-                    api.sendGroupMessage(target, body, replyMessageId = message.messageId)
+            val result =
+                when (message.kind) {
+                    MessageKind.GROUP_AT, MessageKind.GROUP_MESSAGE ->
+                        api.sendGroupMessage(target, body, replyMessageId = message.messageId)
+                    MessageKind.C2C -> api.sendUserMessage(target, body, replyMessageId = message.messageId)
+                    MessageKind.GUILD ->
+                        // 频道消息沿用频道 openid 发送，此处退化为按 group 通道处理
+                        api.sendGroupMessage(target, body, replyMessageId = message.messageId)
 
-                MessageKind.DIRECT -> api.sendUserMessage(target, body, replyMessageId = message.messageId)
-            }
+                    MessageKind.DIRECT -> api.sendUserMessage(target, body, replyMessageId = message.messageId)
+                }
+            sentId = result.id
+        }
+        // 记下自己在群里说的最后一条：场景催场要引用它走被动回复，
+        // 否则一条"该你了"会算成主动消息（任务书坑清单第 2 条）。
+        if (sentId != null &&
+            (message.kind == MessageKind.GROUP_AT ||
+                message.kind == MessageKind.GROUP_MESSAGE ||
+                message.kind == MessageKind.GUILD)
+        ) {
+            lastSentId[target] = sentId
         }
 
         // 图随后到：文字带 msg_id 是回复，图不带——两条连发看起来就是"说了句配个图"

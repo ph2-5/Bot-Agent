@@ -457,6 +457,8 @@ class AiResponder(
         config: AiConfig,
         memory: MemoryContext? = null,
         directive: String? = null,
+        sceneBlock: String? = null,
+        toolTurn: ToolTurn = ToolTurn(),
     ): AiReply {
         val key = historyKey(message)
         // 只发了图没写字：给模型一个默认问题，否则它会回"请问你想问什么"——
@@ -498,12 +500,16 @@ class AiResponder(
 
             val result =
                 try {
-                    callLlmWithTools(stored, question, config, memory, systemPrompt, imageUrl)
+                    callLlmWithTools(
+                        stored, question, config, memory, systemPrompt, imageUrl, sceneBlock, toolTurn,
+                    )
                 } catch (e: ContextTooLongException) {
                     // 估算偏差或历史里混进超长消息：砍掉一半历史重试一次，
                     // 仍失败就把异常抛给调用方走兜底话术。
                     val halved = stored.drop(stored.size / 2)
-                    callLlmWithTools(halved, question, config, memory, systemPrompt, imageUrl)
+                    callLlmWithTools(
+                        halved, question, config, memory, systemPrompt, imageUrl, sceneBlock, toolTurn,
+                    )
                 }
 
             // 成功后才写入历史：失败的请求不应污染上下文。
@@ -859,6 +865,7 @@ class AiResponder(
         memory: MemoryContext?,
         systemPrompt: String,
         imageUrl: String? = null,
+        sceneBlock: String? = null,
     ): List<ChatMessage> {
         val assembled =
             assembler.assemble(
@@ -867,6 +874,7 @@ class AiResponder(
                 history = storedHistory,
                 question = question,
                 tokenBudget = config.contextTokenBudget,
+                sceneBlock = sceneBlock,
             )
         // 只有本轮带图：历史里的图不再重复送，否则同一张图每轮都要付一次 token。
         if (imageUrl.isNullOrBlank()) return assembled
@@ -946,8 +954,13 @@ class AiResponder(
         memory: MemoryContext?,
         systemPrompt: String,
         imageUrl: String? = null,
+        sceneBlock: String? = null,
+        toolTurn: ToolTurn = ToolTurn(),
     ): Pair<LlmReply, String?> {
-        var messages = buildMessages(storedHistory, question, config, memory, systemPrompt, imageUrl)
+        var messages =
+            buildMessages(
+                storedHistory, question, config, memory, systemPrompt, imageUrl, sceneBlock,
+            )
         var memeUrl: String? = null
         var round = 0
         // 本轮不能用的工具不发给模型：联网关着 / 端点不支持 / 表情库为空。
@@ -957,6 +970,14 @@ class AiResponder(
             buildSet {
                 if (!config.webSearchAvailable) add("web_search")
                 if (memory != null && memory.social?.memes?.isEmpty() == true) add("send_meme")
+                // 场景未开启时，连"能不能开场景"都不告诉模型；
+                // 场景已在进行时才放出四个原语动作。
+                if (!toolTurn.sceneEnabled) add("start_scene")
+                if (!toolTurn.sceneToolsVisible) {
+                    add("wait_for_reply")
+                    add("prompt_partner")
+                    add("end_scene")
+                }
             }
 
         while (true) {
@@ -982,7 +1003,7 @@ class AiResponder(
                         toolCalls = reply.toolCalls,
                     )
             reply.toolCalls.forEach { call ->
-                val result = tools.execute(call)
+                val result = tools.execute(call, toolTurn)
                 result.memeUrl?.takeIf { it.isNotBlank() }?.let { memeUrl = it }
                 messages =
                     messages +

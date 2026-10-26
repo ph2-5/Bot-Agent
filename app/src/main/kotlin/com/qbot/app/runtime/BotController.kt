@@ -46,6 +46,7 @@ import com.qbot.app.data.repo.RoomLoreStore
 import com.qbot.app.data.repo.LlmMemoryReranker
 import com.qbot.app.data.repo.RoomMemoryIndexer
 import com.qbot.app.data.repo.RoomMemorySearcher
+import com.qbot.app.data.repo.RoomSceneStore
 import com.qbot.app.data.repo.RoomSocialStore
 import com.qbot.app.data.repo.RoomStyleRuleStore
 import com.qbot.core.api.DeepSeekSearch
@@ -94,6 +95,10 @@ import com.qbot.core.ai.PersonaResolver
 import com.qbot.core.ai.PersonaLoreExtractor
 import com.qbot.core.ai.PersonaStyleExtractor
 import com.qbot.core.ai.RemoteImageLoader
+import com.qbot.core.ai.Scene
+import com.qbot.core.ai.SceneDecisionRecord
+import com.qbot.core.ai.SceneMode
+import com.qbot.core.ai.SceneToolbox
 import com.qbot.core.ai.ScoreWeights
 import com.qbot.core.ai.SendMemeTool
 import com.qbot.core.ai.StyleRule
@@ -124,6 +129,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -174,6 +181,12 @@ class BotController(
 
         /** 索引回填每批行数：太小事务多，太大会长时间占着数据库 */
         private const val BACKFILL_BATCH = 200
+
+        /** 场景巡检间隔：等对方接话最多 60 秒，查得太慢催场就失去意义 */
+        private const val SCENE_TICK_MILLIS = 15_000L
+
+        /** 每多少次巡检清一次过期场景（15s × 240 ≈ 每小时一次） */
+        private const val SCENE_TRIM_EVERY_TICKS = 240
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -421,6 +434,27 @@ class BotController(
     private val driveStore = RoomDriveStore(database.autonomousDecisionDao())
 
     /**
+     * 场景存储：双人对谈的状态机落库。
+     *
+     * 每个机器人一个库，两个 bot 的场景状态天然各自独立（任务书坑清单第 4 条）。
+     */
+    private val sceneStore = RoomSceneStore(database.sceneDao(), database.sceneDecisionDao())
+
+    /**
+     * 场景工具箱。
+     *
+     * 自身 openid 要到网关 ready 之后才有，因此用 lambda 现取；
+     * OBSERVE 档下工具照常被调用、只落表不产生行为。
+     */
+    private val sceneToolbox =
+        SceneToolbox(
+            store = sceneStore,
+            modeProvider = { settings.sceneMode.value },
+            selfIdProvider = { runtime?.botId.orEmpty() },
+            selfNameProvider = { runtime?.botName.orEmpty() },
+        )
+
+    /**
      * 第二道闸门：便宜模型判断"这句该不该说"。
      *
      * lazy 构造：PASSIVE / OFF 档下永远不会被用到，
@@ -466,6 +500,9 @@ class BotController(
 
     /** 自主开口节拍的 Job（理由同 [growthJob]：停止机器人后不能再自己说话）。 */
     private var autonomyJob: kotlinx.coroutines.Job? = null
+
+    /** 场景巡检的 Job：等待超时 / 单场景超长 / 催场。 */
+    private var sceneJob: kotlinx.coroutines.Job? = null
 
     /**
      * 启动代次：每调用一次 start() 递增，stop() 也递增。
@@ -973,6 +1010,23 @@ class BotController(
     /** 调试页：手动跑一次评估（OFF 档会被拒绝；PASSIVE 档按 ACTIVE 阈值算，可能真的开口）。 */
     suspend fun forceAutonomousSpeak(groupId: String): Boolean = autonomousScheduler.force(groupId)
 
+    // ---------- 场景语境 ----------
+
+    /** 场景开关（改完立即生效）。 */
+    val sceneMode: StateFlow<SceneMode> get() = settings.sceneMode
+
+    /** 调试页：最近 N 条场景决策（含 OBSERVE 模式下没执行的）。 */
+    fun observeSceneDecisions(limit: Int = 20): Flow<List<SceneDecisionRecord>> =
+        sceneStore.observeDecisions(limit)
+
+    /** 调试页：某个群最近的场景（含已结束的，便于回看）。 */
+    fun observeScenes(
+        groupId: String,
+        limit: Int = 10,
+    ): Flow<List<Scene>> = sceneStore.observeScenes(groupId, limit)
+
+    fun saveSceneMode(mode: SceneMode) = settings.saveSceneMode(mode)
+
     /**
      * 最近一次 AI 调用的 token 用量（含缓存命中拆分）。
      *
@@ -1095,6 +1149,28 @@ class BotController(
                 .getOrNull()
     }
 
+    /**
+     * 保证场景巡检在跑；重复调用是幂等的。
+     *
+     * 不能靠协程挂起等待（`delay(25000)`），只能定时查时间戳：
+     * OBSERVE / OFF 档下 [BotRuntime.sceneTick] 直接返回，不碰数据库。
+     */
+    private fun ensureSceneTickerRunning() {
+        if (sceneJob?.isActive == true) return
+        sceneJob =
+            scope.launch {
+                var ticks = 0
+                while (isActive) {
+                    delay(SCENE_TICK_MILLIS)
+                    runCatching { runtime?.sceneTick() }
+                        .onFailure { appendLog(LogLevel.WARN, TAG, "场景巡检失败：${it.message}") }
+                    if (++ticks % SCENE_TRIM_EVERY_TICKS == 0) {
+                        runCatching { sceneStore.trim(System.currentTimeMillis()) }
+                    }
+                }
+            }
+    }
+
     /** 启动机器人（幂等）。 */
     fun start() {
         if (runtime != null) {
@@ -1132,6 +1208,7 @@ class BotController(
             runtime?.start()
             ensureGrowthRunning()
             ensureAutonomyRunning()
+            ensureSceneTickerRunning()
         }
     }
 
@@ -1144,6 +1221,8 @@ class BotController(
         autonomyJob?.cancel()
         autonomyJob = null
         autonomousScheduler.stop()
+        sceneJob?.cancel()
+        sceneJob = null
         runtime?.stop()
         gateway?.stop()
         statusForwardJob?.cancel()
@@ -2388,7 +2467,7 @@ class BotController(
                                     deepSeekSearch.search(query, cfg.apiKey, cfg.baseUrl, 5)
                                 },
                             ),
-                        ),
+                        ) + sceneToolbox.tools,
                     ),
                 // 历史按当前生效的人设隔离：切换档案后自动新开一条线程，
                 // 新人格不会接着旧人格的语气和话题说话。
@@ -2461,6 +2540,10 @@ class BotController(
                 // 自主开口的触发点：每条群消息处理完（不管回没回）都排一次延迟评估。
                 // 调度器内部再判档位，PASSIVE / OFF 档不会产生任何模型调用。
                 onGroupMessageHandled = { groupId -> autonomousScheduler.onMessageHandled(groupId) },
+                // 场景语境：默认 OFF 时判定链完全不查场景，行为与 2.12.0 一致。
+                sceneStore = sceneStore,
+                sceneModeProvider = { settings.sceneMode.value },
+                sceneToolbox = sceneToolbox,
             )
 
         // 把网关状态转发到控制器自己的流上，
