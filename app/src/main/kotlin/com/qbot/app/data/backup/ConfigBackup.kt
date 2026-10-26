@@ -56,6 +56,17 @@ data class ConfigBackup(
     @SerialName("room_messages") val roomMessages: List<RoomMessageBackup> = emptyList(),
     /** 3.0.0 新增：内心戏（"忍过这个人"的情绪记忆） */
     @SerialName("inner_thoughts") val innerThoughts: List<InnerThoughtBackup> = emptyList(),
+    // ---- 2.16.0 新增：2.12–2.15 加的配置一直没进备份，换机后全部回默认 ----
+    /** 场景档位：OFF / OBSERVE / ACTIVE */
+    @SerialName("scene_mode") val sceneMode: String = "OFF",
+    /** 自主开口：档位 / 安静时段 / 每小时上限 */
+    val autonomy: AutonomyBackup? = null,
+    /** 按群的行为覆盖（群 A 活跃、群 B 安静） */
+    @SerialName("group_behaviors") val groupBehaviors: List<GroupBehaviorBackup> = emptyList(),
+    /** 向量记忆：provider / 模型 / key / 维度，换机后不用重配 */
+    val embedding: EmbeddingBackup? = null,
+    /** 运行与保活：开机自启、省电策略、日志保留天数 */
+    val runtime: RuntimeBackup? = null,
 ) {
     companion object {
         /**
@@ -64,7 +75,7 @@ data class ConfigBackup(
          * 导入时据此判断备份是否来自更新版本：字段能忽略，但语义不能猜，
          * 所以旧版 App 导入新版备份要明确提示"部分内容未导入"，而不是静默丢掉。
          */
-        const val CURRENT_VERSION = 7
+        const val CURRENT_VERSION = 8
 
         private val json =
             Json {
@@ -162,6 +173,47 @@ data class ChitchatBackup(
     @SerialName("max_lessons") val maxLessons: Int = 80,
     @SerialName("max_injected_lessons") val maxInjectedLessons: Int = 8,
     @SerialName("judge_context_size") val judgeContextSize: Int = 12,
+)
+
+/** 2.16.0 新增：自主开口设置。 */
+@Serializable
+data class AutonomyBackup(
+    /** OFF / PASSIVE / ACTIVE */
+    val mode: String = "PASSIVE",
+    /** 开口阈值：0.75 挑剔 / 0.62 默认 / 0.45 活跃 */
+    val threshold: Double = 0.62,
+    @SerialName("quiet_hours") val quietHours: String = "23:00-08:00",
+    @SerialName("max_per_hour") val maxSpeaksPerHour: Int = 2,
+)
+
+/** 2.16.0 新增：按群的行为覆盖（不同群的活跃度不该互相迁就）。 */
+@Serializable
+data class GroupBehaviorBackup(
+    @SerialName("group_id") val groupId: String,
+    /** OFF / PASSIVE / ACTIVE */
+    val mode: String,
+)
+
+/** 2.16.0 新增：向量记忆配置。key 与 AI 配置同等对待，随备份走。 */
+@Serializable
+data class EmbeddingBackup(
+    val enabled: Boolean = false,
+    val provider: String = "siliconflow",
+    @SerialName("base_url") val baseUrl: String = "",
+    val model: String = "BAAI/bge-m3",
+    @SerialName("api_key") val apiKey: String = "",
+    /** 0 表示没探测过；导入后需要重新「测试连接」才能用 */
+    val dim: Int = 0,
+    @SerialName("timeout_seconds") val timeoutSeconds: Long = 8,
+)
+
+/** 2.16.0 新增：运行与保活。 */
+@Serializable
+data class RuntimeBackup(
+    @SerialName("auto_start") val autoStart: Boolean = true,
+    /** 只影响保活策略，不改变任何行为规则 */
+    @SerialName("power_saving") val powerSaving: Boolean = false,
+    @SerialName("log_retention_days") val logRetentionDays: Int = 3,
 )
 
 @Serializable

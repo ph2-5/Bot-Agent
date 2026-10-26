@@ -86,7 +86,7 @@ fun ChitchatPage(onBack: () -> Unit) {
             )
             SwitchRow(
                 title = "让 AI 自己判断想不想接（推荐）",
-                desc = "不是「该不该回」，而是按性格和当时的语境判断它有没有说话的冲动；"
+                desc = "不是「该不该回」，而是按性格和当时的场合判断它有没有说话的冲动；"
                     + "会先看这句话是对谁说的，再决定要不要插",
                 checked = config.aiJudge,
                 onCheckedChange = { update(config.copy(aiJudge = it)) },

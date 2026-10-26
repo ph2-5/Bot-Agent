@@ -103,6 +103,15 @@ interface MemoryVectorDao {
         model: String,
     )
 
+    /**
+     * 换 embedding 模型时清掉旧模型的向量。
+     *
+     * 检索按 model 过滤，旧向量不会命中——留着只是白白占空间
+     * （384 维约 1.5KB/条，几万条就是几十 MB）。
+     */
+    @Query("DELETE FROM memory_vectors WHERE model = :model")
+    suspend fun deleteByModel(model: String)
+
     @Query("DELETE FROM memory_vectors")
     suspend fun clear()
 

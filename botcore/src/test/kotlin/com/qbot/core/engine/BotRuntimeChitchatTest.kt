@@ -491,7 +491,11 @@ class BotRuntimeChitchatTest {
             assertEquals("SILENT", record.action)
             assertTrue(
                 "原因应带 HTTP 状态，实际=${record.reason}",
-                record.reason.contains("AI 判断失败（HTTP 500）"),
+                record.reason.contains("HTTP 500"),
+            )
+            assertTrue(
+                "还应给出下一步，实际=${record.reason}",
+                record.reason.contains("服务端错误"),
             )
         }
 }

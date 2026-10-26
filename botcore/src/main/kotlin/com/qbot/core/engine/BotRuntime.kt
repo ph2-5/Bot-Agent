@@ -907,7 +907,7 @@ class BotRuntime(
                         ) {
                             gate =
                                 ChitchatGate.Skip(
-                                    "冷却 ${pending.delayMillis / 1000} 秒太久，等到话题也过去了",
+                                    "冷却还剩 ${pending.delayMillis / 1000} 秒，超过 10 秒等待上限，这轮不接",
                                 )
                             break
                         }
@@ -924,7 +924,7 @@ class BotRuntime(
                     }
                     if (gate is ChitchatGate.Defer) {
                         val left = (gate as ChitchatGate.Defer).reason
-                        gate = ChitchatGate.Skip("等了 ${waited / 1000} 秒仍未轮到（$left）")
+                        gate = ChitchatGate.Skip("等了 ${waited / 1000} 秒仍没轮上（$left）")
                     }
                 } finally {
                     deferringGroups.remove(groupId)
@@ -1192,7 +1192,7 @@ class BotRuntime(
                 finalReason = "不接：回复失败"
                 pipeline.markChitchatDecision(message, finalReason)
                 logger.e(TAG, "群聊插话失败", t)
-                log(LogLevel.WARN, TAG, "群聊插话失败：${t.message}")
+                log(LogLevel.WARN, TAG, "群聊插话失败：${describeFailure(t)}")
             }
         } finally {
             // 先释放占位，再写复盘记录——否则复盘写库慢的时候，
@@ -1249,14 +1249,38 @@ class BotRuntime(
             ).take(400)
 
     /** 把判断失败的原因压成一句人话，写进日志与决策记录。 */
+    /**
+     * 把判断失败的原因压成一句人话，**并给出下一步**。
+     *
+     * 只报现象（"HTTP 401"）等于把排查丢给用户：他在群里看到的是机器人
+     * 突然不说话，日志里这句是唯一线索，得能指导他去改哪里。
+     */
     private fun describeFailure(error: Throwable?): String {
         if (error == null) return "原因未知"
+        val code = (error as? LlmException)?.statusCode
         val detail =
             when (error) {
-                is LlmException -> error.statusCode?.let { "HTTP $it" } ?: error.message
+                is LlmException -> code?.let { "HTTP $it" } ?: error.message
                 else -> error.message
             } ?: error::class.simpleName ?: "未知错误"
-        return detail.replace("\n", " ").take(60)
+        val hint =
+            when {
+                error is com.qbot.core.ai.EmptyContentException ->
+                    "——模型只回了思考过程，去 AI 设置换个模型或关掉思考模式"
+                code == 401 || code == 403 ->
+                    "——API Key 无效或过期，去 AI 设置里重填"
+                code == 404 ->
+                    "——地址或模型名不对，检查 Base URL 与模型名"
+                code == 429 ->
+                    "——模型限流，稍后自动恢复；也可调低每小时上限"
+                code != null && code >= 500 ->
+                    "——服务端错误，稍后重试"
+                error is java.net.SocketTimeoutException ||
+                    error.message?.contains("timeout", ignoreCase = true) == true ->
+                    "——网络超时，检查网络或代理"
+                else -> ""
+            }
+        return (detail.replace("\n", " ").take(70) + hint).take(140)
     }
 
     /** 消息里是否 @ 了机器人（全量模式下 @ 消息也可能从这里进来）。 */

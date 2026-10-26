@@ -1,7 +1,11 @@
 package com.qbot.app.runtime
 
 import android.content.Context
+import com.qbot.app.data.backup.AutonomyBackup
 import com.qbot.app.data.backup.ConfigBackup
+import com.qbot.app.data.backup.EmbeddingBackup
+import com.qbot.app.data.backup.GroupBehaviorBackup
+import com.qbot.app.data.backup.RuntimeBackup
 import com.qbot.app.data.backup.AiBackup
 import com.qbot.app.data.backup.ChitchatBackup
 import com.qbot.app.data.backup.CredentialsBackup
@@ -23,6 +27,7 @@ import com.qbot.app.data.backup.RuleBackup
 import com.qbot.app.data.backup.StyleRuleBackup
 import com.qbot.app.data.db.AppDatabase
 import com.qbot.app.data.db.FactEntity
+import com.qbot.app.data.db.GroupBehaviorEntity
 import com.qbot.app.data.db.InnerThoughtEntity
 import com.qbot.app.data.db.LogEntity
 import com.qbot.app.data.db.LoreEntity
@@ -75,6 +80,8 @@ import com.qbot.core.ai.ChimeStats
 import com.qbot.core.ai.FactKind
 import com.qbot.core.ai.FactSource
 import com.qbot.core.ai.EmbeddingClient
+import com.qbot.core.ai.AutonomyMode
+import com.qbot.core.ai.DriveConfig
 import com.qbot.core.ai.EmbeddingConfig
 import com.qbot.core.ai.EmbeddingGuard
 import com.qbot.core.ai.EmptyContentException
@@ -1194,6 +1201,23 @@ class BotController(
             }
         }
 
+        // 换 embedding 模型时清掉旧模型的向量。
+        // 检索按 model 过滤，旧向量永远不会命中，留着只是占空间（约 1.5KB/条）；
+        // 维度不同还可能让点积实现走错分支。
+        scope.launch {
+            var lastModel: String? = null
+            settings.embeddingConfig.collect { cfg ->
+                val previous = lastModel
+                lastModel = cfg.model
+                if (!previous.isNullOrBlank() && previous != cfg.model) {
+                    runCatching { database.memoryVectorDao().deleteByModel(previous) }
+                        .onFailure {
+                            appendLog(LogLevel.WARN, TAG, "清理旧向量失败：${it.message}")
+                        }
+                }
+            }
+        }
+
         // 人格引导：旧设置里的系统提示词 → 第一条人格档案；零提示词用户则建种子档案
         scope.launch {
             runCatching { ensurePersonaBootstrap() }.onFailure {
@@ -1927,9 +1951,41 @@ class BotController(
                                 personaName = thought.personaId?.let { personaNames[it] },
                             )
                         },
+                // 2.16.0：2.12–2.15 加的这些配置一直漏在备份外，换机后全部回默认
+                sceneMode = settings.sceneMode.value.name,
+                autonomy =
+                    settings.autonomyConfig.value.let { drive ->
+                        AutonomyBackup(
+                            mode = drive.mode.name,
+                            threshold = drive.threshold,
+                            quietHours = drive.quietHours,
+                            maxSpeaksPerHour = drive.maxSpeaksPerHour,
+                        )
+                    },
+                groupBehaviors =
+                    runCatching { database.groupBehaviorDao().all() }
+                        .getOrDefault(emptyList())
+                        .map { GroupBehaviorBackup(groupId = it.groupId, mode = it.autonomyMode) },
+                embedding =
+                    settings.embeddingConfig.value.let { cfg ->
+                        EmbeddingBackup(
+                            enabled = cfg.enabled,
+                            provider = cfg.provider,
+                            baseUrl = cfg.baseUrl,
+                            model = cfg.model,
+                            apiKey = cfg.apiKey,
+                            dim = cfg.dim,
+                            timeoutSeconds = cfg.timeoutSeconds,
+                        )
+                    },
+                runtime =
+                    RuntimeBackup(
+                        autoStart = settings.autoStart.first(),
+                        powerSaving = settings.powerSaving.first(),
+                        logRetentionDays = settings.logRetentionDays.first(),
+                    ),
                 // 训练成果：经验库跟着配置走，换机后不必重新教一遍
-                chimeLessons =
-                    chimeLessonStore.all().map { lesson ->
+                chimeLessons =                    chimeLessonStore.all().map { lesson ->
                         LessonBackup(
                             text = lesson.text,
                             source = lesson.source,
@@ -2066,6 +2122,58 @@ class BotController(
                     judgeContextSize = it.judgeContextSize.coerceIn(6, 24),
                 ),
             )
+            applied++
+        }
+
+        // ---- 2.16.0：场景 / 自主 / 按群行为 / 向量 / 运行 ----
+        backup.sceneMode.takeIf { it.isNotBlank() }?.let { raw ->
+            runCatching { SceneMode.valueOf(raw) }.getOrNull()?.let { mode ->
+                settings.saveSceneMode(mode)
+                applied++
+            }
+        }
+        backup.autonomy?.let { dto ->
+            val mode = runCatching { AutonomyMode.valueOf(dto.mode) }.getOrNull()
+                ?: AutonomyMode.PASSIVE
+            settings.saveAutonomyConfig(
+                DriveConfig(
+                    mode = mode,
+                    threshold = dto.threshold.coerceIn(0.3, 0.9),
+                    quietHours = dto.quietHours.take(20),
+                    maxSpeaksPerHour = dto.maxSpeaksPerHour.coerceIn(0, 12),
+                ),
+            )
+            applied++
+        }
+        backup.groupBehaviors.forEach { dto ->
+            if (dto.groupId.isBlank()) return@forEach
+            val mode = runCatching { AutonomyMode.valueOf(dto.mode) }.getOrNull() ?: return@forEach
+            database.groupBehaviorDao().upsert(
+                GroupBehaviorEntity(
+                    groupId = dto.groupId,
+                    autonomyMode = mode.name,
+                    updatedAt = System.currentTimeMillis(),
+                ),
+            )
+        }
+        backup.embedding?.let { dto ->
+            settings.saveEmbeddingConfig(
+                EmbeddingConfig(
+                    enabled = dto.enabled,
+                    provider = dto.provider,
+                    baseUrl = dto.baseUrl,
+                    model = dto.model,
+                    apiKey = dto.apiKey,
+                    dim = dto.dim.coerceAtLeast(0),
+                    timeoutSeconds = dto.timeoutSeconds.coerceIn(3, 30),
+                ),
+            )
+            applied++
+        }
+        backup.runtime?.let { dto ->
+            settings.setAutoStart(dto.autoStart)
+            settings.setPowerSaving(dto.powerSaving)
+            settings.setLogRetentionDays(dto.logRetentionDays.coerceIn(1, 30))
             applied++
         }
 
