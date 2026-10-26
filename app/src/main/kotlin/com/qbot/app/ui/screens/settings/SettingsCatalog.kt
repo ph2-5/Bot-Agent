@@ -13,6 +13,7 @@ import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.SmartToy
+import androidx.compose.material.icons.filled.TheaterComedy
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -132,6 +133,13 @@ private fun builtinEntries(onRequestBatteryWhitelist: () -> Unit): List<Settings
             icon = Icons.Filled.Forum,
             subtitle = { ChitchatSubtitle() },
         ) { onBack -> ChitchatPage(onBack = onBack) },
+        SettingsEntry(
+            id = "scene",
+            group = "智能",
+            title = "场景与对谈",
+            icon = Icons.Filled.TheaterComedy,
+            subtitle = { SceneSubtitle() },
+        ) { onBack -> ScenePage(onBack = onBack) },
         SettingsEntry(
             id = "persona_growth",
             group = "智能",
@@ -255,5 +263,17 @@ private fun ChitchatSubtitle(): String {
         !config.enabled -> "未开启（只回复 @）"
         config.chimeRules.isEmpty() -> "已开启 · 通用规则"
         else -> "已开启 · 规则 ${config.chimeRules.size} 条"
+    }
+}
+
+@Composable
+private fun SceneSubtitle(): String {
+    val context = LocalContext.current
+    val app = context.applicationContext as BotApplication
+    val mode by app.controller.sceneMode.collectAsState()
+    return when (mode) {
+        com.qbot.core.ai.SceneMode.OFF -> "关闭（行为与旧版一致）"
+        com.qbot.core.ai.SceneMode.OBSERVE -> "只读观察 · 只记录不接话"
+        com.qbot.core.ai.SceneMode.ACTIVE -> "执行中 · 会真的接话"
     }
 }
