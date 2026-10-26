@@ -30,6 +30,11 @@ data class AutonomousDecisionEntity(
     val reason: String? = null,
     /** 话题指纹：同一指纹连续忍住会进冷却 */
     val fingerprint: String? = null,
+    /**
+     * 被谁压住的：SCENE_OBSERVE 表示场景处于只读观察，本会开口但没发。
+     * null = 正常决策（想说就说，或按原规则忍住）。
+     */
+    val suppressedBy: String? = null,
     val createdAt: Long,
 )
 

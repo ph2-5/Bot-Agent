@@ -78,6 +78,13 @@ data class Scene(
     val waitUntil: Long?,
     val lastActivityAt: Long,
     val createdAt: Long,
+    /**
+     * 本场的契约（语言风格 / 角色规则 / 禁忌 / 收尾）。
+     *
+     * 由 AI 开场时自己写；null 或全空表示老场景，回退固定模板。
+     * 契约在场景内保持不变——中途改规则会让前后几句对不上。
+     */
+    val contract: SceneContract? = null,
 ) {
     /** 我在这个场景里的角色；不在参与者里返回 null。 */
     fun roleOf(senderId: String): SceneRole? =

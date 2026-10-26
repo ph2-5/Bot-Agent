@@ -41,6 +41,8 @@ data class AutonomousRecord(
     val reason: String?,
     /** 话题指纹，用于同一话题的冷却 */
     val fingerprint: String?,
+    /** 被谁压住的：SCENE_OBSERVE 表示场景只读观察期间本会开口但没发；null = 正常决策 */
+    val suppressedBy: String? = null,
     val createdAt: Long,
 ) {
     val spoken: Boolean get() = outcome == OUTCOME_SPOKEN
@@ -48,6 +50,9 @@ data class AutonomousRecord(
     companion object {
         const val OUTCOME_SPOKEN: String = "SPOKEN"
         const val OUTCOME_HELD: String = "HELD"
+
+        /** 场景只读观察：本会开口，但为了观察数据干净而没发 */
+        const val SUPPRESSED_SCENE_OBSERVE: String = "SCENE_OBSERVE"
     }
 }
 

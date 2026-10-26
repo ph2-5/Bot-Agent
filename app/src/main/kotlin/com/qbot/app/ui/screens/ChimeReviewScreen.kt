@@ -54,10 +54,15 @@ import com.qbot.core.ai.ChimeStats
 import com.qbot.core.ai.InnerThought
 import com.qbot.core.ai.LessonCategories
 import com.qbot.core.ai.Scene
+import com.qbot.core.ai.SceneContract
 import com.qbot.core.ai.SceneDecisionRecord
 import com.qbot.core.ai.SceneMode
 import com.qbot.core.ai.SceneStatus
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -257,6 +262,11 @@ fun ChimeReviewScreen() {
 
         item(key = "scene-mode") {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    "场景档位按机器人独立设置。双人演出需要两个机器人分别设为 ACTIVE。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
                 SceneModeChips(
                     mode = sceneMode,
                     onSelect = { mode -> scope.launch { controller.saveSceneMode(mode) } },
@@ -292,6 +302,12 @@ fun ChimeReviewScreen() {
                         scene = activeScene,
                         groupName = groupNames[sceneGroupId] ?: "群",
                         mode = sceneMode,
+                        // 只读模式不会真的建场景：把最近一次「想开场」写的契约显示出来，
+                        // 这正是第一期要评估的东西
+                        observedContract =
+                            sceneDecisions
+                                .firstOrNull { it.action == "START" && it.groupId == sceneGroupId }
+                                ?.contractOrNull(),
                     )
                 }
             }
@@ -768,6 +784,7 @@ private fun SceneStateCard(
     scene: Scene?,
     groupName: String,
     mode: SceneMode,
+    observedContract: SceneContract? = null,
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -813,9 +830,60 @@ private fun SceneStateCard(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                val contract = scene.contract?.takeIf { !it.isEmpty() }
+                if (contract != null) {
+                    ContractLines(contract, "本场契约")
+                } else {
+                    Text(
+                        "本场没有契约（2.13.0 及更早创建），按固定模板演。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (scene == null && observedContract != null && !observedContract.isEmpty()) {
+                ContractLines(observedContract, "最近一次「想开场」写的契约（未实际开场）")
             }
         }
     }
+}
+
+/** 契约逐行展示：方便直接看 AI 写的规则具体不具体。 */
+@Composable
+private fun ContractLines(
+    contract: SceneContract,
+    title: String,
+) {
+    Text(
+        title,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+    )
+    if (contract.languageStyle.isNotBlank()) {
+        Text("语言风格：${contract.languageStyle}", style = MaterialTheme.typography.labelSmall)
+    }
+    contract.roleRules.forEach { (name, rule) ->
+        Text("「$name」：$rule", style = MaterialTheme.typography.labelSmall)
+    }
+    if (contract.taboos.isNotEmpty()) {
+        Text("禁忌：${contract.taboos.joinToString("；")}", style = MaterialTheme.typography.labelSmall)
+    }
+    if (contract.exitCriteria.isNotBlank()) {
+        Text("收尾：${contract.exitCriteria}", style = MaterialTheme.typography.labelSmall)
+    }
+    if (contract.props.isNotEmpty()) {
+        Text("素材：${contract.props.joinToString("；")}", style = MaterialTheme.typography.labelSmall)
+    }
+}
+
+/** 只读记录里的契约：OBSERVE 不建场景，契约只存在 START 决策的 argsJson 里。 */
+private fun SceneDecisionRecord.contractOrNull(): SceneContract? {
+    val raw = argsJson?.takeIf { it.isNotBlank() } ?: return null
+    return runCatching {
+        val obj = Json.parseToJsonElement(raw) as JsonObject
+        val text = (obj["contract"] as? JsonPrimitive)?.contentOrNull
+        text?.takeIf { it.isNotBlank() }?.let { Json.decodeFromString<SceneContract>(it) }
+    }.getOrNull()
 }
 
 private fun SceneStatus.label(): String =

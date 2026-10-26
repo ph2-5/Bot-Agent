@@ -276,6 +276,13 @@ fun MemoryPage(onBack: () -> Unit) {
                 },
                 modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
             )
+            // 两个开关分属不同页、又都是 per-bot：不提示的话很容易只配一边，
+            // 结果「场景演着、自主还在插话」或者「只设了一个 bot，双人演出起不来」。
+            HintText(
+                "自主开口与场景档位都按机器人独立设置：场景进行中、以及刚结束 5 分钟内，" +
+                    "自主会主动让位。场景档位在「接话复盘」页设置，双人演出需要两个机器人分别设为 ACTIVE。",
+                modifier = Modifier.fillMaxWidth(),
+            )
             if (autonomy.mode == AutonomyMode.ACTIVE) {
                 var quiet by remember(autonomy.quietHours) { mutableStateOf(autonomy.quietHours) }
                 Row(verticalAlignment = Alignment.CenterVertically) {

@@ -33,6 +33,8 @@ data class SceneEntity(
     val waitUntil: Long? = null,
     val lastActivityAt: Long,
     val createdAt: Long,
+    /** SceneContract 的 JSON；2.13.0 及更早的场景为 null（回退固定模板） */
+    val contractJson: String? = null,
 )
 
 /**
@@ -73,7 +75,7 @@ interface SceneDao {
         """
         UPDATE scenes SET kind = :kind, participantsJson = :participantsJson, goal = :goal,
             status = :status, turnIndex = :turnIndex, expectedSpeakerId = :expectedSpeakerId,
-            waitUntil = :waitUntil, lastActivityAt = :lastActivityAt
+            waitUntil = :waitUntil, lastActivityAt = :lastActivityAt, contractJson = :contractJson
         WHERE id = :id
         """,
     )
@@ -87,6 +89,7 @@ interface SceneDao {
         expectedSpeakerId: String?,
         waitUntil: Long?,
         lastActivityAt: Long,
+        contractJson: String?,
     )
 
     @Query("UPDATE scenes SET status = 'ENDED' WHERE id = :id")

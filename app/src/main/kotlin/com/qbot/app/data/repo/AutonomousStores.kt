@@ -27,6 +27,7 @@ class RoomDriveStore(
                 outcome = record.outcome,
                 reason = record.reason,
                 fingerprint = record.fingerprint,
+                suppressedBy = record.suppressedBy,
                 createdAt = record.createdAt,
             ),
         )
@@ -70,6 +71,7 @@ class RoomDriveStore(
             outcome = outcome,
             reason = reason,
             fingerprint = fingerprint,
+            suppressedBy = suppressedBy,
             createdAt = createdAt,
         )
 }

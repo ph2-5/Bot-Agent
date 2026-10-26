@@ -5,6 +5,7 @@ import com.qbot.app.data.db.SceneDecisionDao
 import com.qbot.app.data.db.SceneDecisionEntity
 import com.qbot.app.data.db.SceneEntity
 import com.qbot.core.ai.Scene
+import com.qbot.core.ai.SceneContract
 import com.qbot.core.ai.SceneDecisionRecord
 import com.qbot.core.ai.SceneKind
 import com.qbot.core.ai.SceneParticipant
@@ -36,6 +37,8 @@ class RoomSceneStore(
 
     override suspend fun save(scene: Scene): Scene {
         val participantsJson = json.encodeToString(scene.participants.map { it.toDto() })
+        val contractJson =
+            scene.contract?.takeIf { !it.isEmpty() }?.let { json.encodeToString(it) }
         return if (scene.id == 0L) {
             val id =
                 sceneDao.insert(
@@ -50,6 +53,7 @@ class RoomSceneStore(
                         waitUntil = scene.waitUntil,
                         lastActivityAt = scene.lastActivityAt,
                         createdAt = scene.createdAt,
+                        contractJson = contractJson,
                     ),
                 )
             scene.copy(id = id)
@@ -64,6 +68,7 @@ class RoomSceneStore(
                 expectedSpeakerId = scene.expectedSpeakerId,
                 waitUntil = scene.waitUntil,
                 lastActivityAt = scene.lastActivityAt,
+                contractJson = contractJson,
             )
             scene
         }
@@ -119,7 +124,13 @@ class RoomSceneStore(
             waitUntil = waitUntil,
             lastActivityAt = lastActivityAt,
             createdAt = createdAt,
+            contract = decodeContract(contractJson),
         )
+
+    private fun decodeContract(raw: String?): SceneContract? {
+        if (raw.isNullOrBlank()) return null
+        return runCatching { json.decodeFromString<SceneContract>(raw) }.getOrNull()
+    }
 
     private fun SceneParticipant.toDto(): ParticipantDto =
         ParticipantDto(senderId, displayName, isBot, role?.name)

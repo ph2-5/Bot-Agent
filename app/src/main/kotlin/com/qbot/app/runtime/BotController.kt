@@ -483,6 +483,14 @@ class BotController(
             mainConfig = { settings.aiConfig.value },
             gate = autonomousGate,
             personaTextProvider = { personaRepository.active()?.prompt },
+            // 场景优先：本群演戏中 / 刚收底 5 分钟内，自主不插话；只读观察时只记录不发送。
+            sceneActiveProvider = { groupId -> sceneStore.active(groupId) != null },
+            sceneRecentEndProvider = { groupId ->
+                val endedAt = sceneStore.lastEndedAt(groupId)
+                endedAt != null &&
+                    System.currentTimeMillis() - endedAt < AutonomousScheduler.SCENE_COOLDOWN_MILLIS
+            },
+            sceneModeProvider = { settings.sceneMode.value },
             log = { message -> appendLog(LogLevel.INFO, TAG, message) },
         )
     }

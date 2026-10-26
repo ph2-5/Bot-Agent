@@ -13,6 +13,7 @@ import com.qbot.core.ai.ConversationKeys
 import com.qbot.core.ai.DriveConfig
 import com.qbot.core.ai.DriveState
 import com.qbot.core.ai.RoomMessage
+import com.qbot.core.ai.SceneMode
 import com.qbot.core.ai.TranscriptRender
 import com.qbot.core.engine.BotRuntime
 import java.util.Calendar
@@ -54,6 +55,12 @@ class AutonomousScheduler(
     /** 人设正文：算"话题与人格的相关度"的唯一依据 */
     private val personaTextProvider: suspend () -> String?,
     private val log: (String) -> Unit,
+    /** 本群是否有进行中的场景（C1：场景优先，自主让位） */
+    private val sceneActiveProvider: suspend (String) -> Boolean = { false },
+    /** 本群场景是否刚结束（窗口内也不开口，避免"相声刚完它又自己说"） */
+    private val sceneRecentEndProvider: suspend (String) -> Boolean = { false },
+    /** 场景档位（C2：只读观察期间照常评估、只记录不发送） */
+    private val sceneModeProvider: () -> SceneMode = { SceneMode.OFF },
     private val clock: () -> Long = System::currentTimeMillis,
     private val random: Random = Random.Default,
 ) {
@@ -86,6 +93,9 @@ class AutonomousScheduler(
 
         /** 群范围的活动判定窗口 */
         private const val ACTIVE_WINDOW_MILLIS = 30 * 60_000L
+
+        /** 场景结束后自主的冷却：避免"相声刚收底，它又自己开口" */
+        const val SCENE_COOLDOWN_MILLIS = 5 * 60_000L
     }
 
     private val mutex = Mutex()
@@ -220,6 +230,14 @@ class AutonomousScheduler(
         val scopeKey = ConversationKeys.groupRoom(groupId)
         val dao = database.roomMessageDao()
 
+        // C1：场景优先。本群演戏中、或刚收底不到 5 分钟，自主一律让位。
+        // 只查本群——A 群演戏不该让 B 群也跟着闭嘴。
+        val sceneReason = sceneSkipReason(groupId)
+        if (sceneReason != null) {
+            recordHeld(groupId, personaId, 0.0, sceneReason, "")
+            return false
+        }
+
         val recent =
             dao.recent(scopeKey, JUDGE_CONTEXT, personaId)
                 .asReversed()
@@ -313,6 +331,21 @@ class AutonomousScheduler(
             return false
         }
 
+        // C2：场景只读观察期间，照常走完两道闸门（保留观察价值），
+        // 但一条都不发——否则"观察 AI 怎么演"的数据里会混进自主发言。
+        if (sceneModeProvider() == SceneMode.OBSERVE) {
+            recordHeld(
+                groupId = groupId,
+                personaId = personaId,
+                score = decision.score,
+                reason = "本会开口（${verdict.reason.take(100)}），场景只读观察，未发送",
+                fingerprint = fingerprint,
+                suppressedBy = AutonomousRecord.SUPPRESSED_SCENE_OBSERVE,
+            )
+            bumpSuppressed(+1)
+            return false
+        }
+
         val spoken =
             runCatching {
                 runtime.autonomousSpeak(
@@ -356,6 +389,7 @@ class AutonomousScheduler(
         score: Double,
         reason: String,
         fingerprint: String,
+        suppressedBy: String? = null,
     ) {
         runCatching {
             decisions.record(
@@ -366,10 +400,20 @@ class AutonomousScheduler(
                     outcome = AutonomousRecord.OUTCOME_HELD,
                     reason = reason.take(300),
                     fingerprint = fingerprint.takeIf { it.isNotBlank() },
+                    suppressedBy = suppressedBy,
                     createdAt = clock(),
                 ),
             )
         }
+    }
+
+    /** 场景让位的理由；不该让位时返回 null。 */
+    private suspend fun sceneSkipReason(groupId: String): String? {
+        val active = runCatching { sceneActiveProvider(groupId) }.getOrDefault(false)
+        if (active) return "场景进行中，自主让位"
+        val justEnded = runCatching { sceneRecentEndProvider(groupId) }.getOrDefault(false)
+        if (justEnded) return "场景刚结束不到 ${SCENE_COOLDOWN_MILLIS / 60_000} 分钟，自主让位"
+        return null
     }
 
     /** 喂给判定模型的上下文：只给最近几条 + 情绪/内心戏/相关度，不给全量记忆。 */

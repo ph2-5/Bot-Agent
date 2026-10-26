@@ -157,7 +157,7 @@ interface AiHistoryDao {
         SceneEntity::class,
         SceneDecisionEntity::class,
     ],
-    version = 19,
+    version = 20,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -242,6 +242,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_16_17,
                     MIGRATION_17_18,
                     MIGRATION_18_19,
+                    MIGRATION_19_20,
                 )
                 .build()
 
@@ -906,6 +907,20 @@ abstract class AppDatabase : RoomDatabase() {
                         "CREATE INDEX IF NOT EXISTS `index_scene_decisions_group` " +
                             "ON `scene_decisions` (`groupId`)",
                     )
+                }
+            }
+
+        /**
+         * v19 → v20：场景契约 + 自主抑制原因。
+         *
+         * 两列都是可空增量：老场景 `contractJson` 为 null → 回退 2.13.0 的固定模板；
+         * 老决策 `suppressedBy` 为 null → 就是没被场景抑制过。
+         */
+        val MIGRATION_19_20 =
+            object : androidx.room.migration.Migration(19, 20) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL("ALTER TABLE `scenes` ADD COLUMN `contractJson` TEXT")
+                    db.execSQL("ALTER TABLE `autonomous_decisions` ADD COLUMN `suppressedBy` TEXT")
                 }
             }
     }

@@ -37,7 +37,10 @@ class SceneToolbox(
                     name = "start_scene",
                     description =
                         "和某个具体的人开始一段双人对谈（相声式一来一回）。" +
-                            ScenePrompt.START_HINT,
+                            ScenePrompt.START_HINT +
+                            "开场时必须同时写好 contract：这是你为这次演出定的规则，要具体、可执行。" +
+                            "不要写「要自然」「要幽默」这类空话；角色规则要写清「谁能做什么、不能做什么」，" +
+                            "而不是形容词。角色名用你在对话里看到的叫法。",
                     parameters =
                         Json.parseToJsonElement(
                             """
@@ -56,9 +59,38 @@ class SceneToolbox(
                                 "goal": {
                                   "type": "string",
                                   "description": "这段要说到哪儿，一句话，如「聊到借钱收场」"
+                                },
+                                "contract": {
+                                  "type": "object",
+                                  "description": "你为这次演出写的规则。每项都要具体到能照着做，不要写形容词。",
+                                  "properties": {
+                                    "languageStyle": {
+                                      "type": "string",
+                                      "description": "口音/语体/句长/怎么称呼对方，最多 120 字。例：京津口语，短句为主，多用「您」"
+                                    },
+                                    "roleRules": {
+                                      "type": "object",
+                                      "description": "角色名 → 该角色能做什么、不能做什么。最多 4 个角色，每条 80 字。例：{\"你\":\"抛话题、铺包袱，每句留口子；不许自己接自己的包袱\"}",
+                                      "additionalProperties": { "type": "string" }
+                                    },
+                                    "taboos": {
+                                      "type": "array",
+                                      "items": { "type": "string" },
+                                      "description": "禁忌，最多 5 条，每条 40 字。例：[\"不提政治\",\"不拿家人做人身攻击\"]"
+                                    },
+                                    "exitCriteria": {
+                                      "type": "string",
+                                      "description": "什么情况算说完、怎么收尾，最多 80 字"
+                                    },
+                                    "props": {
+                                      "type": "array",
+                                      "items": { "type": "string" },
+                                      "description": "这次可以用的素材或话题，可选，最多 3 条，每条 40 字"
+                                    }
+                                  }
                                 }
                               },
-                              "required": ["role", "partnerName", "goal"]
+                              "required": ["role", "partnerName", "goal", "contract"]
                             }
                             """.trimIndent(),
                         ) as JsonObject,
@@ -83,6 +115,11 @@ class SceneToolbox(
                 if (partnerName.isBlank()) return ToolResult("缺少对方的名字，未开场。")
                 val goal = arguments["goal"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
                 val role = parseRole(arguments["role"]?.jsonPrimitive?.contentOrNull)
+                // 契约可能是缺的或畸形的：解析失败不阻断开场，回退固定模板即可
+                val contract =
+                    (arguments["contract"] as? JsonObject)
+                        ?.let { runCatching { SceneContract.fromJson(it) }.getOrNull() }
+                        ?.takeIf { !it.isEmpty() }
                 val now = clock()
                 val executed = mode == SceneMode.ACTIVE
 
@@ -115,6 +152,7 @@ class SceneToolbox(
                         waitUntil = null,
                         lastActivityAt = now,
                         createdAt = now,
+                        contract = contract,
                     )
                 val saved = if (executed) store.save(scene) else scene
                 runCatching {
@@ -128,6 +166,14 @@ class SceneToolbox(
                                     put("role", role.name)
                                     put("partnerName", partnerName.take(20))
                                     put("goal", goal.take(80))
+                                    // OBSERVE 不建场景，契约只存在于这条记录里——
+                                    // 复盘页靠它判断 AI 写的规则是不是空话
+                                    contract?.let {
+                                        put(
+                                            "contract",
+                                            Json.encodeToString(SceneContract.serializer(), it).take(800),
+                                        )
+                                    }
                                 }.toString(),
                             executed = executed,
                             reason = "AI 判断要跟「${partnerName.take(20)}」演一段",
