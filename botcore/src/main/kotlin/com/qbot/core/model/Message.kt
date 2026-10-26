@@ -87,6 +87,14 @@ data class IncomingMessage(
      * 会让 token 翻几倍，而收益很小。没有图片时为 null。
      */
     val imageUrl: String? = null,
+    /**
+     * 本机收到这条消息的时刻（拟人延迟的计时起点）。
+     *
+     * 与 [timestampMillis]（平台事件时间）分开：平台时钟可能有偏差，
+     * 而"至少等几秒再回"必须从真正收到那一刻算起，否则会出现
+     * 「等一分钟」或「立刻发」两种极端。默认等于事件时间，兼容旧调用点。
+     */
+    val receivedAtMillis: Long = timestampMillis,
     val raw: JsonObject,
 )
 

@@ -156,6 +156,45 @@ fun ChimeReviewScreen() {
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 40.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        // ---------- 场景语境（刻意放在最前：这是开关，藏在列表底部等于没有） ----------
+        item(key = "scene-header") {
+            SceneHeader(
+                count = sceneDecisions.size,
+                mode = sceneMode,
+                expanded = showScenes,
+                onToggle = { showScenes = !showScenes },
+            )
+        }
+
+        item(key = "scene-mode") {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    "场景档位按机器人独立设置。双人演出需要两个机器人分别设为 ACTIVE。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                SceneModeChips(
+                    mode = sceneMode,
+                    onSelect = { mode -> scope.launch { controller.saveSceneMode(mode) } },
+                )
+                Text(
+                    when (sceneMode) {
+                        SceneMode.OFF ->
+                            "关闭：工具不发给模型，判定链不查场景——行为与 2.12.0 完全一致。"
+                        SceneMode.OBSERVE ->
+                            "只读：模型照常调用开场 / 等待 / 催场 / 收尾，但只写记录、不产生任何行为。" +
+                                "先跑几天看它开场的时机是否合理，再决定要不要打开。"
+                        SceneMode.ACTIVE ->
+                            "执行：真实开启双人对谈。单场景最长 10 分钟，单群每小时最多 " +
+                                "${com.qbot.core.ai.SceneLimits.MAX_SPEAKS_PER_HOUR} 条，" +
+                                "对方连续 ${com.qbot.core.ai.SceneLimits.MAX_PROMPTS} 次不接就自动收尾。"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
         item(key = "stats") { StatsCard(stats = stats, lessonCount = lessons.size) }
 
         item(key = "thoughts") {
@@ -247,45 +286,6 @@ fun ChimeReviewScreen() {
                         )
                     }
                 }
-            }
-        }
-
-        // ---------- 场景语境 ----------
-        item(key = "scene-header") {
-            SceneHeader(
-                count = sceneDecisions.size,
-                mode = sceneMode,
-                expanded = showScenes,
-                onToggle = { showScenes = !showScenes },
-            )
-        }
-
-        item(key = "scene-mode") {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(
-                    "场景档位按机器人独立设置。双人演出需要两个机器人分别设为 ACTIVE。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-                SceneModeChips(
-                    mode = sceneMode,
-                    onSelect = { mode -> scope.launch { controller.saveSceneMode(mode) } },
-                )
-                Text(
-                    when (sceneMode) {
-                        SceneMode.OFF ->
-                            "关闭：工具不发给模型，判定链不查场景——行为与 2.12.0 完全一致。"
-                        SceneMode.OBSERVE ->
-                            "只读：模型照常调用开场 / 等待 / 催场 / 收尾，但只写记录、不产生任何行为。" +
-                                "先跑几天看它开场的时机是否合理，再决定要不要打开。"
-                        SceneMode.ACTIVE ->
-                            "执行：真实开启双人对谈。单场景最长 10 分钟，单群每小时最多 " +
-                                "${com.qbot.core.ai.SceneLimits.MAX_SPEAKS_PER_HOUR} 条，" +
-                                "对方连续 ${com.qbot.core.ai.SceneLimits.MAX_PROMPTS} 次不接就自动收尾。"
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
             }
         }
 

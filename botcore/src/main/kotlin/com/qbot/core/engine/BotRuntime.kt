@@ -61,6 +61,7 @@ import com.qbot.core.model.parseGroupNotice
 import com.qbot.core.util.Logger
 import com.qbot.core.util.NoopLogger
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -307,6 +308,9 @@ class BotRuntime(
 
     override fun onMessage(message: IncomingMessage) {
         val text = message.cleanText(botId)
+        // 打上「本机收到」的时刻：拟人延迟从这一刻算起，不从生成完算。
+        // 平台事件时间只是消息创建时间，跨机器时钟可能有偏差，不能直接用来计时。
+        val received = message.copy(receivedAtMillis = System.currentTimeMillis())
         // @ 消息优先记账：随后到达的同 id 全量事件会被去重挡掉
         if (message.kind == MessageKind.GROUP_AT) rememberMessage(message.messageId)
 
@@ -314,7 +318,7 @@ class BotRuntime(
         // 网关回调线程必须尽快返回，否则会堵塞后续事件读取。
         scope.launch {
             try {
-                processMessage(message, text)
+                processMessage(received, text)
             } finally {
                 // 自主开口的触发点：不管这条回没回，群里刚有过对话，
                 // 就有"想一想要不要接一句"的素材。回调本身必须轻量。
@@ -1531,6 +1535,38 @@ class BotRuntime(
         return if (cut > max / 2) head.take(cut + 1) + "…" else head + "…"
     }
 
+    /**
+     * 拟人化的回复节奏。
+     *
+     * 模型几百毫秒就能出结果，直接发出去是「秒回」——群里一眼看出是机器。
+     * 真人看到消息、读完、想一下、打字，短句也要一两秒；两个人演对谈时，
+     * 这个间隔决定了像不像在对话。
+     *
+     * 计时起点是**收到消息**那一刻（[IncomingMessage.receivedAtMillis]），
+     * 不是生成完那一刻：模型思考得久就少等、快就多等，总时长才稳定。
+     */
+    private suspend fun awaitHumanPace(
+        message: IncomingMessage,
+        reply: String,
+    ) {
+        val target = humanPaceMillis(reply)
+        val elapsed =
+            (System.currentTimeMillis() - message.receivedAtMillis).coerceIn(0L, 60_000L)
+        val wait = target - elapsed
+        if (wait > 0) delay(wait)
+    }
+
+    /**
+     * 目标回复时长：0.8 秒起步 + 每字 40ms，夹在 1.5~8 秒，再叠 ±20% 抖动。
+     *
+     * 按字数而不是固定值：短句「是吗？」应该 1.5 秒，长句应该更久；
+     * 抖动是为了两个 bot 不会每次都用一模一样的间隔。
+     */
+    private fun humanPaceMillis(reply: String): Long {
+        val clamped = (800L + reply.length * 40L).coerceIn(1500L, 8000L)
+        return (clamped * (0.8 + random() * 0.4)).toLong()
+    }
+
     private suspend fun sendReply(
         message: IncomingMessage,
         reply: String,
@@ -1541,6 +1577,9 @@ class BotRuntime(
             log(LogLevel.WARN, TAG, "缺少回复目标，无法回复")
             return
         }
+
+        // 拟人延迟放在真正发送之前：前面所有判定/生成都照常，只影响"什么时候发"
+        awaitHumanPace(message, reply)
 
         // 表情包标记：AI 链路已在 AiResponder 里剥过一次（memeUrl 有值），
         // 这里再解析是给规则回复、指令复述等非 AI 链路兜底——
