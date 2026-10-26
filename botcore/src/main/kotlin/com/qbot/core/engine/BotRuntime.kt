@@ -890,36 +890,45 @@ class BotRuntime(
 
         var gate = evaluateGate()
         if (gate is ChitchatGate.Defer) {
-            val pending = gate as ChitchatGate.Defer
-            gate =
-                when {
-                    // 冷却几十秒时等到也没意义：那时话题早换了，回过去反而突兀
-                    pending.delayMillis > ChitchatGate.MAX_DEFER_MILLIS ->
-                        ChitchatGate.Skip(
-                            "冷却 ${pending.delayMillis / 1000} 秒太久，等到话题也过去了",
-                        )
-                    !deferringGroups.add(groupId) ->
-                        ChitchatGate.Skip("已有消息在等冷却")
-                    else -> {
-                        try {
-                            log(
-                                LogLevel.VERBOSE,
-                                TAG,
-                                "等 ${pending.delayMillis}ms 再判定（${pending.reason}）",
-                            )
-                            // 多等 80ms：冷却按毫秒比，边界上容易差一两毫秒又判成冷却中
-                            delay(pending.delayMillis + 80)
-                            val again = evaluateGate()
-                            if (again is ChitchatGate.Defer) {
-                                ChitchatGate.Skip("等待后仍在冷却（${again.reason}）")
-                            } else {
-                                again
-                            }
-                        } finally {
-                            deferringGroups.remove(groupId)
+            if (!deferringGroups.add(groupId)) {
+                gate = ChitchatGate.Skip("已有消息在等冷却")
+            } else {
+                try {
+                    var rounds = 0
+                    var waited = 0L
+                    // 等完可能又被新一轮发言顶出冷却（群里正聊得热闹时很常见），
+                    // 允许再等，但要有限度：轮数与总时长双上限。
+                    while (gate is ChitchatGate.Defer && rounds < ChitchatGate.MAX_DEFER_ROUNDS) {
+                        val pending = gate as ChitchatGate.Defer
+                        val remainBudget = ChitchatGate.MAX_DEFER_TOTAL_MILLIS - waited
+                        if (pending.delayMillis > ChitchatGate.MAX_DEFER_MILLIS ||
+                            pending.delayMillis > remainBudget
+                        ) {
+                            gate =
+                                ChitchatGate.Skip(
+                                    "冷却 ${pending.delayMillis / 1000} 秒太久，等到话题也过去了",
+                                )
+                            break
                         }
+                        log(
+                            LogLevel.VERBOSE,
+                            TAG,
+                            "等 ${pending.delayMillis}ms 再判定（${pending.reason}）",
+                        )
+                        // 多等 80ms：冷却按毫秒比，边界上容易差一两毫秒又判成冷却中
+                        delay(pending.delayMillis + 80)
+                        waited += pending.delayMillis
+                        rounds++
+                        gate = evaluateGate()
                     }
+                    if (gate is ChitchatGate.Defer) {
+                        val left = (gate as ChitchatGate.Defer).reason
+                        gate = ChitchatGate.Skip("等了 ${waited / 1000} 秒仍未轮到（$left）")
+                    }
+                } finally {
+                    deferringGroups.remove(groupId)
                 }
+            }
         }
 
         // 规则层已经认定「这是在叫它 / 在骂它」时，对话对象必须跟着一致。

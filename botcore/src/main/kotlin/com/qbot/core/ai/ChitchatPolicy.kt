@@ -134,6 +134,17 @@ sealed class ChitchatGate {
     companion object {
         /** 最长等多久：超过这个时长，等到也没有意义了 */
         const val MAX_DEFER_MILLIS = 10_000L
+
+        /**
+         * 最多等几轮。
+         *
+         * 等完一轮后可能又被新一轮发言顶出冷却（群里正聊得起劲时很常见）。
+         * 允许再等，但要有上限——否则"叫了必答"会变成"永远在等"。
+         */
+        const val MAX_DEFER_ROUNDS = 3
+
+        /** 全部等待加起来的预算：再久就不像接话，像补作业 */
+        const val MAX_DEFER_TOTAL_MILLIS = 15_000L
     }
 }
 

@@ -510,6 +510,22 @@ class AiResponder(
                     callLlmWithTools(
                         halved, question, config, memory, systemPrompt, imageUrl, sceneBlock, toolTurn,
                     )
+                } catch (e: EmptyContentException) {
+                    // 思考模型偶发把正文全写进 reasoning_content：finish=stop、
+                    // reasoning 有一大段、content 为空。直接抛出去就是"插话失败"，
+                    // 用户只看到机器人突然不说话。关掉思考重试一次——这类模型的
+                    // 非思考模式输出稳定得多。
+                    callLlmWithTools(
+                        stored,
+                        question,
+                        config,
+                        memory,
+                        systemPrompt,
+                        imageUrl,
+                        sceneBlock,
+                        toolTurn,
+                        forceDisableThinking = true,
+                    )
                 }
 
             // 成功后才写入历史：失败的请求不应污染上下文。
@@ -893,6 +909,7 @@ class AiResponder(
         imageUrl: String?,
         useTools: Boolean,
         unavailableTools: Set<String> = emptySet(),
+        forceDisableThinking: Boolean = false,
     ): LlmReply {
         // 带图时优先用视觉模型；没填时 DeepSeek 端点会自动退回 deepseek-flash
         val model =
@@ -908,7 +925,13 @@ class AiResponder(
                 messages = messages,
                 temperature = config.temperature,
                 maxTokens = config.maxTokens,
-                thinkingType = thinkingParam(config),
+                thinkingType =
+                    if (forceDisableThinking) {
+                        // 重试专用：上一次正文全被思考吃掉，这次强制直接出话
+                        ThinkingParams.forConfig(config, forceDisable = true)
+                    } else {
+                        thinkingParam(config)
+                    },
                 tools = if (withTools) availableSpecs else emptyList(),
             )
 
@@ -956,6 +979,7 @@ class AiResponder(
         imageUrl: String? = null,
         sceneBlock: String? = null,
         toolTurn: ToolTurn = ToolTurn(),
+        forceDisableThinking: Boolean = false,
     ): Pair<LlmReply, String?> {
         var messages =
             buildMessages(
@@ -981,7 +1005,15 @@ class AiResponder(
             }
 
         while (true) {
-            val reply = executeChat(messages, config, imageUrl, useTools = true, unavailableTools = unavailable)
+            val reply =
+                executeChat(
+                    messages,
+                    config,
+                    imageUrl,
+                    useTools = true,
+                    unavailableTools = unavailable,
+                    forceDisableThinking = forceDisableThinking,
+                )
             if (reply.toolCalls.isEmpty()) return reply to memeUrl
 
             if (round >= MAX_TOOL_ROUNDS) {
@@ -992,7 +1024,13 @@ class AiResponder(
                             role = "user",
                             content = "请直接用一句自然的话回复，不要再调用工具。",
                         )
-                return executeChat(forced, config, imageUrl, useTools = false) to memeUrl
+                return executeChat(
+                    forced,
+                    config,
+                    imageUrl,
+                    useTools = false,
+                    forceDisableThinking = forceDisableThinking,
+                ) to memeUrl
             }
 
             messages =
